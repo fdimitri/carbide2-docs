@@ -5,10 +5,13 @@
   "scripts": {
     "dev": "astro dev",
     "build": "astro build",
-    "preview": "astro preview",
-    "astro": "astro"
+    "preview": "npm run build && wrangler dev",
+    "astro": "astro",
+    "deploy": "npm run build && wrangler deploy",
+    "cf-typegen": "wrangler types"
   },
   "dependencies": {
+    "@astrojs/cloudflare": "12",
     "@astrojs/starlight": "^0.33.0",
     "@tailwindcss/vite": "^4.3.0",
     "astro": "^5.0.0",
@@ -16,5 +19,8 @@
     "mermaid": "^11.16.0",
     "sharp": "^0.33.0",
     "tailwindcss": "^4.3.0"
+  },
+  "devDependencies": {
+    "wrangler": "^4.111.0"
   }
 }
