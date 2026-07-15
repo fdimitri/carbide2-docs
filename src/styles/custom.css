@@ -82,3 +82,13 @@
   --sl-font:              var(--font-ui);
   --sl-font-mono:         var(--font-mono);
 }
+
+/* ── Layout tweaks ────────────────────────────────────────────────────────── */
+/* The default right ToC rail feels too wide for this docs site. */
+@media (min-width: 72rem) {
+  .right-sidebar-container,
+  .right-sidebar {
+    width: 14rem !important;
+    max-width: 14rem !important;
+  }
+}
