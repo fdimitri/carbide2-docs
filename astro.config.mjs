@@ -15,6 +15,16 @@ export default defineConfig({
       title: 'Carbide2 Docs',
       description: 'Documentation for the Carbide2 collaborative development environment.',
       favicon: '/favicon.svg',
+      head: [
+        {
+          tag: 'link',
+          attrs: { rel: 'icon', type: 'image/svg+xml', href: '/favicon.svg' },
+        },
+        {
+          tag: 'link',
+          attrs: { rel: 'shortcut icon', href: '/favicon.svg' },
+        },
+      ],
       logo: {
         alt: 'CARB/IDE2',
         src: './src/assets/c2-logo.svg',

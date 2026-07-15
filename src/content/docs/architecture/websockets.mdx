@@ -68,6 +68,10 @@ Database-backed VFS operations. See [Filesystem (VFS)](/architecture/filesystem/
 
 PTY terminal multiplexing.
 
+In Kubernetes mode, terminal PTYs are executed via a per-project shell sidecar
+backend. This keeps terminal toolsets isolated from the server/worker runtime
+and constrains filesystem access to the mounted project root.
+
 | Command | Direction | Description |
 |---------|-----------|-------------|
 | `open` | C→S | Open a new PTY terminal |
@@ -75,6 +79,17 @@ PTY terminal multiplexing.
 | `output` | S→C | Broadcast PTY output to subscribers |
 | `resize` | C→S | Resize PTY (cols × rows) |
 | `close` | C→S | Close a terminal session |
+
+#### Terminal backend modes
+
+| Backend | Execution model | Isolation level |
+|---------|------------------|-----------------|
+| `local` | `PTY.spawn` directly in workspace pod process space | Lowest (shared runtime namespace) |
+| `docker` | `docker exec` into project container | Strong (container boundary) |
+| `kube` | `kubectl exec` into project shell sidecar/pod | Strong (pod/container boundary + project-root mount) |
+
+Default production posture is sidecar-backed terminals so tool execution stays
+out of the server/worker process namespaces.
 
 ### `chat`
 

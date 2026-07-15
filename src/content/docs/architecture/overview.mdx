@@ -22,6 +22,7 @@ graph TD
     subgraph workspace["ws-&lt;id&gt; namespace"]
       Rails["carbide2-server\n(Rails API)"]
       Worker["carbide2-worker\n(EventMachine WS)"]
+      Sidecar["carbide2-shell sidecar\n(PTY exec target)"]
       Vite["Vite\n(dev only, HMR)"]
       DB[("Postgres\n(shared)")]
       Disk[("Disk\n(PVC)")]
@@ -35,6 +36,8 @@ graph TD
   Traefik -->|"/"| CP
   Rails --- DB
   Worker --- DB
+  Worker -->|"term/open,input,resize"| Sidecar
+  Sidecar --- Disk
   Worker -->|"flush"| Disk
   CP --- CPDB
   CP -->|"provision pods"| workspace
@@ -60,6 +63,16 @@ Browser → Traefik → EventMachine worker
   → VfsFlusher: write to disk (PVC) on threshold / timer
 ```
 
+### Terminal path (PTY sidecar)
+
+```
+Browser → Traefik → EventMachine worker (term/open)
+  → ensure per-project shell sidecar is running
+  → PTY exec attaches into shell sidecar (not server/worker process namespaces)
+  → sidecar mounts only the project filesystem root
+  → terminal tools operate on project files, not server/worker internals
+```
+
 ### Control plane
 
 ```
@@ -70,13 +83,14 @@ Browser → Traefik → carbide2-control Rails /api/workspaces
 
 ## Process model (per workspace pod)
 
-Three processes supervised by **Foreman** (`Procfile`):
+Three processes supervised by **Foreman** (`Procfile`) plus one shell sidecar backend:
 
 | Process | Command | Purpose |
 |---------|---------|---------|
 | `web` | `bundle exec rails server` | REST API + SPA asset serving |
 | `worker` | `ruby worker/worker.rb` | EventMachine WS server |
 | `vite` | `npm run dev` (dev only) | HMR for Vue SPA |
+| `carbide2-shell` (sidecar) | spawned/managed by terminal backend | PTY exec target with project-filesystem-only mount |
 
 ## Data storage
 
