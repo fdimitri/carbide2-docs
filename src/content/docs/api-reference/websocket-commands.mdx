@@ -14,67 +14,108 @@ Security levels (`N0..N3`) follow [Security Model](/architecture/security-model/
 ## Message envelope
 
 ```json
-{ "cs": "<commandSet>", "cmd": "<command>", "payload": { } }
+{ "cs": "<commandSet>", "cmd": "<command>", "payload": {} }
 ```
+
+Current worker messages use only these three top-level fields. A request `ref`
+field is not implemented on the wire today.
 
 ## `system`
 
 | Command | Direction | Security | Payload |
 |---------|-----------|----------|---------|
-| `connected` | S→C | N1 | `{ protocol, min_client, project_id }` |
+| `connected` | S→C | N1 | `{ user_id, project_id, protocol, min_client, token_exp }` |
 | `error` | S→C | N1 | `{ message }` |
+| `pong` | S→C | N1 | `{ t }` |
+| `reauth_ok` | S→C | N1 | `{ exp }` |
+| `reauth_failed` | S→C | N1 | `{ message }` |
+| `token_expired` | S→C | N1 | `{}` |
 
 ## `fs`
 
 | Command | Direction | Security | Payload |
 |---------|-----------|----------|---------|
-| `tree` | C→S | N2 | `{ path }` → response `{ entries: [{ name, ftype, size, mtime }] }` |
-| `read` | C→S | N2 | `{ path }` → response `{ content }` |
-| `read_binary` | C→S | N2 | `{ path }` → response `{ content_base64 }` |
-| `stat` | C→S | N2 | `{ path }` → response `{ ftype, size, mtime, posix_mode, ... }` |
-| `write` | C→S | N2 | `{ path, delta, revision }` |
+| `tree` | C→S | N2 | Request payload ignored; reply is `fs/tree` with `{ tree }` |
+| `read` | C→S | N2 | `{ path }` → reply `fs/content` with `{ path, content }` |
+| `read_binary` | C→S | N2 | `{ path, offset?, length? }` → reply `fs/binary_chunk` with `{ path, offset, length, size, eof, data }` |
+| `stat` | C→S | N2 | `{ path }` → reply `fs/stat` with stat fields for that entry |
+| `open` | C→S | N2 | `{ path }` → reply `fs/opened` with `{ path, viewers }` |
+| `close` | C→S | N2 | `{ path }` |
+| `cursor` | C→S | N2 | `{ path, line, char }` → peer broadcast `fs/cursor` with `{ path, user_id, name, line, char }` |
+| `write` | C→S | N2 | `{ path, changes: [{ change_type, change_data, start_line, start_char, end_line, end_char }] }` |
 | `set_contents` | C→S | N2 | `{ path, content }` |
-| `create_file` | C→S | N2 | `{ path }` |
-| `mkdir` | C→S | N2 | `{ path }` |
-| `rename` | C→S | N2 | `{ path, new_path }` |
+| `create_file` | C→S | N2 | `{ path, content?, mkdirp? }` → reply/broadcast `fs/created` |
+| `create_dir` | C→S | N2 | `{ path }` → reply/broadcast `fs/created` |
+| `rename` | C→S | N2 | `{ path, new_name }` → reply/broadcast `fs/renamed` |
 | `delete` | C→S | N2 | `{ path }` |
-| `delta` | S→C | N2 | Broadcast: `{ path, delta, revision, user_id }` |
+| `import_git` | C→S | N2 | `{ git_url, git_ref? }` → `fs/import_started`, then `fs/import_done` or `fs/error` |
+| `change` | S→C | N2 | Broadcast: `{ path, change_type, change_data, start_line, start_char, end_line, end_char, revision, user_id }` |
+| `set_contents` | S→C | N2 | Broadcast: `{ path, content, revision, user_id }` |
+| `created` | S→C | N2 | Broadcast/reply: `{ path, type, id, user_id? }` |
+| `renamed` | S→C | N2 | Broadcast/reply: `{ old_path, new_path, id, user_id? }` |
+| `deleted` | S→C | N2 | Broadcast/reply: `{ path, user_id? }` |
+| `changed` | S→C | N2 | Watcher broadcast for on-disk mutations |
+| `error` | S→C | N2 | `{ message }` or `{ path, error }` |
 
 ## `terminal`
 
 | Command | Direction | Security | Payload |
 |---------|-----------|----------|---------|
-| `open` | C→S | N2 | `{ cols, rows }` → response `{ terminal_id }` |
+| `list` | S→C | N2 | `{ project_id, terminals }` |
+| `create` | C→S | N2 | `{ name?, agent_accessible? }` → reply `term/created` with `{ terminal_id, name }` |
+| `join` | C→S | N2 | `{ terminal_id }` → reply `term/joined` with `{ terminal_id, rows, cols }` |
 | `input` | C→S | N2 | `{ terminal_id, data }` |
 | `output` | S→C | N2 | `{ terminal_id, data }` |
 | `resize` | C→S | N2 | `{ terminal_id, cols, rows }` |
-| `close` | C→S | N2 | `{ terminal_id }` |
+| `resized` | S→C | N2 | `{ terminal_id, rows, cols, user_id }` |
+| `rename` | C→S | N2 | `{ terminal_id, name }` → reply `term/renamed` |
+| `set_agent_accessible` | C→S | N2 | `{ terminal_id, enabled }` |
+| `leave` | C→S | N2 | `{ terminal_id }` |
+| `destroy` | C→S | N2 | `{ terminal_id }` |
+| `exit` | S→C | N2 | `{ terminal_id, code, reason }` |
+| `record_start` | C→S | N2 | `{ terminal_id }` → reply `term/recording_started` |
+| `record_stop` | C→S | N2 | `{ terminal_id }` → reply `term/recording_stopped` |
+| `list_recordings` | C→S | N2 | `{}` → reply `term/recordings` with `{ recordings }` |
 
 ## `chat`
 
 | Command | Direction | Security | Payload |
 |---------|-----------|----------|---------|
-| `send` | C→S | N2 | `{ channel, text }` |
-| `message` | S→C | N2 | `{ channel, name, text, user_id, created_at }` |
-| `history` | C→S | N2 | `{ channel, limit }` → response `{ messages: [...] }` |
+| `join` | C→S | N2 | `{ channel_id }` → reply `chat/joined` with `{ channel_id, room_id, already_joined }` |
+| `message` | C→S | N2 | `{ channel_id, text }` |
+| `typing` | C→S | N2 | `{ channel_id }` |
+| `leave` | C→S | N2 | `{ channel_id }` → reply `chat/left` with `{ channel_id, room_id }` |
+| `user_list` | S→C | N2 | `{ room_id, channel_id, users: [{ user_id, name }] }` |
+| `user_join` | S→C | N2 | `{ room_id, channel_id, user_id, name }` |
+| `message` | S→C | N2 | `{ room_id, channel_id, user_id, name, text, timestamp }` |
+| `typing` | S→C | N2 | `{ channel_id, user_id, name }` |
+| `user_leave` | S→C | N2 | `{ room_id, channel_id, user_id, name }` |
 
-## `agents`
+## `agent`
 
 | Command | Direction | Security | Payload |
 |---------|-----------|----------|---------|
-| `send` | C→S | N2 | `{ conversation_uuid, content, agent_slug }` |
-| `message` | S→C | N2 | Streamed: `{ conversation_uuid, token }` |
-| `done` | S→C | N2 | `{ conversation_uuid }` |
-| `history` | C→S | N2 | `{ conversation_uuid }` → response `{ messages: [...] }` |
+| `list` | C→S | N2 | `{}` → reply `agent/list` with `{ agents }` |
+| `recent` | C→S | N2 | `{ limit? }` → reply `agent/recent` with `{ conversations }` |
+| `load` | C→S | N2 | `{ conversation_id }` → reply `agent/loaded` |
+| `set_visibility` | C→S | N2 | `{ conversation_id, visibility }` |
+| `ask` | C→S | N2 | `{ conversation_id?, agent_slug, message?, images? }` |
+| `started` | S→C | N2 | `{ conversation_id, agent }` |
+| `loaded` | S→C | N2 | `{ conversation_id, agent, title, visibility, owner_user_id, owner_is_self, messages }` |
+| `visibility_changed` | S→C | N2 | `{ conversation_id, visibility, owner_user_id }` |
+| `tool_call` | S→C | N2 | `{ conversation_id, agent, tool, args, call_id }` |
+| `tool_result` | S→C | N2 | `{ conversation_id, agent, tool, call_id, result }` |
+| `done` | S→C | N2 | `{ conversation_id, agent, content, turn, finish_reason, reasoning? }` |
+| `error` | S→C | N2 | `{ conversation_id, agent, message }` |
 
 ## Fanout semantics
 
 | Stream | Fanout | Durability | Recovery |
 |--------|--------|------------|----------|
-| `fs/delta` | broadcast to other clients on same project file | backed by DB changes | re-read file (`fs/read`) |
+| `fs/change` | broadcast to other clients viewing the same open file | backed by DB changes | re-read file (`fs/read`) |
 | `chat/message` | broadcast to room members | durable in `chat_messages` | request history |
 | `term/output` | broadcast to subscribers of terminal id | ephemeral stream | reopen terminal; no guaranteed replay |
-| `agents/message` | streamed to conversation listeners | final assistant message persisted | reload history |
+| `agent/done` | final response to conversation listeners | final assistant message persisted | reload history |
 
 ## Concrete examples
 
@@ -83,7 +124,7 @@ Security levels (`N0..N3`) follow [Security Model](/architecture/security-model/
 Client → server:
 
 ```json
-{ "cs": "fs", "cmd": "tree", "payload": { "path": "/" }, "ref": "req-1" }
+{ "cs": "fs", "cmd": "tree", "payload": {} }
 ```
 
 Server → client:
@@ -92,22 +133,83 @@ Server → client:
 {
   "cs": "fs",
   "cmd": "tree",
-  "ref": "req-1",
   "payload": {
-    "entries": [
-      { "name": "src", "ftype": "folder", "size": null },
-      { "name": "README.md", "ftype": "file", "size": 1387 }
+    "tree": {
+      "name": "/",
+      "path": "/",
+      "ftype": "folder",
+      "children": [
+        { "name": "src", "path": "/src", "ftype": "folder", "children": [] },
+        { "name": "README.md", "path": "/README.md", "ftype": "file" }
+      ]
+    }
+  }
+}
+```
+
+### Example: `fs/write`
+
+Client → server:
+
+```json
+{
+  "cs": "fs",
+  "cmd": "write",
+  "payload": {
+    "path": "/src/app.js",
+    "changes": [
+      {
+        "change_type": "insert",
+        "change_data": "console.log('hi')\n",
+        "start_line": 0,
+        "start_char": 0,
+        "end_line": 0,
+        "end_char": 0
+      }
     ]
   }
 }
 ```
 
-### Example: `chat/send` fanout
+Server → caller:
+
+```json
+{
+  "cs": "fs",
+  "cmd": "written",
+  "payload": {
+    "path": "/src/app.js",
+    "revisions": [12]
+  }
+}
+```
+
+Server → other viewers of that file:
+
+```json
+{
+  "cs": "fs",
+  "cmd": "change",
+  "payload": {
+    "path": "/src/app.js",
+    "change_type": "insert",
+    "change_data": "console.log('hi')\n",
+    "start_line": 0,
+    "start_char": 0,
+    "end_line": 0,
+    "end_char": 0,
+    "revision": 12,
+    "user_id": 7
+  }
+}
+```
+
+### Example: `chat/message` fanout
 
 Sender:
 
 ```json
-{ "cs": "chat", "cmd": "send", "payload": { "channel": "general", "text": "hello" } }
+{ "cs": "chat", "cmd": "message", "payload": { "channel_id": 1, "text": "hello" } }
 ```
 
 Broadcast to subscribers:
@@ -116,11 +218,16 @@ Broadcast to subscribers:
 {
   "cs": "chat",
   "cmd": "message",
-  "payload": { "channel": "general", "name": "alice", "text": "hello", "user_id": 7 }
+  "payload": {
+    "room_id": "project_42_channel_1",
+    "channel_id": 1,
+    "user_id": 7,
+    "name": "alice",
+    "text": "hello",
+    "timestamp": "2026-07-15T07:45:00Z"
+  }
 }
 ```
 
-> Payload shapes above are indicative — the authoritative source is the handler
-> modules in `carbide2-worker` (`fs_store.rb`, `chat_handler.rb`,
-> `terminal_handler.rb`, `agent_handler.rb`). A machine-readable `protocol.yaml`
-> in the worker repo is planned to replace this hand-maintained table.
+These objects are taken from the current worker handlers. The authoritative
+source remains the worker implementation.

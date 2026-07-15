@@ -92,9 +92,9 @@ sequenceDiagram
   participant Disk
 
   Monaco->>Client: text change delta
-  Client->>Worker: WS { cs:'fs', cmd:'write', payload:{path, delta} }
+  Client->>Worker: WS { cs:'fs', cmd:'write', payload:{path, changes:[...] } }
   Worker->>DB: INSERT FileChange (operation='write', delta=...)
-  Worker->>Client: broadcast delta to other connected clients
+  Worker->>Client: broadcast change to other viewers of the file
   Worker->>Flusher: record_write(bytes)
   Flusher-->>DB: calc_current (on threshold or timer)
   Flusher->>Disk: write file to PVC path

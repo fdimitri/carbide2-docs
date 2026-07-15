@@ -11,7 +11,8 @@ sidebar:
 ## deploy.rb
 
 The primary deploy tool is `scripts/deploy.rb` in the meta repo (`carbide2`).
-It GPG-signs all commits and rolls the control plane + workspace pods.
+It self-updates the meta repo checkout, refreshes submodules, imports images,
+and rolls the control plane + workspace deployments.
 
 ```bash
 cd ~/repos/carbide2
@@ -28,12 +29,11 @@ ruby scripts/deploy.rb --roll-scope workspaces
 
 ### Long-running deploys
 
-Run with `nohup` to avoid terminal hang — `deploy.rb` may prompt for GPG passphrase:
+Run with `nohup` to avoid terminal hang and watch the logfile while the deploy runs:
 
 ```bash
-export GPG_TTY=$(tty)
 nohup ruby scripts/deploy.rb > /tmp/deploy.log 2>&1 &
-tail -f /tmp/deploy.log
+tail -n 40 /tmp/deploy.log
 ```
 
 ## Submodule pin discipline
@@ -52,11 +52,26 @@ git push origin main
 
 Stale pins build old images. Checklist: **server**, **control**, **client**, **worker** — all four must be current.
 
+Pinned submodules answer which code the deploy builds. They do not explain an
+old SPA still being served after a deploy if the new image was already built and
+imported successfully.
+
 ## Deploy pulls meta `main`
 
 `deploy.rb` does `git pull --ff-only` on the **current branch** of the meta repo
 checkout on the deploy target (typically `main`). Changes on `dev` only ship after
 merging to `main`.
+
+## Same-tag rebuilds still need a rollout
+
+`deploy.rb` force-restarts the control-plane deployments and existing workspace
+deployments after re-importing images. That matters because a Helm upgrade is a
+no-op when only the image contents changed under the same tag.
+
+If an old SPA is still being served after deploy, look at rollout state first:
+- old pods may still be serving traffic
+- the relevant deployment may not have restarted cleanly
+- stale shell sidecar pods may still be running old code until deleted and respawned
 
 ## Fast iteration (code overlay)
 

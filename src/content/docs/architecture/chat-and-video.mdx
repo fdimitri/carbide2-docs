@@ -23,17 +23,14 @@ sequenceDiagram
   participant DB as Postgres
   participant B as Client B..N
 
-  A->>W: chat/send {channel, text}
-  W->>DB: INSERT chat_messages
-  W-->>A: ack/message
+  A->>W: chat/message {channel_id, text}
+  W-->>A: chat/message broadcast
   W-->>B: chat/message broadcast
 
-  A->>W: rtc/offer {peer_id, sdp}
-  W-->>B: rtc/offer (targeted fanout)
-  B->>W: rtc/answer {peer_id, sdp}
-  W-->>A: rtc/answer
-  A->>W: rtc/ice {peer_id, candidate}
-  W-->>B: rtc/ice
+  A->>W: rtc/signal {channel_id, to, data}
+  W-->>B: rtc/signal {channel_id, from, data}
+  B->>W: rtc/signal {channel_id, to, data}
+  W-->>A: rtc/signal {channel_id, from, data}
 ```
 
 ### Broadcast and ordering guarantees (current)

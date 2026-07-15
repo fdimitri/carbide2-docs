@@ -17,19 +17,22 @@ Security:
 - Caller must be a member of the workspace project and joined to the target room.
 
 Envelope:
-- Uses the standard WS shape with cs, cmd, payload.
-- cs value: rtc.
+- Uses the standard WS shape with `cs`, `cmd`, and `payload`.
+- `cs` value is always `rtc`.
 
 Commands:
 
 | Command | Direction | Payload | Notes |
 |---|---|---|---|
-| rtc/join | C to S | room, peer_id, capabilities | Registers peer presence in room |
-| rtc/leave | C to S | room, peer_id | Removes peer from room |
-| rtc/offer | C to S then S to peer | room, from_peer_id, to_peer_id, sdp | Targeted fanout |
-| rtc/answer | C to S then S to peer | room, from_peer_id, to_peer_id, sdp | Targeted fanout |
-| rtc/ice | C to S then S to peer | room, from_peer_id, to_peer_id, candidate | Targeted fanout |
-| rtc/peers | C to S then S to C | room | Returns current peers |
+| `join` | C→S | `{ channel_id }` | Caller must already be joined to that chat channel |
+| `peers` | S→C | `{ channel_id, peers }` | Sent to the joiner with current call peers |
+| `peer_join` | S→C | `{ channel_id, peer_id, user_id, name }` | Broadcast to existing call members |
+| `leave` | C→S | `{ channel_id }` | Leaves the live call for that channel |
+| `left` | S→C | `{ channel_id }` | Reply to the leaver |
+| `peer_leave` | S→C | `{ channel_id, peer_id, user_id, name }` | Broadcast to remaining call members |
+| `signal` | C→S | `{ channel_id, to, data }` | Relay arbitrary SDP/ICE payload to a specific peer |
+| `signal` | S→C | `{ channel_id, from, data }` | Forwarded unchanged except `from` is the sender peer id |
+| `call_state` | S→C | `{ channel_id, participants }` | Presence snapshot sent to all channel members |
 
 Semantics:
 - Worker relays only. It does not parse or mutate SDP or ICE candidates.
@@ -39,20 +42,66 @@ Semantics:
 
 Error cases:
 - unauthorized: caller lacks N2 or room membership.
-- unknown_peer: to_peer_id not currently present in room.
-- room_mismatch: peer and room association invalid.
+- unknown_peer: target peer is not currently present in the call.
+- room_mismatch: caller is not joined to the target channel call.
 - malformed_payload: required fields missing or invalid.
 
 Concrete example flow:
 
-Client A sends rtc/offer to client B:
-- cs: rtc
-- cmd: rtc/offer
-- payload: room=general, from_peer_id=a1, to_peer_id=b7, sdp=OFFER_SDP
+Caller joins the call for chat channel `1`:
 
-Worker forwards same payload to client B as rtc/offer.
+```json
+{ "cs": "rtc", "cmd": "join", "payload": { "channel_id": 1 } }
+```
 
-Client B responds with rtc/answer and candidate exchange proceeds via rtc/ice.
+Worker replies with the peers the caller should offer to:
+
+```json
+{
+  "cs": "rtc",
+  "cmd": "peers",
+  "payload": {
+    "channel_id": 1,
+    "peers": [
+      { "peer_id": "b7", "user_id": 9, "name": "bob" }
+    ]
+  }
+}
+```
+
+Caller sends a signaling blob to peer `b7`:
+
+```json
+{
+  "cs": "rtc",
+  "cmd": "signal",
+  "payload": {
+    "channel_id": 1,
+    "to": "b7",
+    "data": {
+      "type": "offer",
+      "sdp": "OFFER_SDP"
+    }
+  }
+}
+```
+
+Worker forwards it to that peer as:
+
+```json
+{
+  "cs": "rtc",
+  "cmd": "signal",
+  "payload": {
+    "channel_id": 1,
+    "from": "a1",
+    "data": {
+      "type": "offer",
+      "sdp": "OFFER_SDP"
+    }
+  }
+}
+```
 
 Compatibility notes:
 - This contract is best effort and may evolve.

@@ -15,6 +15,7 @@ sidebar:
 | [carbide2-client](https://github.com/fdimitri/carbide2-client) | Browser IDE SPA | Vue 3 / Vite |
 | [carbide2-control](https://github.com/fdimitri/carbide2-control) | Control plane + k8s operator | Ruby 4.0 / Rails 8.1 |
 | [carbide2-docs](https://github.com/fdimitri/carbide2-docs) | This documentation site | Astro Starlight |
+| [carbide2-site](https://github.com/fdimitri/carbide2-site) | Public website, shared branding assets, and marketing pages | Astro |
 
 ## Local checkout gotchas
 
@@ -29,6 +30,12 @@ in `carbide2-worker`, not `carbide2-server`.
 The real client is the sibling `carbide2-client` checkout;
 `carbide2-server/clients/carbide2-client` is a partial copy. The
 `CARBIDE2_CLIENT` env var overrides the default sibling path.
+
+### Docs vs. public site
+
+Edit `carbide2-docs` for architecture, API, ops, and contributor documentation.
+Edit `carbide2-site` for the public website, landing pages, and shared brand
+assets that may also be reused by the docs site.
 
 ### Shared database
 

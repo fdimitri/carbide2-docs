@@ -17,6 +17,8 @@ All WebSocket messages are JSON objects with three top-level fields:
 }
 ```
 
+The current worker does not implement a top-level request id or `ref` field.
+
 | Field | Type | Description |
 |-------|------|-------------|
 | `cs` | string | CommandSet — routes to the correct handler module |
@@ -25,15 +27,13 @@ All WebSocket messages are JSON objects with three top-level fields:
 
 ## Server → client messages
 
-Responses and broadcasts use the same format, often with a `ref` field mirroring
-the client's request ID:
+Responses and broadcasts use the same format:
 
 ```json
 {
   "cs":      "fs",
   "cmd":     "tree",
-  "ref":     "abc123",
-  "payload": { "entries": [...] }
+  "payload": { "tree": { "path": "/", "children": [] } }
 }
 ```
 
@@ -56,13 +56,15 @@ DBFS operations. See [Filesystem (DBFS)](/architecture/filesystem/).
 |---------|-----------|-------------|
 | `tree` | C→S / S→C | List directory entries |
 | `read` | C→S / S→C | Read file content |
-| `write` | C→S | Append a write delta |
+| `open` | C→S | Register as viewing a file |
+| `cursor` | C→S / S→C | Update and broadcast editor cursor position |
+| `write` | C→S | Append one or more DBFS change records |
 | `set_contents` | C→S | Replace full content |
 | `create_file` | C→S | Create a new file |
-| `mkdir` | C→S | Create a directory |
+| `create_dir` | C→S | Create a directory |
 | `rename` | C→S | Rename a path |
 | `delete` | C→S | Delete an entry |
-| `delta` | S→C | Broadcast a file change to other clients |
+| `change` | S→C | Broadcast a file change to other viewers |
 
 ### `terminal`
 
@@ -74,11 +76,12 @@ and constrains filesystem access to the mounted project root.
 
 | Command | Direction | Description |
 |---------|-----------|-------------|
-| `open` | C→S | Open a new PTY terminal |
+| `create` | C→S | Create a new PTY terminal |
+| `join` | C→S | Subscribe to an existing terminal |
 | `input` | C→S | Send keystrokes to PTY |
 | `output` | S→C | Broadcast PTY output to subscribers |
 | `resize` | C→S | Resize PTY (cols × rows) |
-| `close` | C→S | Close a terminal session |
+| `destroy` | C→S | Close a terminal session |
 
 #### Terminal backend modes
 
@@ -97,20 +100,22 @@ IRC-style project chat.
 
 | Command | Direction | Description |
 |---------|-----------|-------------|
-| `send` | C→S | Post a message |
-| `message` | S→C | Broadcast a new message to room members |
-| `history` | C→S / S→C | Request / receive message backlog |
+| `join` | C→S | Join a channel room |
+| `message` | C→S / S→C | Post / receive a message |
+| `typing` | C→S / S→C | Typing indicator |
+| `leave` | C→S / S→C | Leave a channel room |
 
-### `agents`
+### `agent`
 
 AI agent interaction.
 
 | Command | Direction | Description |
 |---------|-----------|-------------|
-| `send` | C→S | Send a message to an agent |
-| `message` | S→C | Stream agent response token |
-| `done` | S→C | Agent response complete |
-| `history` | C→S / S→C | Conversation history |
+| `list` / `recent` / `load` | C→S | List agents or load conversation state |
+| `ask` | C→S | Send a prompt to an agent |
+| `tool_call` / `tool_result` | S→C | Surface tool activity for a turn |
+| `done` | S→C | Final assistant response for the turn |
+| `error` | S→C | Agent-turn failure |
 
 ## Protocol versioning
 
@@ -130,6 +135,6 @@ currently logs a warning (non-blocking); hard-fail will be added in a future rel
 |------|------|
 | `worker/worker.rb` | Main EM server; routes `cs` to handlers; protocol constants |
 | `worker/fs_store.rb` | `fs` commandSet handler |
-| `worker/chat_handler.rb` | `chat` commandSet handler |
-| `worker/terminal_handler.rb` | `terminal` commandSet + PTY |
-| `worker/agent_handler.rb` | `agents` commandSet handler |
+| `worker/handlers/chat_handlers.rb` | `chat` commandSet handler |
+| `worker/handlers/term_handlers.rb` | `term` commandSet + PTY |
+| `worker/handlers/agent_handlers.rb` | `agent` commandSet handler |

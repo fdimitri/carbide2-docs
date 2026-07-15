@@ -57,16 +57,16 @@ Authentication via JWT (see [Authentication & JWT](/architecture/authentication/
 
 ```
 Browser → Traefik → EventMachine worker
-  → { cs: 'fs', cmd: 'write', payload: ... }
+  → { cs: 'fs', cmd: 'write', payload: { path, changes: [...] } }
   → FileChange row in Postgres
-  → broadcast delta to other connected clients
+  → broadcast change to other viewers of that file
   → VfsFlusher: write to disk (PVC) on threshold / timer
 ```
 
 ### Terminal path (PTY sidecar)
 
 ```
-Browser → Traefik → EventMachine worker (term/open)
+Browser → Traefik → EventMachine worker (term/create)
   → ensure per-project shell sidecar is running
   → PTY exec attaches into shell sidecar (not server/worker process namespaces)
   → sidecar mounts only the project filesystem root

@@ -7,8 +7,8 @@ sidebar:
 
 ## Deploy built old code despite new commits
 
-**Cause:** stale submodule pins in the meta repo. `deploy.rb` builds from the
-pinned SHAs, not component branch tips.
+**Cause:** the meta repo pins old component SHAs. `deploy.rb` builds from the
+pinned SHAs, not from component branch tips.
 
 **Fix:**
 ```bash
@@ -22,18 +22,25 @@ on meta `main` — the deploy pulls meta `main`, not `dev`.
 
 ## Old SPA served after deploy
 
-Both the workspace image and the control-plane image build the Vue SPA from the
-meta repo's **carbide2-client submodule**. A stale client pin ships an old SPA
-in *both* images even when server/control pins are fresh.
+This is usually a rollout or running-pod problem, not a submodule-pin problem by
+itself. A stale client pin explains why an old SPA image got built; it does not
+explain why an already-built new image is not what clients are seeing.
+
+Check these first:
+
+- Did the relevant deployment actually roll after the image import?
+- Are old control-plane or workspace pods still serving traffic?
+- If this was a same-tag rebuild, did the forced rollout complete?
+- Are stale shell sidecar pods still hanging around after the worker restart?
 
 ## GPG signing failures during deploy
 
-`deploy.rb` GPG-signs commits. In a non-interactive shell:
+`deploy.rb` does not create or sign commits. If you hit a GPG signing failure,
+it came from a separate `git commit` you ran manually, not from `deploy.rb`.
 
 ```bash
+# example: only needed when you are about to run a real git commit manually
 export GPG_TTY=$(tty)
-# warm the passphrase cache first:
-echo a | gpg --clearsign >/dev/null
 ```
 
 ## 404 on an authenticated endpoint (expected 401)

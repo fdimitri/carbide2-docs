@@ -63,15 +63,13 @@ sequenceDiagram
   participant Worker as agent_handler.rb
   participant LLM as LLM API
 
-  Client->>Worker: WS { cs:'agents', cmd:'send', payload:{conv_id, content} }
+  Client->>Worker: WS { cs:'agent', cmd:'ask', payload:{conversation_id, agent_slug, message} }
   Worker->>DB: INSERT AgentMessage (role='user')
   Worker->>LLM: POST /v1/chat/completions (stream: true)
-  loop stream chunks
-    LLM-->>Worker: SSE chunk
-    Worker-->>Client: WS { cs:'agents', cmd:'message', payload:{token} }
-  end
+  Worker-->>Client: WS { cs:'agent', cmd:'tool_call', payload:{tool, args, call_id, ...} }
+  Worker-->>Client: WS { cs:'agent', cmd:'tool_result', payload:{tool, result, call_id, ...} }
   Worker->>DB: INSERT AgentMessage (role='assistant', content=full_response)
-  Worker-->>Client: WS { cs:'agents', cmd:'done' }
+  Worker-->>Client: WS { cs:'agent', cmd:'done', payload:{content, turn, finish_reason, ...} }
 ```
 
 ## Local dev relay

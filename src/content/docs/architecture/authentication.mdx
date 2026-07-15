@@ -68,5 +68,5 @@ sequenceDiagram
 
   Browser->>Worker: WS connect ?token=<jwt>
   Worker->>Worker: decode + validate
-  Worker-->>Browser: { cs:'system', cmd:'connected' }
+  Worker-->>Browser: { cs:'system', cmd:'connected', payload:{ user_id, project_id, protocol, min_client, token_exp } }
 ```
