@@ -9,10 +9,10 @@ export default defineConfig({
     starlight({
       title: 'Carbide2 Docs',
       description: 'Documentation for the Carbide2 collaborative development environment.',
+      favicon: '/favicon.svg',
       logo: {
-        alt: 'Carbide2',
-        light: './src/assets/logo-light.svg',
-        dark: './src/assets/logo-dark.svg',
+        alt: 'CARB/IDE2',
+        src: './src/assets/c2-logo.svg',
         replacesTitle: false,
       },
       social: [
