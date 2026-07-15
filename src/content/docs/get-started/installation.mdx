@@ -1,0 +1,78 @@
+---
+title: Installation
+description: Local development setup via Docker Compose or k3d.
+sidebar:
+  order: 2
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+Carbide2 supports two local development paths: **k3d** (primary, full Kubernetes stack)
+and **Docker Compose** (simpler, no k8s).
+
+## Prerequisites
+
+| Tool | Minimum version |
+|------|----------------|
+| Docker | 24.x |
+| k3d | 5.x (k3d path only) |
+| kubectl | 1.28+ |
+| Helm | 3.x |
+| Ruby | 4.0 (via rbenv) |
+| Node.js | 20.x |
+
+## Quick start
+
+<Tabs>
+<TabItem label="k3d (primary)">
+
+```bash
+# Clone the meta repo with submodules
+git clone --recurse-submodules https://github.com/fdimitri/carbide2.git
+cd carbide2
+
+# Create a local k3d cluster
+./scripts/dev-cluster.sh
+
+# Deploy everything
+ruby scripts/deploy.rb
+```
+
+See [Kubernetes Ops](/operations/kubernetes/) for cluster management commands.
+
+</TabItem>
+<TabItem label="Docker Compose">
+
+```bash
+git clone --recurse-submodules https://github.com/fdimitri/carbide2.git
+cd carbide2/carbide2-server
+
+# Copy and edit env
+cp .env.example .env
+
+# Start all services
+docker compose up
+```
+
+The app is available at `http://localhost:3000`.
+
+Default credentials: `admin@example.com` / `password` (seeded by `db/seeds.rb`).
+
+</TabItem>
+</Tabs>
+
+## Submodule discipline
+
+After any `git pull` on the meta repo, always update submodules:
+
+```bash
+git submodule update --init --recursive
+```
+
+The meta repo pins exact SHAs. Stale submodules will build old code even if component
+tags are newer.
+
+## Next steps
+
+- [Deployment guide](/operations/deployment/) — k3d deploy workflow and rolling updates
+- [Kubernetes Ops](/operations/kubernetes/) — cluster management, namespaces, logs

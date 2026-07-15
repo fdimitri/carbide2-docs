@@ -1,0 +1,22 @@
+---
+title: UX Notes
+description: Design directions and UI principles for the workspace SPA.
+sidebar:
+  order: 1
+---
+
+> Migrated from `carbide2-server/UX_NOTES.md` — being reorganized. See the
+> [carbide2-client ARCHITECTURE.md](https://github.com/fdimitri/carbide2-client)
+> for component-level detail.
+
+## Principles
+
+- Terminal/cyberpunk aesthetic — dark IDE surfaces, brand blue `#5ab0ff` accent,
+  JetBrains Mono for code and Inter for UI.
+- Design tokens are the single source of truth
+  (`carbide2-client/src/styles/main.css` `@theme` block); the site and docs
+  mirror them.
+- Density over whitespace: this is an IDE, not a marketing page. The `text-ui-*`
+  type ladder covers dense UI copy.
+- Building blocks over ad-hoc fixes: spacing is defined once in shared
+  components (Avatar, UiButton, tab, pane header, message row).

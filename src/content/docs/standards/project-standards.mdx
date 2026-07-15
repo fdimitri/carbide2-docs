@@ -1,0 +1,27 @@
+---
+title: Project Standards
+description: Git workflow, commit signing, and review rules.
+sidebar:
+  order: 1
+---
+
+## Git
+
+- **All commits must be GPG-signed.** Never disable signing (`git -c commit.gpgsign=false` is forbidden).
+- **Never amend or force-push published commits.**
+- Small, well-scoped commits with descriptive messages.
+- Component repos: work lands on `dev`, then fast-forwards to `main`.
+- Meta repo (`carbide2`): bump **all four** submodule pins together before deploying.
+
+## Licensing
+
+All repos are **GPLv3**. Substantial new files need a copyright header:
+
+```ruby
+# Copyright (C) 2026 Carbide2 contributors. GPLv3.
+```
+
+## Issues
+
+- Bugs fixed by direct commit to main (no PR): close the GitHub issue manually —
+  `closes #N` only auto-closes via merged PRs.

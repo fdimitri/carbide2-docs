@@ -1,0 +1,43 @@
+---
+title: "ADR-001: Database-backed VFS"
+description: Why file content lives in Postgres, not on disk.
+sidebar:
+  order: 1
+---
+
+**Status:** Accepted · **Date:** 2026 (retro-documented)
+
+## Context
+
+Carbide2 needs real-time collaborative editing where multiple clients see each
+other's changes instantly, plus point-in-time history, across workspace pod
+restarts.
+
+## Decision
+
+Store all file content in Postgres as an append-only `file_changes` log per
+`directory_entries` row. Current content is derived by replay
+(`DirectoryEntry#calc_current`). Disk is a **derived cache**, written by
+`VfsFlusher` so shell tools inside the pod see a conventional filesystem.
+
+## Consequences
+
+**Positive**
+- No save step — every keystroke is durable.
+- Change history and attribution (per-user deltas) come for free.
+- Broadcast to collaborators is a natural side-effect of the write path.
+- Pod is disposable — state survives in the database.
+
+**Negative**
+- Read cost grows with change-log length (full replay); compaction policy needed.
+- Binary files don't fit the delta model — handled via the `binary`
+  passthrough flag reading directly from VFS disk.
+- Worker and Rails share the schema — migrations must be expand/contract safe
+  (issue #17).
+
+## Alternatives considered
+
+- **Disk-primary + inotify sync** — simpler reads, but conflict-prone for
+  concurrent editing and loses per-keystroke history.
+- **CRDT store (e.g. Yjs)** — richer merge semantics, but a much larger
+  dependency surface; revisit if offline editing becomes a requirement.

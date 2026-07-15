@@ -1,0 +1,37 @@
+---
+title: Repo Map
+description: The meta repo, its submodules, and local checkout layout.
+sidebar:
+  order: 1
+---
+
+## Repositories
+
+| Repo | Role | Language |
+|------|------|----------|
+| [carbide2](https://github.com/fdimitri/carbide2) | Meta repo — submodule pins + `deploy.rb` | — |
+| [carbide2-server](https://github.com/fdimitri/carbide2-server) | Workspace Rails app + REST API | Ruby 4.0 / Rails 8.1 |
+| [carbide2-worker](https://github.com/fdimitri/carbide2-worker) | EventMachine WS worker | Ruby |
+| [carbide2-client](https://github.com/fdimitri/carbide2-client) | Browser IDE SPA | Vue 3 / Vite |
+| [carbide2-control](https://github.com/fdimitri/carbide2-control) | Control plane + k8s operator | Ruby 4.0 / Rails 8.1 |
+| [carbide2-docs](https://github.com/fdimitri/carbide2-docs) | This documentation site | Astro Starlight |
+
+## Local checkout gotchas
+
+### The worker symlink
+
+`carbide2-server/worker` is a **symlink** to the sibling `carbide2-worker` checkout.
+Editing `carbide2-server/worker/*.rb` edits the worker repo — commit those changes
+in `carbide2-worker`, not `carbide2-server`.
+
+### Client checkout
+
+The real client is the sibling `carbide2-client` checkout;
+`carbide2-server/clients/carbide2-client` is a partial copy. The
+`CARBIDE2_CLIENT` env var overrides the default sibling path.
+
+### Shared database
+
+The worker connects to the **same Postgres** as Rails (`worker/ar_boot.rb`) and
+loads every `app/models/*.rb`. Schema changes affect both processes — see
+[Database Schema](/architecture/database-schema/).

@@ -1,0 +1,86 @@
+---
+title: Kubernetes Ops
+description: k3d cluster management, namespaces, logs, and resource reference.
+sidebar:
+  order: 4
+---
+
+## 60-second mental model
+
+```
+Traefik (ingress)
+  ├── / → carbide2-control  (control plane, Dashboard SPA, k8s operator)
+  └── /w/<workspace-id>/ → ws-<id> namespace  (per-workspace pod)
+```
+
+Each workspace runs in an isolated `ws-<id>` namespace. The control-plane operator
+watches `Workspace` custom resources and provisions/deprovisions workspace pods.
+
+## Cluster management
+
+```bash
+# Create dev cluster
+./scripts/dev-cluster.sh
+
+# List clusters
+k3d cluster list
+
+# Stop/start
+k3d cluster stop carbide
+k3d cluster start carbide
+
+# Delete
+k3d cluster delete carbide
+```
+
+## Key namespaces
+
+| Namespace | Contents |
+|-----------|---------|
+| `default` | Traefik ingress, shared services |
+| `carbide` | Control plane deployment |
+| `ws-<id>` | Per-workspace pod (Rails + worker + Vite) |
+
+## Common kubectl commands
+
+```bash
+# Control plane logs
+kubectl -n carbide logs -l app=carbide2-control -f
+
+# Workspace pod logs (replace <id>)
+kubectl -n ws-<id> logs -l app=carbide2-server -f
+
+# Worker logs specifically
+kubectl -n ws-<id> logs -l app=carbide2-server -c worker -f
+
+# Shell into a workspace pod
+kubectl -n ws-<id> exec -it deploy/carbide2-server -- bash
+
+# Restart a deployment
+kubectl -n carbide rollout restart deploy/carbide2-control
+kubectl -n ws-<id> rollout restart deploy/carbide2-server
+```
+
+## Database
+
+Carbide2 uses CloudNative PG (`cnpg`). The cluster definition is in `deploy/cnpg-cluster.yaml`.
+
+```bash
+# Connect to Postgres
+kubectl -n carbide exec -it carbide-db-1 -- psql -U carbide
+
+# Check cluster status
+kubectl -n carbide get cluster
+```
+
+## Helm charts
+
+Workspace pod Helm chart: `charts/workspace/`.
+
+```bash
+# Render chart (dry-run)
+helm template carbide ./charts/workspace -f charts/workspace/values.yaml
+
+# List installed releases
+helm list -A
+```

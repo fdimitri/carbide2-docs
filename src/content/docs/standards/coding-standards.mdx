@@ -1,0 +1,39 @@
+---
+title: Coding Standards
+description: Ruby, Vue, and documentation conventions.
+sidebar:
+  order: 2
+---
+
+## Ruby
+
+- Target Ruby 4.0 / Rails 8.1.
+- Lint with `bundle exec rubocop` (config in each repo).
+- File-header doc comments in plain English prose — purpose, usage, behaviour —
+  **not** YARD tags:
+
+```ruby
+# FsStore — database-backed filesystem handler for the EventMachine worker.
+#
+# Handles the 'fs' commandSet over WebSocket. All reads go through
+# DirectoryEntry#calc_current (full replay). ...
+```
+
+- Inline comments explain *intent and interactions* (reference related models/
+  tables/services), not what the code syntactically does.
+
+## Vue / client
+
+- Vue 3 composition API; shared logic goes in composables (`src/composables/`),
+  not copied helpers.
+- Reusable building blocks over one-off spacing fixes: `Avatar`, `UiButton`,
+  and friends define spacing once.
+- Tailwind v4 with the brand `@theme` token block in `src/styles/main.css` —
+  token names (`text-accent`, `bg-1`, `border-line`) are the stable interface.
+
+## Documentation
+
+- New WS command → update the [WebSocket Commands](/api-reference/websocket-commands/) page.
+- New REST endpoint → update the relevant API reference page (OpenAPI spec once available).
+- Schema migration → update [Database Schema](/architecture/database-schema/).
+- New env var → update [Environment Variables](/operations/environment-variables/).

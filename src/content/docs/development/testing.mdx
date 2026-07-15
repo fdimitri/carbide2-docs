@@ -1,0 +1,35 @@
+---
+title: Testing
+description: The four-layer test strategy across the stack.
+sidebar:
+  order: 2
+---
+
+## Test layers
+
+| Layer | Tool | Location | Command |
+|-------|------|----------|---------|
+| 1. Substrate smoke | bash | `carbide2-server/scripts/test-substrate.sh` | `./scripts/test-substrate.sh` |
+| 2. Helm/pod smoke | Rails test | `test/smoke_project_pod_test.rb` | `bundle exec rails test test/smoke_project_pod_test.rb` |
+| 3. Rails unit/integration | Rails test | `carbide2-server/test/` | `./scripts/test-rails.sh` |
+| 4. End-to-end | Playwright | `carbide2-client/tests/e2e/` | `npx playwright test --reporter=list` |
+
+## Playwright specifics
+
+```bash
+cd carbide2-client
+
+# Full smoke (captures all console output + WS frames)
+npm run test:smoke
+
+# Individual flows
+npx playwright test tests/e2e/terminal.spec.js --reporter=list
+npx playwright test tests/e2e/chat.spec.js --reporter=list
+```
+
+All e2e scripts set `localStorage.carbide_log=255` automatically via `addInitScript`.
+
+## CI
+
+`carbide2-server/bin/ci` runs the Rails layer plus `rubocop`, `brakeman`, and
+`bundler-audit`.

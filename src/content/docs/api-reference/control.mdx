@@ -1,0 +1,61 @@
+---
+title: Control Plane API
+description: carbide2-control REST API reference — sessions and workspaces.
+sidebar:
+  order: 3
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+<Aside type="note">
+  An OpenAPI spec (`docs/openapi.yaml`) is planned for `carbide2-control`.
+  Until then, endpoints are documented here by hand.
+</Aside>
+
+## Sessions
+
+### `POST /api/sessions`
+
+Log in — issue a JWT.
+
+**Request body:**
+```json
+{ "email": "user@example.com", "password": "..." }
+```
+
+**Response:**
+```json
+{ "token": "<jwt>", "user": { "id": 1, "email": "..." } }
+```
+
+### `POST /api/signup`
+
+Register a new user.
+
+---
+
+## Workspaces
+
+### `GET /api/workspaces`
+
+List the authenticated user's workspaces, including pod health.
+
+### `POST /api/workspaces`
+
+Create a new workspace. The k8s operator provisions a `ws-<id>` namespace and pod.
+
+### `GET /api/workspaces/:id`
+
+Workspace detail, including provisioning status and health.
+
+### `DELETE /api/workspaces/:id`
+
+Deprovision a workspace (operator tears down the namespace).
+
+### `POST /api/workspaces/:id/token`
+
+Mint a workspace-scoped JWT for connecting to the workspace pod's API/WebSocket.
+
+### `GET /api/workspaces/:id/health`
+
+Pod liveness/readiness summary for the dashboard health dot.

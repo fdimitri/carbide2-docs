@@ -1,0 +1,84 @@
+/* ── Tailwind v4 ─────────────────────────────────────────────────────────── */
+@import "tailwindcss";
+
+/* ── CARB/IDE2 brand design tokens ──────────────────────────────────────────
+   Mirrors carbide2-client/src/styles/main.css @theme block and
+   carbide2-site/tailwind.config.mjs `carbide` palette.
+   Single source of truth: carbide2-client. Keep in sync manually until a
+   shared package is available. */
+@theme {
+  /* Dark IDE backgrounds (bg-0 deepest → bg-3 raised) */
+  --color-bg-0: #08090d;
+  --color-bg-1: #0d1016;
+  --color-bg-2: #12161e;
+  --color-bg-3: #1c2230;
+
+  /* UI colours */
+  --color-line:          #1c2230;
+  --color-text:          #c8d8e8;
+  --color-muted:         #5c7888;
+  --color-accent:        #5ab0ff;   /* brand blue */
+  --color-accent-dark:   #2e8fd4;
+  --color-accent-fg:     #d7ecff;   /* brand-lit text on dark surfaces */
+  --color-accent-text:   #04121f;   /* dark text on accent-coloured surfaces */
+  --color-on-solid:      #ffffff;
+  --color-warn:          #ff6b6b;
+  --color-amber:         #ffb454;
+  --color-cyan:          #5cf6ff;
+  --color-success:       #a6e3a1;
+  --color-accent-bright: #8fcaff;
+  --color-sel:           #10243a;
+  --color-dim:           #2b3445;
+  --color-bg-input:      #05080d;
+
+  /* Accent as raw RGB channels — for rgb(var(--accent-rgb) / <a>) glows. */
+  --accent-rgb: 90 176 255;
+
+  /* Typography — JetBrains Mono brand face, matches the site. */
+  --font-ui:   "Inter", "IBM Plex Sans", "Segoe UI", sans-serif;
+  --font-mono: "JetBrains Mono", "IBM Plex Mono", "Fira Code", ui-monospace, monospace;
+
+  /* Glow shadows */
+  --shadow-glow:    0 0 12px rgb(90 176 255 / 0.45), 0 0 32px rgb(90 176 255 / 0.15);
+  --shadow-glow-sm: 0 0 6px rgb(90 176 255 / 0.5);
+}
+
+/* ── Starlight variable overrides — map brand tokens onto --sl-* vars ────── */
+/* Light mode (Starlight defaults to light; we keep bg-3 as a near-white alt) */
+:root,
+[data-theme='light'] {
+  --sl-color-accent-low:  #cce4ff;
+  --sl-color-accent:      #2e8fd4;   /* accent-dark — readable on white */
+  --sl-color-accent-high: #04121f;
+  --sl-font:              var(--font-ui);
+  --sl-font-mono:         var(--font-mono);
+}
+
+/* Dark mode */
+[data-theme='dark'] {
+  --sl-color-accent-low:  #10243a;   /* sel — deep tinted bg for active items */
+  --sl-color-accent:      #5ab0ff;   /* full brand blue */
+  --sl-color-accent-high: #d7ecff;   /* accent-fg — bright text on accent */
+
+  /* Background layers */
+  --sl-color-bg:          #0d1016;   /* bg-1 */
+  --sl-color-bg-nav:      #08090d;   /* bg-0 — deepest, sidebar/nav */
+  --sl-color-bg-sidebar:  #08090d;
+  --sl-color-bg-inline-code: #12161e; /* bg-2 */
+  --sl-color-bg-badge:    #10243a;
+  --sl-color-hairline:    #1c2230;   /* line */
+
+  /* Text */
+  --sl-color-text:        #c8d8e8;   /* text */
+  --sl-color-text-accent: #5ab0ff;   /* accent */
+  --sl-color-gray-1:      #c8d8e8;
+  --sl-color-gray-2:      #8fa8bc;
+  --sl-color-gray-3:      #5c7888;
+  --sl-color-gray-4:      #2b3445;
+  --sl-color-gray-5:      #1c2230;
+  --sl-color-gray-6:      #12161e;
+  --sl-color-black:       #08090d;
+
+  --sl-font:              var(--font-ui);
+  --sl-font-mono:         var(--font-mono);
+}

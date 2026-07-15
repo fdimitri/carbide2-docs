@@ -1,0 +1,121 @@
+---
+title: Filesystem (VFS)
+description: How Carbide2's database-backed virtual filesystem works.
+sidebar:
+  order: 2
+---
+
+## Design principle
+
+There is **no save step**. Every keystroke is immediately persisted. The database
+*is* the filesystem. Disk is a flushed snapshot used by shell tools running in the pod.
+
+## Data model
+
+```mermaid
+erDiagram
+  DirectoryEntry {
+    int id
+    int project_id
+    string path
+    string kind
+    string content_type
+    datetime created_at
+  }
+  FileChange {
+    int id
+    int directory_entry_id
+    string operation
+    text delta
+    int user_id
+    datetime created_at
+  }
+  DirectoryEntry ||--o{ FileChange : "has many"
+```
+
+### `DirectoryEntry`
+
+One row per file or folder in the project's VFS. Stores metadata only — no content.
+
+- `kind`: `'file'` | `'folder'`
+- `path`: absolute VFS path (e.g. `/src/app.js`)
+
+### `FileChange`
+
+Append-only log of every mutation to a file.
+
+- `operation`: `'write'` | `'set_contents'` | `'create'` | `'delete'` | `'rename'`
+- `delta`: the change payload (full content for `set_contents`, OT delta for `write`)
+
+## Reading a file: `calc_current`
+
+`DirectoryEntry#calc_current` replays all `FileChange` rows for that entry in
+creation order, producing the current file content. There is no "latest version"
+column — the truth is always in the log.
+
+```ruby
+# Simplified
+def calc_current
+  changes.order(:id).reduce('') do |content, change|
+    apply_delta(content, change)
+  end
+end
+```
+
+## Write path (FsStore → VfsFlusher)
+
+```mermaid
+sequenceDiagram
+  participant Monaco
+  participant Client as Vue Client
+  participant Worker as EventMachine Worker
+  participant DB as Postgres
+  participant Flusher as VfsFlusher
+  participant Disk
+
+  Monaco->>Client: text change delta
+  Client->>Worker: WS { cs:'fs', cmd:'write', payload:{path, delta} }
+  Worker->>DB: INSERT FileChange (operation='write', delta=...)
+  Worker->>Client: broadcast delta to other connected clients
+  Worker->>Flusher: record_write(bytes)
+  Flusher-->>DB: calc_current (on threshold or timer)
+  Flusher->>Disk: write file to PVC path
+```
+
+## Flush triggers (VfsFlusher)
+
+Two flush triggers run in the background:
+
+| Trigger | Condition | Default |
+|---------|-----------|---------|
+| Periodic sweep | every N ms | 800 ms (`VFS_FLUSH_INTERVAL_MS`) |
+| Byte threshold | accumulated unflushed bytes ≥ T | 20 bytes (`VFS_FLUSH_THRESHOLD_BYTES`) |
+
+Both thresholds are configurable via environment variables.
+
+## FsStore commands
+
+`FsStore` handles the `fs` commandSet over WebSocket:
+
+| Command | Description |
+|---------|-------------|
+| `tree` | List directory entries for a path |
+| `read` | Read file content (`calc_current`) |
+| `read_binary` | Read binary file (Base64) |
+| `stat` | Metadata for a path |
+| `write` | Append a write delta |
+| `set_contents` | Replace full file content |
+| `create_file` | Create a new file entry |
+| `mkdir` | Create a folder entry |
+| `rename` | Rename a path |
+| `delete` | Delete an entry |
+
+## Source files
+
+| File | Role |
+|------|------|
+| `worker/fs_store.rb` | WS command handler for `cs: 'fs'` |
+| `worker/vfs_flusher.rb` | Background flush loop (timer + threshold) |
+| `app/models/directory_entry.rb` | VFS entry model + `calc_current` |
+| `app/models/file_change.rb` | Append-only change log model |
+| `lib/tasks/fs.rake` | Rake tasks for VFS inspection |

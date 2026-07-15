@@ -1,0 +1,71 @@
+---
+title: WebSocket Commands
+description: Full reference for the client ↔ worker WebSocket protocol.
+sidebar:
+  order: 4
+---
+
+The protocol architecture (wire format, versioning, handler routing) is described
+in [Architecture → WebSocket Protocol](/architecture/websockets/). This page is
+the per-command reference.
+
+## Message envelope
+
+```json
+{ "cs": "<commandSet>", "cmd": "<command>", "payload": { } }
+```
+
+## `system`
+
+| Command | Direction | Payload |
+|---------|-----------|---------|
+| `connected` | S→C | `{ protocol, min_client, project_id }` |
+| `error` | S→C | `{ message }` |
+
+## `fs`
+
+| Command | Direction | Payload |
+|---------|-----------|---------|
+| `tree` | C→S | `{ path }` → response `{ entries: [{ name, ftype, size, mtime }] }` |
+| `read` | C→S | `{ path }` → response `{ content }` |
+| `read_binary` | C→S | `{ path }` → response `{ content_base64 }` |
+| `stat` | C→S | `{ path }` → response `{ ftype, size, mtime, posix_mode, ... }` |
+| `write` | C→S | `{ path, delta, revision }` |
+| `set_contents` | C→S | `{ path, content }` |
+| `create_file` | C→S | `{ path }` |
+| `mkdir` | C→S | `{ path }` |
+| `rename` | C→S | `{ path, new_path }` |
+| `delete` | C→S | `{ path }` |
+| `delta` | S→C | Broadcast: `{ path, delta, revision, user_id }` |
+
+## `terminal`
+
+| Command | Direction | Payload |
+|---------|-----------|---------|
+| `open` | C→S | `{ cols, rows }` → response `{ terminal_id }` |
+| `input` | C→S | `{ terminal_id, data }` |
+| `output` | S→C | `{ terminal_id, data }` |
+| `resize` | C→S | `{ terminal_id, cols, rows }` |
+| `close` | C→S | `{ terminal_id }` |
+
+## `chat`
+
+| Command | Direction | Payload |
+|---------|-----------|---------|
+| `send` | C→S | `{ channel, text }` |
+| `message` | S→C | `{ channel, name, text, user_id, created_at }` |
+| `history` | C→S | `{ channel, limit }` → response `{ messages: [...] }` |
+
+## `agents`
+
+| Command | Direction | Payload |
+|---------|-----------|---------|
+| `send` | C→S | `{ conversation_uuid, content, agent_slug }` |
+| `message` | S→C | Streamed: `{ conversation_uuid, token }` |
+| `done` | S→C | `{ conversation_uuid }` |
+| `history` | C→S | `{ conversation_uuid }` → response `{ messages: [...] }` |
+
+> Payload shapes above are indicative — the authoritative source is the handler
+> modules in `carbide2-worker` (`fs_store.rb`, `chat_handler.rb`,
+> `terminal_handler.rb`, `agent_handler.rb`). A machine-readable `protocol.yaml`
+> in the worker repo is planned to replace this hand-maintained table.

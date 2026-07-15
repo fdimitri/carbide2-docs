@@ -1,0 +1,33 @@
+---
+title: Debugging Workflow
+description: Runtime debugging discipline for Carbide2.
+sidebar:
+  order: 3
+---
+
+## Rules
+
+1. Collect logs and runtime data before hypothesizing.
+2. For SPA bugs, reproduce in a real browser session (not curl alone).
+3. Make the smallest fix that addresses the confirmed root cause.
+4. Verify after the fix with logs/output.
+
+## Where to look first
+
+- Worker log: `/tmp/carbide2-worker.log`
+- Rails log: `log/development.log`
+- Browser console + network + WS frames
+
+## Useful commands
+
+```bash
+# Rails log
+tail -f log/development.log
+
+# Worker log
+tail -f /tmp/carbide2-worker.log
+
+# Focused e2e
+cd ${CARBIDE2_CLIENT:-../carbide2-client}
+npx playwright test tests/e2e/terminal.spec.js --reporter=list
+```

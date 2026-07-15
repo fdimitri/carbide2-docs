@@ -1,0 +1,90 @@
+---
+title: Architecture Overview
+description: System diagram and data flow for the full Carbide2 stack.
+sidebar:
+  order: 1
+---
+
+## System diagram
+
+```mermaid
+graph TD
+  Browser["Browser (Vue SPA)"]
+
+  subgraph k8s["Kubernetes Cluster"]
+    Traefik["Traefik Ingress"]
+
+    subgraph control["carbide namespace"]
+      CP["carbide2-control\n(Rails + operator)"]
+      CPDB[("Postgres\n(cnpg)")]
+    end
+
+    subgraph workspace["ws-&lt;id&gt; namespace"]
+      Rails["carbide2-server\n(Rails API)"]
+      Worker["carbide2-worker\n(EventMachine WS)"]
+      Vite["Vite\n(dev only, HMR)"]
+      DB[("Postgres\n(shared)")]
+      Disk[("Disk\n(PVC)")]
+    end
+  end
+
+  Browser -->|"HTTPS /w/&lt;id&gt;/"| Traefik
+  Browser -->|"HTTPS /"| Traefik
+  Traefik -->|"/w/&lt;id&gt;/*"| Rails
+  Traefik -->|"/w/&lt;id&gt;/ws"| Worker
+  Traefik -->|"/"| CP
+  Rails --- DB
+  Worker --- DB
+  Worker -->|"flush"| Disk
+  CP --- CPDB
+  CP -->|"provision pods"| workspace
+```
+
+## Request paths
+
+### REST API (carbide2-server)
+
+```
+Browser → Traefik → Rails /api/* → ActiveRecord → Postgres
+```
+
+Authentication via JWT (see [Authentication & JWT](/architecture/authentication/)).
+
+### WebSocket (carbide2-worker)
+
+```
+Browser → Traefik → EventMachine worker
+  → { cs: 'fs', cmd: 'write', payload: ... }
+  → FileChange row in Postgres
+  → broadcast delta to other connected clients
+  → VfsFlusher: write to disk (PVC) on threshold / timer
+```
+
+### Control plane
+
+```
+Browser → Traefik → carbide2-control Rails /api/workspaces
+  → k8s operator creates Workspace CR
+  → operator reconciles: creates Helm release in ws-<id>
+```
+
+## Process model (per workspace pod)
+
+Three processes supervised by **Foreman** (`Procfile`):
+
+| Process | Command | Purpose |
+|---------|---------|---------|
+| `web` | `bundle exec rails server` | REST API + SPA asset serving |
+| `worker` | `ruby worker/worker.rb` | EventMachine WS server |
+| `vite` | `npm run dev` (dev only) | HMR for Vue SPA |
+
+## Data storage
+
+| Store | Used for |
+|-------|---------|
+| Postgres (`FileChange`, `DirectoryEntry`) | All file content and metadata — the VFS |
+| Postgres (`ChatMessage`, `TerminalRecording`, `Agent*`) | Collaboration history |
+| Disk (PVC) | Flushed VFS snapshots, used by dev tools running in the pod |
+| Postgres (`User`, `Project`, `ProjectMembership`) | Identity and access |
+
+See [Filesystem (VFS)](/architecture/filesystem/) for detail on the DBFS design.

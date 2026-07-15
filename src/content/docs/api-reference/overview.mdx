@@ -1,0 +1,36 @@
+---
+title: API Reference Overview
+description: How the Carbide2 REST APIs are documented and accessed.
+sidebar:
+  order: 1
+---
+
+Carbide2 exposes two REST APIs and one WebSocket protocol:
+
+| API | Base URL | Auth |
+|-----|----------|------|
+| **Server API** (`carbide2-server`) | `/api/` (per workspace) | JWT Bearer |
+| **Control Plane API** (`carbide2-control`) | `/api/` (main domain) | JWT Bearer |
+| **WebSocket protocol** (`carbide2-worker`) | `/w/<id>/ws` | JWT query param |
+
+## Authentication
+
+All REST endpoints require a valid JWT in the `Authorization` header:
+
+```
+Authorization: Bearer <token>
+```
+
+Tokens are issued by `POST /api/sessions` on the control plane. See
+[Authentication & JWT](/architecture/authentication/) for the full token spec.
+
+## Versioning
+
+APIs are currently unversioned. Breaking changes will be communicated via this
+documentation and the GitHub changelog.
+
+## Detailed references
+
+- [Server API](/api-reference/server/) — projects, filesystem, users, auth
+- [Control Plane API](/api-reference/control/) — sessions, workspaces
+- [WebSocket Commands](/api-reference/websocket-commands/) — full WS protocol reference

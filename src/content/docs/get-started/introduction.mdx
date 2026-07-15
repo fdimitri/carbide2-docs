@@ -1,0 +1,54 @@
+---
+title: Introduction
+description: What Carbide2 is and how it works.
+sidebar:
+  order: 1
+---
+
+Carbide2 is a self-hosted, collaborative browser-based development environment.
+Open a workspace in your browser and you get a full terminal, an editor backed by
+Monaco, a shared chat room, and an AI agent — all multiplexed over a single WebSocket
+connection per client.
+
+## Key concepts
+
+### Database-backed filesystem (DBFS)
+
+There is **no save step**. Every keystroke is immediately persisted as a `FileChange`
+row in Postgres. The filesystem state is reconstructed by replaying these rows through
+`DirectoryEntry#calc_current`. This design makes real-time collaboration and
+point-in-time recovery trivial.
+
+### One pod per workspace
+
+Each workspace runs in its own Kubernetes pod (`namespace: ws-<id>`). The pod runs
+three processes supervised by Foreman:
+
+- **Rails** — REST API + session management
+- **Worker** — EventMachine WebSocket server (terminals, chat, filesystem, agents)
+- **Vite** (dev only) — HMR for the client SPA
+
+### Control plane vs workspace
+
+| | Control plane (`carbide2-control`) | Workspace pod (`carbide2-server`) |
+|--|--|--|
+| Runs at | `/` on the main domain | `/w/<workspace-id>/` |
+| Serves | Dashboard SPA + REST | Workspace SPA + WS/IDE backend |
+| k8s | Cluster-wide (operator) | One pod per workspace |
+
+## Repository layout
+
+```
+carbide2/                  ← meta repo (submodule pins + deploy scripts)
+├── carbide2-server/       ← Rails app + REST API
+├── carbide2-worker/       ← EventMachine WS worker (symlinked into server)
+├── carbide2-client/       ← Vue 3 SPA (shared by server + control builds)
+└── carbide2-control/      ← Rails control plane + k8s operator
+```
+
+## Next steps
+
+- [Installation](/get-started/installation/) — local dev setup via Docker Compose or k3d
+- [Architecture overview](/architecture/overview/) — full system diagram
+- [Server API reference](/api-reference/server/) — REST endpoints
+- [WebSocket commands](/api-reference/websocket-commands/) — WS protocol reference

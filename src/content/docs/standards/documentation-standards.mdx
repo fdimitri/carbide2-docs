@@ -1,0 +1,21 @@
+---
+title: Documentation Standards
+description: What must be documented for each type of change.
+sidebar:
+  order: 3
+---
+
+## Required doc updates per change
+
+- New REST endpoint: update API reference (and OpenAPI spec when enabled).
+- New WebSocket command: update WebSocket Commands page.
+- Schema migration: update Database Schema page.
+- New environment variable: update Environment Variables page.
+- New operational behavior: update Troubleshooting and/or Deployment pages.
+
+## Writing style
+
+- Explain intent and constraints, not just mechanics.
+- Prefer tables for field lists and configuration matrices.
+- Include source pointers (model, handler, migration files).
+- Keep docs versioned with code and updated in the same PR when possible.

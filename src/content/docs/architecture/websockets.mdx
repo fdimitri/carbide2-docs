@@ -1,0 +1,120 @@
+---
+title: WebSocket Protocol
+description: EventMachine worker commandSet architecture and message format.
+sidebar:
+  order: 3
+---
+
+## Wire format
+
+All WebSocket messages are JSON objects with three top-level fields:
+
+```json
+{
+  "cs":      "fs",
+  "cmd":     "write",
+  "payload": { "path": "/src/app.js", "delta": "..." }
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `cs` | string | CommandSet — routes to the correct handler module |
+| `cmd` | string | Command within that commandSet |
+| `payload` | object | Command-specific data |
+
+## Server → client messages
+
+Responses and broadcasts use the same format, often with a `ref` field mirroring
+the client's request ID:
+
+```json
+{
+  "cs":      "fs",
+  "cmd":     "tree",
+  "ref":     "abc123",
+  "payload": { "entries": [...] }
+}
+```
+
+## CommandSets
+
+### `system`
+
+Connection lifecycle and metadata.
+
+| Command (server → client) | Description |
+|--------------------------|-------------|
+| `connected` | Initial handshake — carries `protocol`, `min_client`, `project_id` |
+| `error` | Unrecoverable error |
+
+### `fs`
+
+Database-backed VFS operations. See [Filesystem (VFS)](/architecture/filesystem/).
+
+| Command | Direction | Description |
+|---------|-----------|-------------|
+| `tree` | C→S / S→C | List directory entries |
+| `read` | C→S / S→C | Read file content |
+| `write` | C→S | Append a write delta |
+| `set_contents` | C→S | Replace full content |
+| `create_file` | C→S | Create a new file |
+| `mkdir` | C→S | Create a directory |
+| `rename` | C→S | Rename a path |
+| `delete` | C→S | Delete an entry |
+| `delta` | S→C | Broadcast a file change to other clients |
+
+### `terminal`
+
+PTY terminal multiplexing.
+
+| Command | Direction | Description |
+|---------|-----------|-------------|
+| `open` | C→S | Open a new PTY terminal |
+| `input` | C→S | Send keystrokes to PTY |
+| `output` | S→C | Broadcast PTY output to subscribers |
+| `resize` | C→S | Resize PTY (cols × rows) |
+| `close` | C→S | Close a terminal session |
+
+### `chat`
+
+IRC-style project chat.
+
+| Command | Direction | Description |
+|---------|-----------|-------------|
+| `send` | C→S | Post a message |
+| `message` | S→C | Broadcast a new message to room members |
+| `history` | C→S / S→C | Request / receive message backlog |
+
+### `agents`
+
+AI agent interaction.
+
+| Command | Direction | Description |
+|---------|-----------|-------------|
+| `send` | C→S | Send a message to an agent |
+| `message` | S→C | Stream agent response token |
+| `done` | S→C | Agent response complete |
+| `history` | C→S / S→C | Conversation history |
+
+## Protocol versioning
+
+The worker advertises two constants on the `system/connected` message:
+
+| Field | Description |
+|-------|-------------|
+| `protocol` | Current server protocol version (integer) |
+| `min_client` | Minimum client version the server accepts |
+
+The client sends `&proto=N&min_server=M` on the WebSocket URL. A mismatch
+currently logs a warning (non-blocking); hard-fail will be added in a future release.
+
+## Source files
+
+| File | Role |
+|------|------|
+| `worker/worker.rb` | Main EM server; routes `cs` to handlers; protocol constants |
+| `worker/fs_store.rb` | `fs` commandSet handler |
+| `worker/chat_handler.rb` | `chat` commandSet handler |
+| `worker/terminal_handler.rb` | `terminal` commandSet + PTY |
+| `worker/agent_handler.rb` | `agents` commandSet handler |

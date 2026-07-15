@@ -1,0 +1,119 @@
+---
+title: Server API
+description: carbide2-server REST API reference — projects, filesystem, users, auth.
+sidebar:
+  order: 2
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+<Aside type="note">
+  An OpenAPI spec (`docs/openapi.yaml`) is planned for `carbide2-server`. Once
+  available, this page will embed an interactive Swagger UI. Until then, endpoints
+  are documented here by hand.
+</Aside>
+
+## Authentication
+
+### `POST /api/auth/login`
+
+Issue a JWT for an existing user.
+
+**Request body:**
+```json
+{ "email": "user@example.com", "password": "..." }
+```
+
+**Response:**
+```json
+{ "token": "<jwt>", "user": { "id": 1, "email": "..." } }
+```
+
+### `POST /api/auth/signup`
+
+Register a new user and receive a JWT.
+
+---
+
+## Projects
+
+### `GET /api/projects`
+
+List all projects the authenticated user is a member of.
+
+### `POST /api/projects`
+
+Create a new project.
+
+**Request body:**
+```json
+{ "project": { "name": "my-project" } }
+```
+
+### `GET /api/projects/:id`
+
+Get a single project.
+
+### `PATCH /api/projects/:id`
+
+Update project metadata.
+
+### `DELETE /api/projects/:id`
+
+Delete a project. Owner only.
+
+---
+
+## Filesystem (VFS)
+
+All VFS endpoints are scoped to a project: `/api/projects/:project_id/fs/...`
+
+<Aside type="tip">
+  The VFS is also accessible over WebSocket via the `fs` commandSet.
+  See [WebSocket Commands](/api-reference/websocket-commands/).
+</Aside>
+
+### `GET /api/projects/:project_id/fs/tree`
+
+List directory entries for a given path.
+
+**Query params:** `path` (default: `/`)
+
+### `GET /api/projects/:project_id/fs/files/*path`
+
+Read a file's current content (replays `FileChange` log via `calc_current`).
+
+### `POST /api/projects/:project_id/fs/files`
+
+Create a new file.
+
+**Request body:**
+```json
+{ "path": "/src/app.js", "content": "" }
+```
+
+### `PUT /api/projects/:project_id/fs/files/*path`
+
+Set full file contents.
+
+### `DELETE /api/projects/:project_id/fs/files/*path`
+
+Delete a file or directory.
+
+### `POST /api/projects/:project_id/fs/upload`
+
+Upload an archive (zip, tar, tar.gz) or single file and import into the VFS.
+
+**Content-Type:** `multipart/form-data`
+
+---
+
+## Users
+
+### `GET /api/users/me`
+
+Return the authenticated user's profile.
+
+### `PATCH /api/users/me`
+
+Update the authenticated user's profile.

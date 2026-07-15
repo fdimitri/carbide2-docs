@@ -1,0 +1,54 @@
+---
+title: Troubleshooting
+description: Known gotchas and their fixes.
+sidebar:
+  order: 6
+---
+
+## Deploy built old code despite new commits
+
+**Cause:** stale submodule pins in the meta repo. `deploy.rb` builds from the
+pinned SHAs, not component branch tips.
+
+**Fix:**
+```bash
+cd ~/repos/carbide2
+git submodule update --init --recursive
+git submodule status   # verify all four pins are current
+```
+
+Checklist before redeploy: **server, control, client, worker** pins all current
+on meta `main` — the deploy pulls meta `main`, not `dev`.
+
+## Old SPA served after deploy
+
+Both the workspace image and the control-plane image build the Vue SPA from the
+meta repo's **carbide2-client submodule**. A stale client pin ships an old SPA
+in *both* images even when server/control pins are fresh.
+
+## GPG signing failures during deploy
+
+`deploy.rb` GPG-signs commits. In a non-interactive shell:
+
+```bash
+export GPG_TTY=$(tty)
+# warm the passphrase cache first:
+echo a | gpg --clearsign >/dev/null
+```
+
+## 404 on an authenticated endpoint (expected 401)
+
+`User.find(sub)` raising `RecordNotFound` for a token whose user doesn't exist
+surfaces as a 404 — an auth bug masquerading as a missing resource. Check the
+token's `sub` claim against the users table.
+
+## Browser shows stale behaviour that curl can't reproduce
+
+The SPA may be replaying stale `localStorage` tokens/state. Reproduce in a real
+browser session (or Playwright with fresh storage) before concluding the server
+is at fault.
+
+## k3d networking on WSL
+
+If the cluster is unreachable after a Windows sleep/resume cycle, restart the
+k3d cluster: `k3d cluster stop carbide && k3d cluster start carbide`.

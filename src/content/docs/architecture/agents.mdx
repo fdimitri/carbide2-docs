@@ -1,0 +1,90 @@
+---
+title: Agents
+description: AI agent architecture — Agent, AgentConversation, AgentMessage models and LLM relay.
+sidebar:
+  order: 5
+---
+
+## Overview
+
+Carbide2's agent system lets users interact with LLMs from within the workspace.
+Conversations are stored in Postgres and streamed to the client over the `agents`
+WebSocket commandSet.
+
+## Data model
+
+```mermaid
+erDiagram
+  Agent {
+    int id
+    int project_id
+    string name
+    string model
+    text system_prompt
+  }
+  AgentConversation {
+    int id
+    int agent_id
+    int user_id
+    string title
+  }
+  AgentMessage {
+    int id
+    int agent_conversation_id
+    string role
+    text content
+    datetime created_at
+  }
+  Agent ||--o{ AgentConversation : "has many"
+  AgentConversation ||--o{ AgentMessage : "has many"
+```
+
+### `Agent`
+
+Defines an LLM persona: model, system prompt, name. Scoped to a project.
+
+### `AgentConversation`
+
+A single conversation thread between a user and an agent. One conversation can have
+many messages.
+
+### `AgentMessage`
+
+One message in a conversation. `role` is `"user"` or `"assistant"`.
+
+## LLM relay
+
+The worker streams responses from the configured LLM endpoint (LM Studio in local dev,
+or a remote OpenAI-compatible endpoint in production).
+
+```mermaid
+sequenceDiagram
+  participant Client as Vue Client
+  participant Worker as agent_handler.rb
+  participant LLM as LLM API
+
+  Client->>Worker: WS { cs:'agents', cmd:'send', payload:{conv_id, content} }
+  Worker->>DB: INSERT AgentMessage (role='user')
+  Worker->>LLM: POST /v1/chat/completions (stream: true)
+  loop stream chunks
+    LLM-->>Worker: SSE chunk
+    Worker-->>Client: WS { cs:'agents', cmd:'message', payload:{token} }
+  end
+  Worker->>DB: INSERT AgentMessage (role='assistant', content=full_response)
+  Worker-->>Client: WS { cs:'agents', cmd:'done' }
+```
+
+## Local dev relay
+
+`scripts/dev-lmstudio-relay.sh` proxies requests to a local LM Studio instance,
+allowing offline agent use during development.
+
+## Source files
+
+| File | Role |
+|------|------|
+| `app/models/agent.rb` | Agent model |
+| `app/models/agent_conversation.rb` | Conversation model |
+| `app/models/agent_message.rb` | Message model |
+| `worker/agent_handler.rb` | WS commandSet handler + LLM streaming |
+| `scripts/dev-lmstudio-relay.sh` | Local LLM relay script |

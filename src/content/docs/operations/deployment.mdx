@@ -1,0 +1,70 @@
+---
+title: Deployment
+description: k3d deploy workflow and rolling updates.
+sidebar:
+  order: 3
+---
+
+> **Note:** For full k3d cluster setup see [Kubernetes Ops](/operations/kubernetes/).
+> This page covers the deploy workflow once a cluster exists.
+
+## deploy.rb
+
+The primary deploy tool is `scripts/deploy.rb` in the meta repo (`carbide2`).
+It GPG-signs all commits and rolls the control plane + workspace pods.
+
+```bash
+cd ~/repos/carbide2
+
+# Full deploy (control plane + all workspace pods)
+ruby scripts/deploy.rb
+
+# Control plane only
+ruby scripts/deploy.rb --roll-scope control
+
+# Workspace pods only
+ruby scripts/deploy.rb --roll-scope workspaces
+```
+
+### Long-running deploys
+
+Run with `nohup` to avoid terminal hang — `deploy.rb` may prompt for GPG passphrase:
+
+```bash
+export GPG_TTY=$(tty)
+nohup ruby scripts/deploy.rb > /tmp/deploy.log 2>&1 &
+tail -f /tmp/deploy.log
+```
+
+## Submodule pin discipline
+
+Before every deploy, ensure all four submodule pins are current on meta `main`:
+
+```bash
+# Check current pin SHAs
+git submodule status
+
+# Bump a component (example: server)
+cd carbide2-server && git checkout main && git pull
+cd .. && git add carbide2-server && git commit -m "bump carbide2-server"
+git push origin main
+```
+
+Stale pins build old images. Checklist: **server**, **control**, **client**, **worker** — all four must be current.
+
+## Deploy pulls meta `main`
+
+`deploy.rb` does `git pull --ff-only` on the **current branch** of the meta repo
+checkout on the deploy target (typically `main`). Changes on `dev` only ship after
+merging to `main`.
+
+## Fast iteration (code overlay)
+
+For rapid dev cycles without a full image rebuild:
+
+```bash
+# Overlay changed files into the running pod
+./scripts/dev-native.sh
+```
+
+Full rebuild is only needed for gem or npm dep changes.

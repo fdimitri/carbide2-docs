@@ -1,0 +1,29 @@
+---
+title: Carbide2 Documentation
+description: A collaborative browser-based development environment.
+template: splash
+hero:
+  tagline: A collaborative browser-based development environment with in-database filesystem, real-time terminals, chat, and AI agents.
+  actions:
+    - text: Get Started
+      link: /get-started/introduction/
+      icon: right-arrow
+      variant: primary
+    - text: Architecture Overview
+      link: /architecture/overview/
+      icon: open-book
+---
+
+## What is Carbide2?
+
+Carbide2 is a collaborative, browser-based IDE built on Rails 8.1 + Vue 3.
+Each workspace runs in its own Kubernetes pod, with a database-backed virtual filesystem (no "save" concept — edits persist continuously), real-time shared terminals over WebSocket, IRC-style chat, and an AI agent interface.
+
+## Components
+
+| Repo | Role |
+|------|------|
+| [carbide2-server](https://github.com/fdimitri/carbide2-server) | Rails app — REST API, auth, VFS, project management |
+| [carbide2-worker](https://github.com/fdimitri/carbide2-worker) | EventMachine WebSocket worker — terminals, chat, fs, agents |
+| [carbide2-client](https://github.com/fdimitri/carbide2-client) | Vue 3 / Vite SPA — the browser IDE |
+| [carbide2-control](https://github.com/fdimitri/carbide2-control) | Rails control plane — workspace provisioning, k8s operator |
