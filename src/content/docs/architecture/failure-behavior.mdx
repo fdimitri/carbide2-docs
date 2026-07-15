@@ -1,0 +1,37 @@
+---
+title: Failure Behavior
+description: Expected behavior during disconnects, retries, crashes, and partial failures.
+sidebar:
+  order: 8
+---
+
+## Failure classes
+
+| Class | Example | Expected behavior |
+|-------|---------|-------------------|
+| Auth failure | expired/invalid token | REST: 401/403, WS: `system/error` and close |
+| Missing identity | token `sub` not found | May surface as 404 in current stack |
+| Worker restart | ws pod rolls | clients reconnect; in-flight ephemeral events may be lost |
+| Sidecar/PTY failure | shell container exits | `term/exit` for affected terminal; user re-open required |
+| DB transient error | brief Postgres disconnect | command error response; client should allow retry |
+
+## Realtime recovery model (current)
+
+1. WS reconnect is client-driven.
+2. Durable state (`fs`/chat history/agent history) is replayable from DB.
+3. Ephemeral streams (`term/output`, `rtc/*`) are not replayed after disconnect.
+
+## Fanout failure semantics
+
+| Stream | If receiver disconnects during fanout |
+|--------|--------------------------------------|
+| `fs/delta` | Client resyncs by re-reading file (`calc_current`) |
+| `chat/message` | Missed live push can be recovered through history endpoint/command |
+| `term/output` | Lost output during disconnect is not guaranteed replayed |
+| `rtc/*` | Signaling event dropped; peer renegotiation needed |
+
+## Developer expectations
+
+1. Do not promise exactly-once delivery for WS events.
+2. Treat DB-backed reads as source of truth for recovery.
+3. Keep request handlers idempotent where practical (`tree`, `read`, `history`, health checks).

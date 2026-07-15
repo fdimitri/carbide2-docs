@@ -13,6 +13,28 @@ import { Aside } from '@astrojs/starlight/components';
   are documented here by hand.
 </Aside>
 
+## Security matrix
+
+| Endpoint | Security |
+|----------|----------|
+| `POST /api/auth/login` | N0 |
+| `POST /api/auth/signup` | N0 |
+| `GET /api/projects` | N1 |
+| `POST /api/projects` | N1 |
+| `GET /api/projects/:id` | N2 |
+| `PATCH /api/projects/:id` | N2 |
+| `DELETE /api/projects/:id` | N3 |
+| `GET /api/projects/:project_id/fs/tree` | N2 |
+| `GET /api/projects/:project_id/fs/files/*path` | N2 |
+| `POST /api/projects/:project_id/fs/files` | N2 |
+| `PUT /api/projects/:project_id/fs/files/*path` | N2 |
+| `DELETE /api/projects/:project_id/fs/files/*path` | N2 |
+| `POST /api/projects/:project_id/fs/upload` | N2 |
+| `GET /api/users/me` | N1 |
+| `PATCH /api/users/me` | N1 |
+
+Security levels are defined in [Security Model](/architecture/security-model/).
+
 ## Authentication
 
 ### `POST /api/auth/login`
@@ -32,6 +54,36 @@ Issue a JWT for an existing user.
 ### `POST /api/auth/signup`
 
 Register a new user and receive a JWT.
+
+## Concrete examples
+
+### Example: list project tree
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" \
+  "http://localhost:3000/api/projects/1/fs/tree?path=/"
+```
+
+Example response:
+
+```json
+{
+  "entries": [
+    { "name": "src", "ftype": "folder", "size": null, "mtime": "2026-07-14T18:10:22Z" },
+    { "name": "README.md", "ftype": "file", "size": 1387, "mtime": "2026-07-14T18:10:32Z" }
+  ]
+}
+```
+
+### Example: create a file
+
+```bash
+curl -X POST \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"path":"/src/new_file.rb","content":"puts :ok\n"}' \
+  "http://localhost:3000/api/projects/1/fs/files"
+```
 
 ---
 

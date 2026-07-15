@@ -1,11 +1,11 @@
 ---
 title: API Reference Overview
-description: How the Carbide2 REST APIs are documented and accessed.
+description: How the CARB/IDE2 REST APIs are documented and accessed.
 sidebar:
   order: 1
 ---
 
-Carbide2 exposes two REST APIs and one WebSocket protocol:
+CARB/IDE2 exposes two REST APIs and one WebSocket protocol:
 
 | API | Base URL | Auth |
 |-----|----------|------|
@@ -23,6 +23,16 @@ Authorization: Bearer <token>
 
 Tokens are issued by `POST /api/sessions` on the control plane. See
 [Authentication & JWT](/architecture/authentication/) for the full token spec.
+
+## Security levels
+
+All endpoint and command tables now include a `Security` column using the model
+defined in [Security Model](/architecture/security-model/):
+
+- `N0` public
+- `N1` authenticated user
+- `N2` project/workspace member
+- `N3` privileged or owner action
 
 ## Versioning
 

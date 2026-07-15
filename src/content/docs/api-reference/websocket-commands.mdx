@@ -9,6 +9,8 @@ The protocol architecture (wire format, versioning, handler routing) is describe
 in [Architecture → WebSocket Protocol](/architecture/websockets/). This page is
 the per-command reference.
 
+Security levels (`N0..N3`) follow [Security Model](/architecture/security-model/).
+
 ## Message envelope
 
 ```json
@@ -17,53 +19,106 @@ the per-command reference.
 
 ## `system`
 
-| Command | Direction | Payload |
-|---------|-----------|---------|
-| `connected` | S→C | `{ protocol, min_client, project_id }` |
-| `error` | S→C | `{ message }` |
+| Command | Direction | Security | Payload |
+|---------|-----------|----------|---------|
+| `connected` | S→C | N1 | `{ protocol, min_client, project_id }` |
+| `error` | S→C | N1 | `{ message }` |
 
 ## `fs`
 
-| Command | Direction | Payload |
-|---------|-----------|---------|
-| `tree` | C→S | `{ path }` → response `{ entries: [{ name, ftype, size, mtime }] }` |
-| `read` | C→S | `{ path }` → response `{ content }` |
-| `read_binary` | C→S | `{ path }` → response `{ content_base64 }` |
-| `stat` | C→S | `{ path }` → response `{ ftype, size, mtime, posix_mode, ... }` |
-| `write` | C→S | `{ path, delta, revision }` |
-| `set_contents` | C→S | `{ path, content }` |
-| `create_file` | C→S | `{ path }` |
-| `mkdir` | C→S | `{ path }` |
-| `rename` | C→S | `{ path, new_path }` |
-| `delete` | C→S | `{ path }` |
-| `delta` | S→C | Broadcast: `{ path, delta, revision, user_id }` |
+| Command | Direction | Security | Payload |
+|---------|-----------|----------|---------|
+| `tree` | C→S | N2 | `{ path }` → response `{ entries: [{ name, ftype, size, mtime }] }` |
+| `read` | C→S | N2 | `{ path }` → response `{ content }` |
+| `read_binary` | C→S | N2 | `{ path }` → response `{ content_base64 }` |
+| `stat` | C→S | N2 | `{ path }` → response `{ ftype, size, mtime, posix_mode, ... }` |
+| `write` | C→S | N2 | `{ path, delta, revision }` |
+| `set_contents` | C→S | N2 | `{ path, content }` |
+| `create_file` | C→S | N2 | `{ path }` |
+| `mkdir` | C→S | N2 | `{ path }` |
+| `rename` | C→S | N2 | `{ path, new_path }` |
+| `delete` | C→S | N2 | `{ path }` |
+| `delta` | S→C | N2 | Broadcast: `{ path, delta, revision, user_id }` |
 
 ## `terminal`
 
-| Command | Direction | Payload |
-|---------|-----------|---------|
-| `open` | C→S | `{ cols, rows }` → response `{ terminal_id }` |
-| `input` | C→S | `{ terminal_id, data }` |
-| `output` | S→C | `{ terminal_id, data }` |
-| `resize` | C→S | `{ terminal_id, cols, rows }` |
-| `close` | C→S | `{ terminal_id }` |
+| Command | Direction | Security | Payload |
+|---------|-----------|----------|---------|
+| `open` | C→S | N2 | `{ cols, rows }` → response `{ terminal_id }` |
+| `input` | C→S | N2 | `{ terminal_id, data }` |
+| `output` | S→C | N2 | `{ terminal_id, data }` |
+| `resize` | C→S | N2 | `{ terminal_id, cols, rows }` |
+| `close` | C→S | N2 | `{ terminal_id }` |
 
 ## `chat`
 
-| Command | Direction | Payload |
-|---------|-----------|---------|
-| `send` | C→S | `{ channel, text }` |
-| `message` | S→C | `{ channel, name, text, user_id, created_at }` |
-| `history` | C→S | `{ channel, limit }` → response `{ messages: [...] }` |
+| Command | Direction | Security | Payload |
+|---------|-----------|----------|---------|
+| `send` | C→S | N2 | `{ channel, text }` |
+| `message` | S→C | N2 | `{ channel, name, text, user_id, created_at }` |
+| `history` | C→S | N2 | `{ channel, limit }` → response `{ messages: [...] }` |
 
 ## `agents`
 
-| Command | Direction | Payload |
-|---------|-----------|---------|
-| `send` | C→S | `{ conversation_uuid, content, agent_slug }` |
-| `message` | S→C | Streamed: `{ conversation_uuid, token }` |
-| `done` | S→C | `{ conversation_uuid }` |
-| `history` | C→S | `{ conversation_uuid }` → response `{ messages: [...] }` |
+| Command | Direction | Security | Payload |
+|---------|-----------|----------|---------|
+| `send` | C→S | N2 | `{ conversation_uuid, content, agent_slug }` |
+| `message` | S→C | N2 | Streamed: `{ conversation_uuid, token }` |
+| `done` | S→C | N2 | `{ conversation_uuid }` |
+| `history` | C→S | N2 | `{ conversation_uuid }` → response `{ messages: [...] }` |
+
+## Fanout semantics
+
+| Stream | Fanout | Durability | Recovery |
+|--------|--------|------------|----------|
+| `fs/delta` | broadcast to other clients on same project file | backed by DB changes | re-read file (`fs/read`) |
+| `chat/message` | broadcast to room members | durable in `chat_messages` | request history |
+| `term/output` | broadcast to subscribers of terminal id | ephemeral stream | reopen terminal; no guaranteed replay |
+| `agents/message` | streamed to conversation listeners | final assistant message persisted | reload history |
+
+## Concrete examples
+
+### Example: `fs/tree`
+
+Client → server:
+
+```json
+{ "cs": "fs", "cmd": "tree", "payload": { "path": "/" }, "ref": "req-1" }
+```
+
+Server → client:
+
+```json
+{
+  "cs": "fs",
+  "cmd": "tree",
+  "ref": "req-1",
+  "payload": {
+    "entries": [
+      { "name": "src", "ftype": "folder", "size": null },
+      { "name": "README.md", "ftype": "file", "size": 1387 }
+    ]
+  }
+}
+```
+
+### Example: `chat/send` fanout
+
+Sender:
+
+```json
+{ "cs": "chat", "cmd": "send", "payload": { "channel": "general", "text": "hello" } }
+```
+
+Broadcast to subscribers:
+
+```json
+{
+  "cs": "chat",
+  "cmd": "message",
+  "payload": { "channel": "general", "name": "alice", "text": "hello", "user_id": 7 }
+}
+```
 
 > Payload shapes above are indicative — the authoritative source is the handler
 > modules in `carbide2-worker` (`fs_store.rb`, `chat_handler.rb`,

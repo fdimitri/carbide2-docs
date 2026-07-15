@@ -1,0 +1,38 @@
+---
+title: Known Issues
+description: Current limitations and behavioral gaps developers should expect.
+sidebar:
+  order: 7
+---
+
+## Security model enforcement is incomplete
+
+Security levels (`N0..N3`) are documented, but not yet uniformly enforced in a
+single policy layer across REST and WebSocket handlers.
+
+## Realtime delivery is best-effort
+
+- WS fanout is not exactly-once.
+- Ephemeral streams (`term/output`, `rtc/*`) can be lost during disconnects.
+- Durable streams can be recovered from DB-backed history/read paths.
+
+## Auth mismatch can appear as 404
+
+A token with a `sub` that does not map to an existing user may surface as a 404
+instead of a clean 401/403 in some flows.
+
+## Terminal sidecar behavior still evolving
+
+Terminal isolation targets sidecar execution with project-root-only access, but
+backend mode differences (`local`, `docker`, `kube`) still produce behavioral
+variance during development.
+
+## Chat/video coupling is currently implicit
+
+VideoConference signaling and chat room semantics are coupled; this works for the
+current implementation but lacks a formal signaling contract and policy surface.
+
+## API specs are hand-maintained
+
+OpenAPI/WS protocol specs are not yet fully auto-generated from tests/source.
+This can drift if docs are not updated in the same change as code.

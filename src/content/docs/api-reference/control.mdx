@@ -12,6 +12,21 @@ import { Aside } from '@astrojs/starlight/components';
   Until then, endpoints are documented here by hand.
 </Aside>
 
+## Security matrix
+
+| Endpoint | Security |
+|----------|----------|
+| `POST /api/sessions` | N0 |
+| `POST /api/signup` | N0 |
+| `GET /api/workspaces` | N1 |
+| `POST /api/workspaces` | N1 |
+| `GET /api/workspaces/:id` | N2 |
+| `DELETE /api/workspaces/:id` | N3 |
+| `POST /api/workspaces/:id/token` | N2 |
+| `GET /api/workspaces/:id/health` | N2 |
+
+Security levels are defined in [Security Model](/architecture/security-model/).
+
 ## Sessions
 
 ### `POST /api/sessions`
@@ -59,3 +74,34 @@ Mint a workspace-scoped JWT for connecting to the workspace pod's API/WebSocket.
 ### `GET /api/workspaces/:id/health`
 
 Pod liveness/readiness summary for the dashboard health dot.
+
+## Concrete examples
+
+### Example: create workspace
+
+```bash
+curl -X POST \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"my-workspace"}' \
+  "http://localhost:3001/api/workspaces"
+```
+
+Example response:
+
+```json
+{
+  "id": "ws_123",
+  "name": "my-workspace",
+  "status": "provisioning",
+  "public_url": "https://example.local/w/ws_123/"
+}
+```
+
+### Example: mint workspace token
+
+```bash
+curl -X POST \
+  -H "Authorization: Bearer $TOKEN" \
+  "http://localhost:3001/api/workspaces/ws_123/token"
+```

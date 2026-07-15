@@ -12,8 +12,8 @@ export default defineConfig({
       autoTheme: true,
     }),
     starlight({
-      title: 'Carbide2 Docs',
-      description: 'Documentation for the Carbide2 collaborative development environment.',
+      title: 'CARB/IDE2 Docs',
+      description: 'Documentation for the CARB/IDE2 collaborative development environment.',
       favicon: '/favicon.svg',
       head: [
         {

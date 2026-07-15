@@ -1,6 +1,6 @@
 # carbide2-docs
 
-Documentation site for the Carbide2 stack, built with Astro + Starlight.
+Documentation site for the CARB/IDE2 stack, built with Astro + Starlight.
 
 ## Local development
 

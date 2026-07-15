@@ -1,0 +1,50 @@
+---
+title: Chat & VideoConference
+description: Realtime chat and rudimentary video conference architecture and fanout semantics.
+sidebar:
+  order: 7
+---
+
+Chat is a first-class subsystem. VideoConference currently exists in a rudimentary
+form and is coupled to chat room/session semantics.
+
+## Coupling model
+
+1. Room identity and membership are shared between chat and video signaling.
+2. Chat events are durable (`chat_messages`); video signaling is ephemeral WS traffic.
+3. Video session lifecycle is currently anchored to chat presence/channel context.
+
+## Fanout semantics
+
+```mermaid
+sequenceDiagram
+  participant A as Client A
+  participant W as Worker
+  participant DB as Postgres
+  participant B as Client B..N
+
+  A->>W: chat/send {channel, text}
+  W->>DB: INSERT chat_messages
+  W-->>A: ack/message
+  W-->>B: chat/message broadcast
+
+  A->>W: rtc/offer {peer_id, sdp}
+  W-->>B: rtc/offer (targeted fanout)
+  B->>W: rtc/answer {peer_id, sdp}
+  W-->>A: rtc/answer
+  A->>W: rtc/ice {peer_id, candidate}
+  W-->>B: rtc/ice
+```
+
+### Broadcast and ordering guarantees (current)
+
+| Channel | Durability | Ordering expectation | Delivery scope |
+|---------|------------|----------------------|----------------|
+| `chat/message` | Durable in DB | Per-channel insertion order | All connected subscribers in channel |
+| `rtc/*` signaling | Ephemeral | Best-effort arrival order | Targeted peer(s) in same room |
+
+## What is missing / expected evolution
+
+1. Formalized signaling contract page under API reference.
+2. Explicit reconnection policy for in-flight `rtc/*` messages.
+3. Security-level gating per `rtc/*` command (see [Security Model](/architecture/security-model/)).

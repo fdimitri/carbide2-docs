@@ -1,0 +1,38 @@
+---
+title: Security Model (Proposed Levels)
+description: Per-call security level model for REST and WebSocket commands.
+sidebar:
+  order: 9
+---
+
+Security policy is currently under-specified in implementation. This page defines
+the target model so every API/WS call can be tagged with a required level.
+
+## Levels
+
+| Level | Name | Meaning |
+|-------|------|---------|
+| N0 | Public | No auth required |
+| N1 | Authenticated | Valid user JWT required |
+| N2 | Project-member | N1 + membership in target project/workspace |
+| N3 | Privileged/owner | N2 + owner/admin or elevated action scope |
+
+## Intended enforcement points
+
+1. REST: controller before-actions and policy checks.
+2. WS: session auth at connect + per-command authorization guards.
+3. Sidecar terminal: command execution only inside project-scoped execution context.
+
+## Current gap
+
+The levels are documentation-first right now. Implementation is partial and not yet
+centrally enforced. Use the level tags in API docs as the expected contract.
+
+## Mapping guidance
+
+| Surface | Typical level |
+|---------|---------------|
+| Login/signup | N0 |
+| User profile read/update | N1 |
+| Project/file/chat/agent operations | N2 |
+| Destructive or provisioning actions | N3 (or N2 + explicit ownership rule) |
