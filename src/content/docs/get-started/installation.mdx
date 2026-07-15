@@ -1,30 +1,26 @@
 ---
 title: Installation
-description: Local development setup via Docker Compose or k3d.
+description: Local development setup via k3d.
 sidebar:
   order: 2
 ---
 
-import { Tabs, TabItem } from '@astrojs/starlight/components';
-
-CARB/IDE2 supports two local development paths: **k3d** (primary, full Kubernetes stack)
-and **Docker Compose** (simpler, no k8s).
+CARB/IDE2 runs as a full Kubernetes stack. Local development uses **k3d**:
+`deploy.rb` brings up the cluster, builds every component, and deploys the
+server, worker, control plane, and SPA together.
 
 ## Prerequisites
 
 | Tool | Minimum version |
 |------|----------------|
 | Docker | 24.x |
-| k3d | 5.x (k3d path only) |
+| k3d | 5.x |
 | kubectl | 1.28+ |
 | Helm | 3.x |
 | Ruby | 4.0 (via rbenv) |
 | Node.js | 20.x |
 
 ## Quick start
-
-<Tabs>
-<TabItem label="k3d (primary)">
 
 ```bash
 # Clone the meta repo with submodules
@@ -39,26 +35,16 @@ ruby scripts/deploy.rb
 
 See [Kubernetes Ops](/operations/kubernetes/) for cluster management commands.
 
-</TabItem>
-<TabItem label="Docker Compose">
+## Docker Compose (stale — not currently supported)
 
-```bash
-git clone --recurse-submodules https://github.com/fdimitri/carbide2.git
-cd carbide2/carbide2-server
+The committed `carbide2-server/docker-compose.yml` predates the k3d switch. It
+brings up a single unified server image against Postgres and has **not** been
+kept working since; treat it as unmaintained.
 
-# Copy and edit env
-cp .env.example .env
-
-# Start all services
-docker compose up
-```
-
-The app is available at `http://localhost:3000`.
-
-Default credentials: `admin@example.com` / `password` (seeded by `db/seeds.rb`).
-
-</TabItem>
-</Tabs>
+It also can't stand in for the full stack on its own. The server still exchanges
+tokens with the **control plane** for JWT auth, and a real deployment hosts many
+projects — neither of which a server-only Compose file provides. A working
+Compose path would need to run the control plane too. Until then, use k3d.
 
 ## Submodule discipline
 
