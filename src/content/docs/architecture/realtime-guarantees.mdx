@@ -7,6 +7,11 @@ sidebar:
 
 This page defines the expected guarantees developers can rely on today.
 
+Current sync model decision:
+- Server-authoritative linear revision log for collaborative edits.
+- Chosen for simplicity, low-latency practicality, and fast iteration.
+- Designed so OT/CRDT can be layered in later without discarding durable history.
+
 Guarantee dimensions:
 - Delivery scope: who receives event frames.
 - Ordering scope: where ordering is expected to hold.
@@ -25,6 +30,7 @@ Guarantee dimensions:
 What this is not:
 - Exactly-once delivery is not guaranteed.
 - Global ordering across independent streams is not guaranteed.
+- CRDT-level conflict resolution is not guaranteed in the current model.
 
 Design implications:
 1. Client reducers must be idempotent where practical.
@@ -35,3 +41,4 @@ Recommended next hardening steps:
 1. Add message ids to all broadcast frames.
 2. Add optional client ack and replay windows for selected streams.
 3. Publish compatibility policy for wire-level changes.
+4. Prototype OT/CRDT as an overlay protocol while preserving revision-log durability.

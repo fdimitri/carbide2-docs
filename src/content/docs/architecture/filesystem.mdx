@@ -10,6 +10,24 @@ sidebar:
 There is **no save step**. Every keystroke is immediately persisted. The database
 *is* the filesystem. Disk is a flushed snapshot used by shell tools running in the pod.
 
+## Decision: linear revision log, server authoritative
+
+CARB/IDE2 currently uses a **server-authoritative linear revision log** for collaborative edits.
+
+Why this is the right fit right now:
+- Simple to reason about and debug.
+- Low-latency behavior is good enough for current collaborative sessions.
+- Fast to ship and operate without CRDT complexity at this stage.
+- Durable-by-default, because revisions are appended and replayable.
+
+Tradeoff:
+- This model is less resilient to complex concurrent-edit edge cases than OT/CRDT.
+
+Planned evolution:
+- Keep the current revision log as the durable substrate.
+- Introduce OT/CRDT later as a higher-level sync protocol when product needs justify it.
+- Preserve backward compatibility by treating revision replay as the source of truth.
+
 ## Data model
 
 ```mermaid
@@ -45,7 +63,7 @@ One row per file or folder in the project's VFS. Stores metadata only — no con
 Append-only log of every mutation to a file.
 
 - `operation`: `'write'` | `'set_contents'` | `'create'` | `'delete'` | `'rename'`
-- `delta`: the change payload (full content for `set_contents`, OT delta for `write`)
+- `delta`: the change payload (full content for `set_contents`, linear server-validated delta for `write`)
 
 ## Reading a file: `calc_current`
 
