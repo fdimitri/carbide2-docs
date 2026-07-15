@@ -4,8 +4,11 @@ import starlight from '@astrojs/starlight';
 import tailwindcss from '@tailwindcss/vite';
 import mermaid from 'astro-mermaid';
 
+import cloudflare from "@astrojs/cloudflare";
+
 export default defineConfig({
   site: 'https://docs.carbidecore.online',
+
   integrations: [
     mermaid({
       theme: 'dark',
@@ -73,7 +76,10 @@ export default defineConfig({
       customCss: ['./src/styles/custom.css'],
     }),
   ],
+
   vite: {
     plugins: [tailwindcss()],
   },
+
+  adapter: cloudflare()
 });
