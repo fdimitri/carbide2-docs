@@ -7,48 +7,68 @@ sidebar:
 
 ## Token issuance
 
-Tokens are issued in two contexts:
+All tokens are HS256, signed with the shared `WORKER_JWT_SECRET`. In Kubernetes
+the secret lives in the `workspace-jwt` Secret, which the control-plane operator
+mirrors into every `ws-<id>` namespace. The authoritative wire format is
+`JWT_CLAIMS.md`, mirrored by hand in both `carbide2-server` and `carbide2-control`.
 
 | Context | Issuer | Purpose |
 |---------|--------|---------|
-| Login / signup | `carbide2-server` Rails auth controller | User session for the workspace SPA |
-| Workspace provisioning | `carbide2-control` `WorkerTokenIssuer` | Short-lived token for worker process |
+| Dashboard login | `carbide2-control` (`POST /api/login`) | Control-plane session for the dashboard SPA |
+| Workspace bootstrap | `carbide2-control` (`POST /api/workspaces/:id/token`) | Short-lived (5 min) workspace-scoped token the browser presents to the workspace pod |
+| Workspace session | `carbide2-server` (`POST /api/login`) | Exchanges the control-plane token for a workspace user token used on REST calls |
+| Legacy worker token | `carbide2-server` `WorkerTokenIssuer` (`POST /api/projects/:id/ws_token`) | Server-minted WS token, kept while the control plane rolls out |
 
-## Required JWT claims
+## Control-plane-minted claims (new format)
 
-| Claim | Type | Description |
-|-------|------|-------------|
-| `sub` | string | User ID (database primary key as string) |
-| `iss` | string | Issuer — `"carbide2"` |
-| `iat` | integer | Issued-at (Unix timestamp) |
-| `exp` | integer | Expiry (Unix timestamp) |
+| Claim | Type | Example | Notes |
+|-------|------|---------|-------|
+| `iss` | string | `carbide-control` | Constant; the workspace rejects any other issuer |
+| `sub` | string | `user:42` | `user:<control_plane_user_id>` |
+| `aud` | string | `workspace:42` | `workspace:<project_id>`; the workspace rejects a mismatch |
+| `exp` / `iat` | integer | — | Unix seconds; TTL is 5 minutes |
+| `user_id` | integer | `42` | Control-plane DB primary key |
+| `user_email` | string | — | Denormalized for display and audit |
+| `project_id` | integer | `42` | Must match the `aud` suffix and `WORKSPACE_PROJECT_ID` |
+| `scope` | string | `workspace:rw` | Currently always `workspace:rw` |
 
-## Worker-specific claims
+## Workspace-minted user token
 
-The worker token additionally carries:
+After the control-plane exchange, the workspace auth controller issues its own
+user token for subsequent REST calls:
 
-| Claim | Description |
-|-------|-------------|
-| `project_id` | Database ID of the workspace project |
-| `workspace_id` | Control-plane workspace ID |
-| `role` | `"worker"` — distinguishes from user tokens |
+| Claim | Notes |
+|-------|-------|
+| `sub` | Local (workspace-DB) user id |
+| `iat` / `exp` | Expiry from `WORKER_TOKEN_EXPIRY_SECONDS` (default 3600 s) |
+| `scopes` | `["user:auth"]` |
+| `control_user_id` / `control_user_email` | Carried through from the control-plane token |
 
-See `app/services/worker_token_issuer.rb` for issuance logic.
+## Legacy format (server-minted by `WorkerTokenIssuer`)
+
+Accepted by the worker during the control-plane transition. Claims: `sub` and
+`user` (both the user id), `name` (display name), `project` (project id), and
+`exp`. No `iss`/`aud`. See `app/services/worker_token_issuer.rb`.
 
 ## Validation
 
-Token validation on the Rails side:
+Rails API validation (`Api::BaseController`):
 
-1. Decode with the application secret key (`Rails.application.secret_key_base`)
-2. Verify `iss == "carbide2"`
-3. Verify `exp` is in the future
-4. Look up `User.find(sub)` — a `RecordNotFound` here surfaces as a 404 (auth error masquerading as missing resource; a known gotcha)
+1. Decode HS256 against `WORKER_JWT_SECRET`; expired or malformed tokens → 401.
+2. Look up the user from the `sub` claim. A structurally valid token whose user
+   does not exist in *this* pod's database (e.g. a token minted by a different
+   workspace pod and replayed here) returns **401 "Token does not match a known
+   user"** — deliberately not a 404.
 
-Worker validates tokens in `worker/worker.rb` on WebSocket connection using the same secret.
+The worker validates tokens in `worker/worker.rb` at WebSocket connect (and
+again on in-band `system/reauth`), against the same secret:
 
-## Legacy claims
-
-Older tokens may carry `user_id` instead of `sub`. Both are accepted during a transition window. `sub` is canonical for new tokens.
+1. Signature valid against `WORKER_JWT_SECRET`.
+2. `iss == "carbide-control"` (new format) **or** no `iss` claim (legacy).
+3. New format only, when `WORKSPACE_PROJECT_ID` is set: `aud` must equal
+   `workspace:<id>`, `project_id` must match, and `scope` must be `workspace:rw`.
+4. `exp > now`. An expiry sweep sends `system/token_expired`; clients refresh
+   in-band via `system/reauth` without dropping the socket.
 
 ## Token flow diagram
 
@@ -59,11 +79,17 @@ sequenceDiagram
   participant Server as carbide2-server
   participant Worker as carbide2-worker
 
-  Browser->>Control: POST /api/sessions (login)
-  Control-->>Browser: JWT { sub, iss, exp }
+  Browser->>Control: POST /api/login
+  Control-->>Browser: control-plane session token
 
-  Browser->>Server: GET /api/projects (Authorization: Bearer <token>)
-  Server->>Server: decode + validate + User.find(sub)
+  Browser->>Control: POST /api/workspaces/:id/token
+  Control-->>Browser: workspace-scoped JWT (5 min TTL)
+
+  Browser->>Server: POST /api/login (Bearer workspace JWT)
+  Server->>Control: verify token, fetch user
+  Server-->>Browser: workspace user token + profile
+
+  Browser->>Server: GET /api/projects (Bearer user token)
   Server-->>Browser: 200 OK
 
   Browser->>Worker: WS connect ?token=<jwt>

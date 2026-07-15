@@ -19,8 +19,8 @@ watches `Workspace` custom resources and provisions/deprovisions workspace pods.
 ## Cluster management
 
 ```bash
-# Create dev cluster
-./scripts/dev-cluster.sh
+# Create dev cluster (lives in carbide2-server)
+./carbide2-server/scripts/dev-cluster.sh
 
 # List clusters
 k3d cluster list
@@ -39,7 +39,7 @@ k3d cluster delete carbide
 |-----------|---------|
 | `default` | Traefik ingress, shared services |
 | `carbide` | Control plane deployment |
-| `ws-<id>` | Per-workspace pod (Rails + worker + Vite) |
+| `ws-<id>` | Per-workspace pod (Rails + worker) |
 
 ## Common kubectl commands
 

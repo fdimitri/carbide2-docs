@@ -13,7 +13,7 @@ sidebar:
 | **Control plane** | `carbide2-control` — dashboard, workspace CRUD, k8s operator. Serves `/` on the main domain. |
 | **Workspace pod** | The per-workspace deployment (`ws-<id>` namespace) running Rails + worker. Serves `/w/<id>/`. |
 | **Worker** | The EventMachine WebSocket server (`carbide2-worker`) — terminals, chat, fs, agents. |
-| **commandSet (`cs`)** | Top-level routing key in WS messages: `system`, `fs`, `terminal`, `chat`, `agents`. |
+| **commandSet (`cs`)** | Top-level routing key in WS messages: `system`, `fs`, `term`, `chat`, `agent`, `rtc`, `debug`. |
 | **`calc_current`** | `DirectoryEntry` method that replays the `FileChange` log to produce current file content. |
 | **VfsFlusher** | Worker background loop that writes DBFS content to pod disk (timer + byte threshold). |
 | **Meta repo** | `carbide2` — pins the four component repos as submodules; owns `deploy.rb`. |

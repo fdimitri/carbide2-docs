@@ -17,60 +17,69 @@ import { Aside } from '@astrojs/starlight/components';
 
 | Endpoint | Security |
 |----------|----------|
-| `POST /api/auth/login` | N0 |
-| `POST /api/auth/signup` | N0 |
+| `POST /api/login` | N0 (requires a control-plane bearer) |
+| `POST /api/signup` | N0 (always 405 — signup lives on the control plane) |
 | `GET /api/projects` | N1 |
 | `POST /api/projects` | N1 |
 | `GET /api/projects/:id` | N2 |
 | `PATCH /api/projects/:id` | N2 |
 | `DELETE /api/projects/:id` | N3 |
+| `POST /api/projects/:id/ws_token` | N2 |
+| `GET`/`PATCH /api/projects/:id/settings` | N2 |
 | `GET /api/projects/:project_id/fs/tree` | N2 |
-| `GET /api/projects/:project_id/fs/files/*path` | N2 |
+| `GET /api/projects/:project_id/fs/content` | N2 |
+| `GET /api/projects/:project_id/fs/stat` | N2 |
+| `GET /api/projects/:project_id/fs/blob` | N2 |
 | `POST /api/projects/:project_id/fs/files` | N2 |
-| `PUT /api/projects/:project_id/fs/files/*path` | N2 |
-| `DELETE /api/projects/:project_id/fs/files/*path` | N2 |
+| `POST /api/projects/:project_id/fs/dirs` | N2 |
+| `PATCH /api/projects/:project_id/fs/rename` | N2 |
+| `DELETE /api/projects/:project_id/fs/entry` | N2 |
 | `POST /api/projects/:project_id/fs/upload` | N2 |
-| `GET /api/users/me` | N1 |
-| `PATCH /api/users/me` | N1 |
+| `GET /api/projects/:project_id/recordings` | N2 |
+| `GET /api/preferences` | N1 |
+| `PATCH /api/preferences` | N1 |
 
 Security levels are defined in [Security Model](/architecture/security-model/).
 
 ## Authentication
 
-### `POST /api/auth/login`
+### `POST /api/login`
 
-Issue a JWT for an existing user.
+Exchange a **control-plane bearer token** for a workspace user token. This is
+not an email/password login — the workspace pod delegates credential checks to
+`carbide2-control` (see [Authentication & JWT](/architecture/authentication/)).
 
-**Request body:**
-```json
-{ "email": "user@example.com", "password": "..." }
-```
+**Request:** `Authorization: Bearer <control-plane workspace token>`
 
 **Response:**
 ```json
-{ "token": "<jwt>", "user": { "id": 1, "email": "..." } }
+{ "token": "<workspace user jwt>", "user": { "id": 1, "email": "..." }, "message": "Login successful" }
 ```
 
-### `POST /api/auth/signup`
+### `POST /api/signup`
 
-Register a new user and receive a JWT.
+Always returns **405** — account creation is handled by the control plane
+dashboard, not by workspace pods.
 
 ## Concrete examples
 
-### Example: list project tree
+### Example: fetch the project tree
 
 ```bash
 curl -H "Authorization: Bearer $TOKEN" \
-  "http://localhost:3000/api/projects/1/fs/tree?path=/"
+  "http://localhost:3000/api/projects/1/fs/tree"
 ```
 
-Example response:
+The response is the full nested tree for the project:
 
 ```json
 {
-  "entries": [
-    { "name": "src", "ftype": "folder", "size": null, "mtime": "2026-07-14T18:10:22Z" },
-    { "name": "README.md", "ftype": "file", "size": 1387, "mtime": "2026-07-14T18:10:32Z" }
+  "name": "/",
+  "path": "/",
+  "ftype": "folder",
+  "children": [
+    { "name": "src", "path": "/src", "ftype": "folder", "children": [] },
+    { "name": "README.md", "path": "/README.md", "ftype": "file" }
   ]
 }
 ```
@@ -114,6 +123,16 @@ Update project metadata.
 
 Delete a project. Owner only.
 
+### `POST /api/projects/:id/ws_token`
+
+Mint a project-scoped worker JWT for the WebSocket connection (legacy path;
+see [Authentication & JWT](/architecture/authentication/)).
+
+### `GET` / `PATCH /api/projects/:id/settings`
+
+Read or update per-project settings (DBFS flush tuning, `root_path`,
+`shell_image`, …).
+
 ---
 
 ## Filesystem (DBFS)
@@ -127,13 +146,21 @@ All DBFS endpoints are scoped to a project: `/api/projects/:project_id/fs/...`
 
 ### `GET /api/projects/:project_id/fs/tree`
 
-List directory entries for a given path.
+Return the full nested file tree for the project.
 
-**Query params:** `path` (default: `/`)
+### `GET /api/projects/:project_id/fs/content`
 
-### `GET /api/projects/:project_id/fs/files/*path`
+Read a file's current content (replays the `FileChange` log via `calc_current`).
 
-Read a file's current content (replays `FileChange` log via `calc_current`).
+**Query params:** `path` (e.g. `?path=/src/app.rb`)
+
+### `GET /api/projects/:project_id/fs/stat`
+
+Stat-style metadata for a single entry. **Query params:** `path`
+
+### `GET /api/projects/:project_id/fs/blob`
+
+Raw bytes for a binary entry. **Query params:** `path`
 
 ### `POST /api/projects/:project_id/fs/files`
 
@@ -141,31 +168,63 @@ Create a new file.
 
 **Request body:**
 ```json
-{ "path": "/src/app.js", "content": "" }
+{ "path": "/src/app.js", "content": "", "mkdirp": true }
 ```
 
-### `PUT /api/projects/:project_id/fs/files/*path`
+### `POST /api/projects/:project_id/fs/dirs`
 
-Set full file contents.
+Create a directory (`mkdir -p` semantics).
 
-### `DELETE /api/projects/:project_id/fs/files/*path`
+**Request body:** `{ "path": "/src/lib" }`
 
-Delete a file or directory.
+### `PATCH /api/projects/:project_id/fs/rename`
+
+Rename an entry.
+
+**Request body:** `{ "path": "/src/old.rb", "new_name": "new.rb" }`
+
+### `DELETE /api/projects/:project_id/fs/entry`
+
+Delete a file or directory (and its children).
+
+**Request body:** `{ "path": "/src/old.rb" }`
 
 ### `POST /api/projects/:project_id/fs/upload`
 
-Upload an archive (zip, tar, tar.gz) or single file and import into the DBFS.
+Upload an archive (zip, tar, tar.gz) or single file and import it into the DBFS.
 
 **Content-Type:** `multipart/form-data`
 
+### `POST /api/projects/:project_id/fs/import`
+
+Import the project's on-disk root into the DBFS (used after out-of-band
+filesystem population).
+
 ---
 
-## Users
+## Terminal recordings
 
-### `GET /api/users/me`
+### `GET /api/projects/:project_id/recordings`
 
-Return the authenticated user's profile.
+List asciinema cast recordings for the project.
 
-### `PATCH /api/users/me`
+### `GET /api/projects/:project_id/recordings/:id/cast`
 
-Update the authenticated user's profile.
+Download the asciinema v2 cast file for replay.
+
+### `DELETE /api/projects/:project_id/recordings/:id`
+
+Delete a recording.
+
+---
+
+## Preferences
+
+### `GET /api/preferences`
+
+Return the authenticated user's preferences (theme, editor font size, tab
+width, timezone, …), creating a default row on first access.
+
+### `PATCH /api/preferences`
+
+Update the authenticated user's preferences.

@@ -8,7 +8,7 @@ sidebar:
 ## Overview
 
 CARB/IDE2's agent system lets users interact with LLMs from within the workspace.
-Conversations are stored in Postgres and streamed to the client over the `agents`
+Conversations are stored in Postgres and surfaced to the client over the `agent`
 WebSocket commandSet.
 
 ## Data model
@@ -17,16 +17,19 @@ WebSocket commandSet.
 erDiagram
   Agent {
     int id
-    int project_id
+    string slug
     string name
     string model
     text system_prompt
   }
   AgentConversation {
     int id
+    string uuid
+    int project_id
     int agent_id
     int user_id
     string title
+    string visibility
   }
   AgentMessage {
     int id
@@ -41,26 +44,32 @@ erDiagram
 
 ### `Agent`
 
-Defines an LLM persona: model, system prompt, name. Scoped to a project.
+Defines an LLM persona: model, system prompt, tool allowlist. Agents are
+workspace-global (not per-project); `slug` is the stable client-facing id.
 
 ### `AgentConversation`
 
-A single conversation thread between a user and an agent. One conversation can have
-many messages.
+A persisted conversation thread (project + user + agent). `uuid` is the
+client-facing id; `visibility` is `project` (any member can read and post) or
+`private` (owner only).
 
 ### `AgentMessage`
 
-One message in a conversation. `role` is `"user"` or `"assistant"`.
+One message in a conversation. `role` is one of `system`, `user`, `assistant`,
+or `tool` — the OpenAI chat-completion roles, including tool calls and results.
 
 ## LLM relay
 
-The worker streams responses from the configured LLM endpoint (LM Studio in local dev,
-or a remote OpenAI-compatible endpoint in production).
+The worker runs the tool-call loop against the configured OpenAI-compatible
+endpoint (LM Studio in local dev, or a remote provider in production). Each
+turn is a single non-streaming completion request today; tool calls are
+executed worker-side and surfaced as `agent/tool_call` / `agent/tool_result`
+events.
 
 ```mermaid
 sequenceDiagram
   participant Client as Vue Client
-  participant Worker as agent_handler.rb
+  participant Worker as agent_handlers.rb / AgentSession
   participant LLM as LLM API
 
   Client->>Worker: WS { cs:'agent', cmd:'ask', payload:{conversation_id, agent_slug, message} }
@@ -84,5 +93,6 @@ allowing offline agent use during development.
 | `app/models/agent.rb` | Agent model |
 | `app/models/agent_conversation.rb` | Conversation model |
 | `app/models/agent_message.rb` | Message model |
-| `worker/agent_handler.rb` | WS commandSet handler + LLM streaming |
+| `worker/handlers/agent_handlers.rb` | WS commandSet handlers (`list`, `recent`, `load`, `ask`, …) |
+| `worker/agent_session.rb` | In-memory tool-call loop per conversation |
 | `scripts/dev-lmstudio-relay.sh` | Local LLM relay script |

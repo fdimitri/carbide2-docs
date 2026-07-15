@@ -31,10 +31,9 @@ and **Docker Compose** (simpler, no k8s).
 git clone --recurse-submodules https://github.com/fdimitri/carbide2.git
 cd carbide2
 
-# Create a local k3d cluster
-./scripts/dev-cluster.sh
-
-# Deploy everything
+# Build, create the cluster if needed, and deploy everything.
+# deploy.rb brings up the k3d cluster + infra itself
+# (via carbide2-server/scripts/dev-cluster.sh) before building and deploying.
 ruby scripts/deploy.rb
 ```
 

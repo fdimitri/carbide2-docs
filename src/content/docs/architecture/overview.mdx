@@ -83,14 +83,15 @@ Browser → Traefik → carbide2-control Rails /api/workspaces
 
 ## Process model (per workspace pod)
 
-Three processes supervised by **Foreman** (`Procfile`) plus one shell sidecar backend:
+Two long-lived processes (defined in the `Procfile`), plus a dev-only Vite
+server and a shell sidecar backend:
 
 | Process | Command | Purpose |
 |---------|---------|---------|
-| `web` | `bundle exec rails server` | REST API + SPA asset serving |
-| `worker` | `ruby worker/worker.rb` | EventMachine WS server |
-| `vite` | `npm run dev` (dev only) | HMR for Vue SPA |
-| `carbide2-shell` (sidecar) | spawned/managed by terminal backend | PTY exec target with project-filesystem-only mount |
+| `rails` | `bundle exec rails server` | REST API + SPA asset serving |
+| `worker` | `bundle exec ruby worker/worker.rb` | EventMachine WS server |
+| Vite (dev only) | `npm run dev` | HMR for the Vue SPA |
+| `carbide2-shell` (sidecar) | spawned/managed by the terminal backend | PTY exec target with a project-filesystem-only mount |
 
 ## Data storage
 

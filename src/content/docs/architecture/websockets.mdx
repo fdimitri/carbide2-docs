@@ -66,7 +66,7 @@ DBFS operations. See [Filesystem (DBFS)](/architecture/filesystem/).
 | `delete` | C→S | Delete an entry |
 | `change` | S→C | Broadcast a file change to other viewers |
 
-### `terminal`
+### `term`
 
 PTY terminal multiplexing.
 
@@ -138,3 +138,4 @@ currently logs a warning (non-blocking); hard-fail will be added in a future rel
 | `worker/handlers/chat_handlers.rb` | `chat` commandSet handler |
 | `worker/handlers/term_handlers.rb` | `term` commandSet + PTY |
 | `worker/handlers/agent_handlers.rb` | `agent` commandSet handler |
+| `worker/handlers/rtc_handlers.rb` | `rtc` signaling relay |

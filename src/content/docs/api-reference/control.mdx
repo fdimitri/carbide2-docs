@@ -16,8 +16,9 @@ import { Aside } from '@astrojs/starlight/components';
 
 | Endpoint | Security |
 |----------|----------|
-| `POST /api/sessions` | N0 |
+| `POST /api/login` | N0 |
 | `POST /api/signup` | N0 |
+| `DELETE /api/logout` | N1 |
 | `GET /api/workspaces` | N1 |
 | `POST /api/workspaces` | N1 |
 | `GET /api/workspaces/:id` | N2 |
@@ -29,9 +30,9 @@ Security levels are defined in [Security Model](/architecture/security-model/).
 
 ## Sessions
 
-### `POST /api/sessions`
+### `POST /api/login`
 
-Log in — issue a JWT.
+Log in — issue a control-plane session JWT.
 
 **Request body:**
 ```json
@@ -46,6 +47,10 @@ Log in — issue a JWT.
 ### `POST /api/signup`
 
 Register a new user.
+
+### `DELETE /api/logout`
+
+End the current session.
 
 ---
 

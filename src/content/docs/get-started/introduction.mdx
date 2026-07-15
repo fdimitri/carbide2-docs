@@ -22,11 +22,12 @@ point-in-time recovery trivial.
 ### One pod per workspace
 
 Each workspace runs in its own Kubernetes pod (`namespace: ws-<id>`). The pod runs
-three processes supervised by Foreman:
+two long-lived processes (see the `Procfile`):
 
-- **Rails** — REST API + session management
+- **Rails** — REST API + SPA asset serving
 - **Worker** — EventMachine WebSocket server (terminals, chat, filesystem, agents)
-- **Vite** (dev only) — HMR for the client SPA
+
+In local development a third process, **Vite**, provides HMR for the client SPA.
 
 ### Control plane vs workspace
 

@@ -21,7 +21,8 @@ All REST endpoints require a valid JWT in the `Authorization` header:
 Authorization: Bearer <token>
 ```
 
-Tokens are issued by `POST /api/sessions` on the control plane. See
+Tokens are issued by `POST /api/login` on the control plane, then exchanged for
+a workspace user token via `POST /api/login` on the workspace pod. See
 [Authentication & JWT](/architecture/authentication/) for the full token spec.
 
 ## Security levels

@@ -20,11 +20,11 @@ Guarantee dimensions:
 
 | Stream | Delivery scope | Ordering scope | Durability | Replay strategy |
 |---|---|---|---|---|
-| fs delta | other viewers of same file in same project | per file revision sequence | durable via file_changes | re-read file state from fs read |
+| fs change | other viewers of same file in same project | per file revision sequence | durable via file_changes | re-read file state from fs read |
 | fs set_contents from watcher | viewers of affected file | per file | durable via file_changes | re-read file state from fs read |
-| chat message | subscribers in same channel | per channel insertion order | durable via chat_messages | fetch history |
+| chat message | subscribers in same channel | per channel insertion order | durable via chat_messages | fetch history over REST |
 | terminal output | subscribers to same terminal id | best effort stream order | not guaranteed durable | reopen terminal or rely on recording if enabled |
-| agent token stream | conversation listeners | per response stream | final response durable, token chunks ephemeral | fetch conversation history |
+| agent events (tool_call / tool_result / done) | conversation listeners | per conversation turn | final messages durable via agent_messages | reload conversation (`agent/load`) |
 | rtc signaling | targeted peers in same room | best effort arrival order | not durable | renegotiate on reconnect |
 
 What this is not:

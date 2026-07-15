@@ -10,7 +10,7 @@ sidebar:
 | Class | Example | Expected behavior |
 |-------|---------|-------------------|
 | Auth failure | expired/invalid token | REST: 401/403, WS: `system/error` and close |
-| Missing identity | token `sub` not found | May surface as 404 in current stack |
+| Unknown identity | token `sub` not found in this pod's DB | REST: 401 (`Api::BaseController` maps it explicitly, not 404) |
 | Worker restart | ws pod rolls | clients reconnect; in-flight ephemeral events may be lost |
 | Sidecar/PTY failure | shell container exits | `term/exit` for affected terminal; user re-open required |
 | DB transient error | brief Postgres disconnect | command error response; client should allow retry |
@@ -25,8 +25,8 @@ sidebar:
 
 | Stream | If receiver disconnects during fanout |
 |--------|--------------------------------------|
-| `fs/delta` | Client resyncs by re-reading file (`calc_current`) |
-| `chat/message` | Missed live push can be recovered through history endpoint/command |
+| `fs/change` | Client resyncs by re-reading the file (`calc_current`) |
+| `chat/message` | Missed live push can be recovered through the REST history endpoint |
 | `term/output` | Lost output during disconnect is not guaranteed replayed |
 | `rtc/*` | Signaling event dropped; peer renegotiation needed |
 

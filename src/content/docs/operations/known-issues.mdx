@@ -16,10 +16,12 @@ single policy layer across REST and WebSocket handlers.
 - Ephemeral streams (`term/output`, `rtc/*`) can be lost during disconnects.
 - Durable streams can be recovered from DB-backed history/read paths.
 
-## Auth mismatch can appear as 404
+## Auth mismatch handling differs by surface
 
-A token with a `sub` that does not map to an existing user may surface as a 404
-instead of a clean 401/403 in some flows.
+The Rails API base controller maps a token whose `sub` has no matching user to
+a clean **401**. Per-resource lookups (`current_user.projects.find(...)`) still
+surface as 404 — correct for missing/inaccessible resources, but worth knowing
+when debugging auth issues.
 
 ## Terminal sidecar behavior still evolving
 

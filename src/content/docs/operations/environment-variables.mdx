@@ -10,10 +10,15 @@ sidebar:
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `DATABASE_URL` | — | Postgres connection (shared by Rails + worker) |
-| `SECRET_KEY_BASE` | — | JWT signing + Rails secrets |
+| `SECRET_KEY_BASE` | — | Rails secrets (production) |
+| `WORKER_JWT_SECRET` | — | HS256 secret for all workspace JWTs (REST + WS); mirrored from the `workspace-jwt` k8s Secret |
+| `WORKER_TOKEN_EXPIRY_SECONDS` | `3600` (login) / `600` (ws_token) | Token TTLs |
+| `WORKSPACE_PROJECT_ID` | — | Control-plane workspace id this pod represents; enables strict `aud`/`project_id` validation |
+| `CARBIDE_BACKEND` | `local` | Terminal execution backend: `local`, `docker`, or `kube` |
 | `CARBIDE_CORS_ORIGINS` | local dev hosts | Comma-separated allowed origins; literal or `/regex/` |
 | `VFS_FLUSH_INTERVAL_MS` | `800` | VfsFlusher periodic sweep interval |
 | `VFS_FLUSH_THRESHOLD_BYTES` | `20` | Immediate flush byte threshold |
+| `IMPORT_FROM_GIT_TIMEOUT_S` | `1800` | Hard timeout for `fs/import_git` clones |
 | `CARBIDE2_CLIENT` | `../carbide2-client` | Path to the client checkout (dev) |
 
 ## carbide2-control
@@ -21,7 +26,7 @@ sidebar:
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `DATABASE_URL` | — | Control-plane Postgres |
-| `SECRET_KEY_BASE` | — | JWT signing |
+| `SECRET_KEY_BASE` | — | Rails secrets |
 | `KUBECONFIG` | in-cluster | k8s API access for the operator |
 
 > This table is seeded from the READMEs — verify against

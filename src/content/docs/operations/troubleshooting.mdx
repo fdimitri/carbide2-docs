@@ -33,21 +33,13 @@ Check these first:
 - If this was a same-tag rebuild, did the forced rollout complete?
 - Are stale shell sidecar pods still hanging around after the worker restart?
 
-## GPG signing failures during deploy
-
-`deploy.rb` does not create or sign commits. If you hit a GPG signing failure,
-it came from a separate `git commit` you ran manually, not from `deploy.rb`.
-
-```bash
-# example: only needed when you are about to run a real git commit manually
-export GPG_TTY=$(tty)
-```
-
 ## 404 on an authenticated endpoint (expected 401)
 
-`User.find(sub)` raising `RecordNotFound` for a token whose user doesn't exist
-surfaces as a 404 — an auth bug masquerading as a missing resource. Check the
-token's `sub` claim against the users table.
+The API base controller now returns **401 "Token does not match a known user"**
+when a token's `sub` has no matching user in this pod's database. If you still
+see a 404 on an authed endpoint, it is almost always a scoped resource lookup
+(`current_user.projects.find(...)`) — meaning the resource doesn't exist *or*
+the user isn't a member. Check membership before assuming a routing bug.
 
 ## Browser shows stale behaviour that curl can't reproduce
 
