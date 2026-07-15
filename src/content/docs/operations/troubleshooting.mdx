@@ -7,18 +7,26 @@ sidebar:
 
 ## Deploy built old code despite new commits
 
-**Cause:** the meta repo pins old component SHAs. `deploy.rb` builds from the
-pinned SHAs, not from component branch tips.
+`deploy.rb` self-updates before doing anything: it fetches the meta repo,
+fast-forwards to `origin/main`, and runs `git submodule update --init
+--recursive`. So every build uses exactly the SHAs pinned on meta `main` —
+running submodule update by hand is never the fix.
 
-**Fix:**
+If a deploy still built old code, the pins themselves are stale: your new
+commits landed in a component repo, but nobody bumped the pin on meta `main`.
+
+**Fix:** bump the pin(s) and push, then redeploy:
+
 ```bash
 cd ~/repos/carbide2
-git submodule update --init --recursive
-git submodule status   # verify all four pins are current
+cd carbide2-server && git checkout main && git pull && cd ..
+git add carbide2-server
+git commit -m "bump carbide2-server"
+git push origin main
 ```
 
-Checklist before redeploy: **server, control, client, worker** pins all current
-on meta `main` — the deploy pulls meta `main`, not `dev`.
+Checklist: **server, control, client, worker** — the deploy pulls meta `main`,
+not `dev`, so a component change only ships once its pin bump is on `main`.
 
 ## Old SPA served after deploy
 

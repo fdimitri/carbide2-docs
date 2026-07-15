@@ -38,19 +38,20 @@ tail -n 40 /tmp/deploy.log
 
 ## Submodule pin discipline
 
-Before every deploy, ensure all four submodule pins are current on meta `main`:
+`deploy.rb` always builds from the SHAs pinned on meta `main` — it self-updates
+and runs `git submodule update --init --recursive` itself, so local submodule
+state on the deploy machine is irrelevant. What matters is that pin bumps are
+**committed and pushed to meta `main`**:
 
 ```bash
-# Check current pin SHAs
-git submodule status
-
 # Bump a component (example: server)
 cd carbide2-server && git checkout main && git pull
 cd .. && git add carbide2-server && git commit -m "bump carbide2-server"
 git push origin main
 ```
 
-Stale pins build old images. Checklist: **server**, **control**, **client**, **worker** — all four must be current.
+A component change only ships once its pin bump is on meta `main`. Checklist:
+**server**, **control**, **client**, **worker**.
 
 Pinned submodules answer which code the deploy builds. They do not explain an
 old SPA still being served after a deploy if the new image was already built and
@@ -58,9 +59,11 @@ imported successfully.
 
 ## Deploy pulls meta `main`
 
-`deploy.rb` does `git pull --ff-only` on the **current branch** of the meta repo
-checkout on the deploy target (typically `main`). Changes on `dev` only ship after
-merging to `main`.
+On startup `deploy.rb` fetches, checks out the deploy ref (default `main`),
+fast-forwards to `origin/<ref>`, and updates submodules. If the local checkout
+has diverged (local commits or a dirty tree), it aborts rather than merging.
+Changes on `dev` only ship after merging to `main`. Pass `--no-pull` to deploy
+exactly what's checked out.
 
 ## Same-tag rebuilds still need a rollout
 

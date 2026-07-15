@@ -62,14 +62,15 @@ Default credentials: `admin@example.com` / `password` (seeded by `db/seeds.rb`).
 
 ## Submodule discipline
 
-After any `git pull` on the meta repo, always update submodules:
+For local development checkouts, update submodules after any `git pull` on the
+meta repo so your working tree matches the pinned SHAs:
 
 ```bash
 git submodule update --init --recursive
 ```
 
-The meta repo pins exact SHAs. Stale submodules will build old code even if component
-tags are newer.
+(`deploy.rb` does this itself before every deploy — this is only for keeping
+your own checkout in sync.)
 
 ## Next steps
 
