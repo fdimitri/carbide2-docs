@@ -1,0 +1,37 @@
+---
+title: Realtime Guarantees
+description: Delivery, ordering, durability, and replay expectations for each stream.
+sidebar:
+  order: 11
+---
+
+This page defines the expected guarantees developers can rely on today.
+
+Guarantee dimensions:
+- Delivery scope: who receives event frames.
+- Ordering scope: where ordering is expected to hold.
+- Durability: whether event survives process restart.
+- Replay: how missed state is recovered after disconnect.
+
+| Stream | Delivery scope | Ordering scope | Durability | Replay strategy |
+|---|---|---|---|---|
+| fs delta | other viewers of same file in same project | per file revision sequence | durable via file_changes | re-read file state from fs read |
+| fs set_contents from watcher | viewers of affected file | per file | durable via file_changes | re-read file state from fs read |
+| chat message | subscribers in same channel | per channel insertion order | durable via chat_messages | fetch history |
+| terminal output | subscribers to same terminal id | best effort stream order | not guaranteed durable | reopen terminal or rely on recording if enabled |
+| agent token stream | conversation listeners | per response stream | final response durable, token chunks ephemeral | fetch conversation history |
+| rtc signaling | targeted peers in same room | best effort arrival order | not durable | renegotiate on reconnect |
+
+What this is not:
+- Exactly-once delivery is not guaranteed.
+- Global ordering across independent streams is not guaranteed.
+
+Design implications:
+1. Client reducers must be idempotent where practical.
+2. Durable DB-backed reads are source of truth after reconnect.
+3. UI should expose reconnect and resync states explicitly.
+
+Recommended next hardening steps:
+1. Add message ids to all broadcast frames.
+2. Add optional client ack and replay windows for selected streams.
+3. Publish compatibility policy for wire-level changes.

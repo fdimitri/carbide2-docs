@@ -1,0 +1,59 @@
+---
+title: RTC Signaling Contract
+description: WebRTC signaling messages over the workspace WebSocket channel.
+sidebar:
+  order: 5
+---
+
+This page defines the current chat-coupled video signaling contract carried over the worker WebSocket.
+
+Status:
+- Implemented but rudimentary.
+- Coupled to chat room membership.
+- Signaling is relay-only; media is peer-to-peer.
+
+Security:
+- Required level: N2 for all rtc commands.
+- Caller must be a member of the workspace project and joined to the target room.
+
+Envelope:
+- Uses the standard WS shape with cs, cmd, payload.
+- cs value: rtc.
+
+Commands:
+
+| Command | Direction | Payload | Notes |
+|---|---|---|---|
+| rtc/join | C to S | room, peer_id, capabilities | Registers peer presence in room |
+| rtc/leave | C to S | room, peer_id | Removes peer from room |
+| rtc/offer | C to S then S to peer | room, from_peer_id, to_peer_id, sdp | Targeted fanout |
+| rtc/answer | C to S then S to peer | room, from_peer_id, to_peer_id, sdp | Targeted fanout |
+| rtc/ice | C to S then S to peer | room, from_peer_id, to_peer_id, candidate | Targeted fanout |
+| rtc/peers | C to S then S to C | room | Returns current peers |
+
+Semantics:
+- Worker relays only. It does not parse or mutate SDP or ICE candidates.
+- No persistence of rtc signaling frames.
+- On reconnect, client must renegotiate.
+- Full mesh is assumed for small rooms.
+
+Error cases:
+- unauthorized: caller lacks N2 or room membership.
+- unknown_peer: to_peer_id not currently present in room.
+- room_mismatch: peer and room association invalid.
+- malformed_payload: required fields missing or invalid.
+
+Concrete example flow:
+
+Client A sends rtc/offer to client B:
+- cs: rtc
+- cmd: rtc/offer
+- payload: room=general, from_peer_id=a1, to_peer_id=b7, sdp=OFFER_SDP
+
+Worker forwards same payload to client B as rtc/offer.
+
+Client B responds with rtc/answer and candidate exchange proceeds via rtc/ice.
+
+Compatibility notes:
+- This contract is best effort and may evolve.
+- Future change should version command payloads explicitly if breaking fields are introduced.

@@ -1,0 +1,53 @@
+---
+title: Authorization Matrix
+description: Per-call authorization requirements for REST and WebSocket surfaces.
+sidebar:
+  order: 10
+---
+
+This matrix turns security levels into actionable authorization expectations.
+
+Levels:
+- N0: Public
+- N1: Authenticated user
+- N2: Project or workspace member
+- N3: Owner or privileged operation
+
+REST matrix:
+
+| Surface | Level | Additional rule |
+|---|---|---|
+| login and signup | N0 | None |
+| user profile read or update | N1 | Subject must equal authenticated user |
+| project list and create | N1 | None |
+| project read and update | N2 | Membership required |
+| project delete | N3 | Owner or explicit admin |
+| filesystem read and write | N2 | Membership in target project |
+| filesystem import upload | N2 | Membership and payload validation |
+| workspace list and create | N1 | None |
+| workspace detail and token mint | N2 | Membership in target workspace |
+| workspace delete | N3 | Owner or explicit admin |
+
+WebSocket matrix:
+
+| Command set | Level | Additional rule |
+|---|---|---|
+| system | N1 | Valid authenticated session |
+| fs | N2 | Membership in project bound to WS session |
+| terminal | N2 | Membership and terminal ownership rules |
+| chat | N2 | Membership and room access |
+| agents | N2 | Membership and conversation visibility |
+| rtc | N2 | Membership and room presence |
+
+Terminal-specific rules:
+- Open terminal requires N2.
+- Input, resize, close requires N2 and terminal access.
+- Agent shell execution requires N2 plus tool allowlist checks.
+
+Failure behavior for authorization:
+- REST: 401 or 403.
+- WS: structured error frame followed by denial of command handling.
+
+Implementation target:
+- One central authorization helper used by both Rails controllers and worker handlers.
+- No duplicated policy logic in individual handlers.

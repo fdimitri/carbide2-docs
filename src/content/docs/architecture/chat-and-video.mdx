@@ -45,6 +45,10 @@ sequenceDiagram
 
 ## What is missing / expected evolution
 
-1. Formalized signaling contract page under API reference.
-2. Explicit reconnection policy for in-flight `rtc/*` messages.
-3. Security-level gating per `rtc/*` command (see [Security Model](/architecture/security-model/)).
+1. Explicit reconnect and renegotiation UX for in-flight `rtc/*` messages.
+2. Stronger delivery telemetry for targeted signaling fanout.
+
+Contracts and guarantees:
+- [RTC Signaling Contract](/api-reference/rtc-signaling/)
+- [Realtime Guarantees](/architecture/realtime-guarantees/)
+- [Security Model](/architecture/security-model/)
