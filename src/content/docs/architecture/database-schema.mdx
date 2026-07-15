@@ -56,10 +56,10 @@ One row per file or folder. Metadata only — content lives in the change log.
 | Column | Type | Notes |
 |--------|------|-------|
 | `project_id` | bigint | FK; `(project_id, srcpath)` unique |
-| `srcpath` | string | Absolute VFS path |
+| `srcpath` | string | Absolute DBFS path |
 | `cur_name` | string | Current basename |
 | `ftype` | string | `'file'` (default) or `'folder'` |
-| `binary` | boolean | Binary-passthrough — reads go straight to VFS disk |
+| `binary` | boolean | Binary-passthrough — reads go straight to DBFS disk |
 | `posix_mode` / `posix_owner` / `posix_group` | int / string / string | POSIX metadata, populated by `FsLoader` |
 | `last_size`, `mtime` | bigint, datetime | stat-style properties for the explorer |
 | `owner_id`, `created_by_id` | integer | User references |
@@ -125,7 +125,7 @@ root), plus geometry snapshot (`cols`/`rows`) and lifecycle
 - `users` — Devise-backed (encrypted password, sign-in tracking, omniauth `provider`/`uid`)
 - `user_preferences` — one per user: theme, editor font size, tab width, timezone…
 - `projects` / `project_memberships` — access control, unique `(user_id, project_id)`
-- `project_settings` — one per project: VFS flush tuning (`flush_bytes`,
+- `project_settings` — one per project: DBFS flush tuning (`flush_bytes`,
   `flush_interval_s`), `root_path`, `shell_image`, `agent_shell_busy_timeout_s`
 
 <Aside type="note">

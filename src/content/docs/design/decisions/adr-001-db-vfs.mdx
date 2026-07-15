@@ -1,5 +1,5 @@
 ---
-title: "ADR-001: Database-backed VFS"
+title: "ADR-001: Database-backed Filesystem (DBFS)"
 description: Why file content lives in Postgres, not on disk.
 sidebar:
   order: 1
@@ -36,7 +36,7 @@ low-latency, and easy to operate while CARB/IDE2 scales up.
 **Negative**
 - Read cost grows with change-log length (full replay); compaction policy needed.
 - Binary files don't fit the delta model — handled via the `binary`
-  passthrough flag reading directly from VFS disk.
+  passthrough flag reading directly from DBFS disk.
 - Worker and Rails share the schema — migrations must be expand/contract safe
   (issue #17).
 

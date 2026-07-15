@@ -96,9 +96,9 @@ Three processes supervised by **Foreman** (`Procfile`) plus one shell sidecar ba
 
 | Store | Used for |
 |-------|---------|
-| Postgres (`FileChange`, `DirectoryEntry`) | All file content and metadata — the VFS |
+| Postgres (`FileChange`, `DirectoryEntry`) | All file content and metadata — the DBFS |
 | Postgres (`ChatMessage`, `TerminalRecording`, `Agent*`) | Collaboration history |
-| Disk (PVC) | Flushed VFS snapshots, used by dev tools running in the pod |
+| Disk (PVC) | Flushed DBFS snapshots, used by dev tools running in the pod |
 | Postgres (`User`, `Project`, `ProjectMembership`) | Identity and access |
 
-See [Filesystem (VFS)](/architecture/filesystem/) for detail on the DBFS design.
+See [Filesystem (DBFS)](/architecture/filesystem/) for detail on the DBFS design.

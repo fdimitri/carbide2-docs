@@ -17,13 +17,13 @@ hero:
 ## What is CARB/IDE2?
 
 CARB/IDE2 is a collaborative, browser-based IDE built on Rails 8.1 + Vue 3.
-Each workspace runs in its own Kubernetes pod, with a database-backed virtual filesystem (no "save" concept — edits persist continuously), real-time shared terminals over WebSocket, IRC-style chat, and an AI agent interface.
+Each workspace runs in its own Kubernetes pod, with a database-backed filesystem (DBFS, no "save" concept — edits persist continuously), real-time shared terminals over WebSocket, IRC-style chat, and an AI agent interface.
 
 ## Components
 
 | Repo | Role |
 |------|------|
-| [carbide2-server](https://github.com/fdimitri/carbide2-server) | Rails app — REST API, auth, VFS, project management |
+| [carbide2-server](https://github.com/fdimitri/carbide2-server) | Rails app — REST API, auth, DBFS, project management |
 | [carbide2-worker](https://github.com/fdimitri/carbide2-worker) | EventMachine WebSocket worker — terminals, chat, fs, agents |
 | [carbide2-client](https://github.com/fdimitri/carbide2-client) | Vue 3 / Vite SPA — the browser IDE |
 | [carbide2-control](https://github.com/fdimitri/carbide2-control) | Rails control plane — workspace provisioning, k8s operator |

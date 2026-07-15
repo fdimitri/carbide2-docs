@@ -116,12 +116,12 @@ Delete a project. Owner only.
 
 ---
 
-## Filesystem (VFS)
+## Filesystem (DBFS)
 
-All VFS endpoints are scoped to a project: `/api/projects/:project_id/fs/...`
+All DBFS endpoints are scoped to a project: `/api/projects/:project_id/fs/...`
 
 <Aside type="tip">
-  The VFS is also accessible over WebSocket via the `fs` commandSet.
+  The DBFS is also accessible over WebSocket via the `fs` commandSet.
   See [WebSocket Commands](/api-reference/websocket-commands/).
 </Aside>
 
@@ -154,7 +154,7 @@ Delete a file or directory.
 
 ### `POST /api/projects/:project_id/fs/upload`
 
-Upload an archive (zip, tar, tar.gz) or single file and import into the VFS.
+Upload an archive (zip, tar, tar.gz) or single file and import into the DBFS.
 
 **Content-Type:** `multipart/form-data`
 

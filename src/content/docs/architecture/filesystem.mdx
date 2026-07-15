@@ -1,6 +1,6 @@
 ---
-title: Filesystem (VFS)
-description: How CARB/IDE2's database-backed virtual filesystem works.
+title: Filesystem (DBFS)
+description: How CARB/IDE2's database-backed filesystem works.
 sidebar:
   order: 2
 ---
@@ -53,10 +53,10 @@ erDiagram
 
 ### `DirectoryEntry`
 
-One row per file or folder in the project's VFS. Stores metadata only — no content.
+One row per file or folder in the project's DBFS. Stores metadata only — no content.
 
 - `kind`: `'file'` | `'folder'`
-- `path`: absolute VFS path (e.g. `/src/app.js`)
+- `path`: absolute DBFS path (e.g. `/src/app.js`)
 
 ### `FileChange`
 
@@ -133,7 +133,7 @@ Both thresholds are configurable via environment variables.
 | File | Role |
 |------|------|
 | `worker/fs_store.rb` | WS command handler for `cs: 'fs'` |
-| `worker/vfs_flusher.rb` | Background flush loop (timer + threshold) |
-| `app/models/directory_entry.rb` | VFS entry model + `calc_current` |
+| `worker/vfs_flusher.rb` | Background DBFS flush loop (timer + threshold) |
+| `app/models/directory_entry.rb` | DBFS entry model + `calc_current` |
 | `app/models/file_change.rb` | Append-only change log model |
-| `lib/tasks/fs.rake` | Rake tasks for VFS inspection |
+| `lib/tasks/fs.rake` | Rake tasks for DBFS inspection |

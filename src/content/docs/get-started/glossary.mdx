@@ -7,7 +7,7 @@ sidebar:
 
 | Term | Meaning |
 |------|---------|
-| **DBFS / VFS** | The database-backed virtual filesystem. Edits persist continuously as `FileChange` rows — there is **no save step** in CARB/IDE2. |
+| **DBFS** | The database-backed filesystem. Edits persist continuously as `FileChange` rows — there is **no save step** in CARB/IDE2. |
 | **Workspace** | One provisioned environment = one Kubernetes pod = one project (Model B). Managed by the control plane. |
 | **Project** | The workspace-local Rails record owning the file tree, chat, agents. Its primary key is local — unrelated to the control-plane workspace id. |
 | **Control plane** | `carbide2-control` — dashboard, workspace CRUD, k8s operator. Serves `/` on the main domain. |
