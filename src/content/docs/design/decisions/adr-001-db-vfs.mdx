@@ -20,6 +20,11 @@ Store all file content in Postgres as an append-only `file_changes` log per
 (`DirectoryEntry#calc_current`). Disk is a **derived cache**, written by
 `VfsFlusher` so shell tools inside the pod see a conventional filesystem.
 
+The synchronization model is **server-authoritative and linear** today: the
+worker validates and appends revisions in order, and clients converge by
+applying server-originated changes. This keeps the implementation simple,
+low-latency, and easy to operate while CARB/IDE2 scales up.
+
 ## Consequences
 
 **Positive**
@@ -40,4 +45,5 @@ Store all file content in Postgres as an append-only `file_changes` log per
 - **Disk-primary + inotify sync** — simpler reads, but conflict-prone for
   concurrent editing and loses per-keystroke history.
 - **CRDT store (e.g. Yjs)** — richer merge semantics, but a much larger
-  dependency surface; revisit if offline editing becomes a requirement.
+  dependency surface; revisit as a future overlay protocol when collaboration
+  edge cases or offline requirements justify the added complexity.
