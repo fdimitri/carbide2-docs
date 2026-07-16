@@ -1,0 +1,186 @@
+---
+title: "ADR-002: Browser Session Tracking"
+description: How the client's live UI/session state is synced to a server-authoritative document.
+sidebar:
+  order: 2
+---
+
+**Status:** Accepted (server side implemented; client side in progress) · **Date:** 2026-07-15
+
+## Context
+
+A browser refresh currently drops the user back to a blank/default workspace
+layout. Pane split configuration, open tabs, active tab per pane, and which
+terminals/files/channels were open are all lost. Beyond simple resume, we want
+two payoffs:
+
+1. **Session resume** — connect with a fresh client (refresh, or a different
+   window/device) and get your workspace back: panes, tabs, focus restored.
+2. **Session watching** — a second client can clone the layout and *follow* the
+   driver's focus/navigation live (pair-programming / observe / demo).
+
+This is the **layout / focus / navigation** layer, distinct from editor
+**content**. Content already flows through its own live transports (DBFS file
+channel, PTY stream, chat broadcast). Session tracking must **not** re-broadcast
+keystrokes into a "session" document — a watcher subscribes to both the session
+doc (layout/focus) and the existing content channels.
+
+Mental model: **treat it like a multiplayer game, not a database replica.**
+Synchronization is best-effort and eventually consistent; the driver is
+authoritative for their own view; watchers tolerate lag. Some state is
+intentionally local and never sent (transient hover, un-committed scroll
+micro-positions).
+
+## Decision
+
+### The server is a dumb path-patch store
+
+The server has **zero schema knowledge** of what a "pane" or "focus" is. The
+client sends generic path patches against an opaque JSON document:
+
+```json
+{ "path": ["panes", "0", "activeTab"], "value": "file:src/main.rb" }
+{ "path": ["panes", "1"], "op": "delete" }
+```
+
+The worker applies the op to a `doc` (jsonb), persists, and rebroadcasts to
+watchers. All session semantics live client-side. This keeps the server tiny and
+lets the wire document's shape evolve without server changes.
+
+### Ownership: single producer per session → last-write-wins
+
+A session has exactly **one producer** (the driver), so LWW is safe with no
+conflict resolution. Opening an existing session:
+
+- **Fork (default open):** the server clones the session doc → you get your own
+  independent session; you are its single producer. The original owner is
+  unaffected.
+- **Watch (listen-only):** you subscribe to the original's event stream but
+  cannot produce events. Read-only follower. No write path → no conflict.
+- **Two-way shared (optional / future):** multiple producers on one session.
+  The only mode that breaks single-producer LWW; would need real conflict
+  handling. Explicitly deferred — CRDT is overkill for 2–3 people. Not everything
+  has to work perfectly.
+
+### Storage: a dedicated `browser_sessions` table
+
+Not a column on `users`. One row per session, durable, survives reconnect and
+pod restart. Columns: `session_uuid` (public/wire id) + bigint PK; `user` and
+`project` refs (project defaults to `Project.canonical` — kept as a hedge for a
+future strip-down deploy even though it is redundant in the single-DB-per-
+workspace model); `name`; `doc` (jsonb); self-referential `forked_from`
+(`forks` uses `dependent: :nullify` so deleting an original never cascade-deletes
+diverged forks); `created_at`/`updated_at` as ctime/mtime.
+
+### Persistence: save on every patch
+
+Persist on every layout patch via plain ActiveRecord `save`. Fine at carbide's
+per-workspace scale (single digits to low thousands of users, nowhere near 10k).
+No server-side write-coalescing layer — that would mean holding a dirty in-memory
+AR instance and a bespoke flush discipline (ActiveRecord has no identity map, so
+any re-`find` would read the stale row). Throttling belongs on the **client**,
+which batches/debounces outbound patches. A pane resize is one discrete settle
+event, not a stream — we are **not** tracking mouse cursor position.
+
+### Transport: a `session` WebSocket commandSet
+
+Rides the existing client ↔ worker WS protocol (not a separate cable channel),
+matching the rest of the live surface. See
+[WebSocket Commands → `session`](/api-reference/websocket-commands/#session). The
+wire shape of the ops is deliberately generic boilerplate while the document
+schema is still being designed.
+
+## Client architecture (Option A: authoritative tree in a store)
+
+The client's layout state is **already almost exactly the wire document**. Today
+it lives in the `usePanes` composable as three reactive refs:
+
+```js
+paneLayout      // 'one' | 'two-horizontal' | ...
+activePaneIndex // number
+panes           // [ { tabs: [{ key:'file:…'|'terminal:…', kind, id, label }], activeTab } ]
+```
+
+**Decision: lift the authoritative layout tree into a dedicated Pinia store**
+(`useSessionStore`), separate from the large `workspaceStore`. Rationale:
+
+- The sync layer (`useSessionSync`) can `watch` the store from anywhere — it does
+  not have to live inside `ProjectPage` or receive refs as arguments.
+- Applying inbound patches (resume / watch) becomes a natural store mutation; the
+  UI reactively follows. Pinia devtools give inspection/time-travel for free.
+- Store state survives `ProjectPage` remount; composable refs die with the page.
+  Resume-across-devices and the multi-window "super session" idea both need the
+  tree reachable independently of any one page.
+
+`usePanes` keeps its **methods** (`setPaneLayout`, `bindTabToPane`, drag/drop);
+they mutate the store instead of local refs. Its public return shape can stay
+identical so consumers (`ProjectPage`, `WorkspacePaneShell`, pane components)
+barely change.
+
+### The wire document IS the reactive tree
+
+Define the store's state so its shape **is** the wire document. Then:
+
+- **Capture (outbound):** a deep `watch` on the session store diffs changes into
+  path patches and sends `session/patch`. Client batches/debounces so a drag
+  emits one settle patch, not one per pixel.
+- **Apply (inbound):** `session/patch` / `session/snapshot` frames mutate the
+  store at the given paths; the UI re-renders reactively.
+
+This makes the Vue-watcher capture path natural and keeps the server dumb.
+
+### Flows
+
+- **Resume:** on load, `session/list` → pick the session → `session/resume`
+  returns a snapshot → hydrate the store → the client re-issues its normal
+  open/subscribe requests for each surface (files/terminals/chats) so content
+  binds through the ordinary code path. The server provides the **manifest**;
+  the client performs the **requests** (the server must not auto-subscribe on the
+  client's behalf).
+- **Watch:** `session/subscribe` returns a snapshot and streams subsequent
+  patches read-only. The watcher subscribes to the existing content channels for
+  the surfaces it is showing (interest management — only what it renders).
+
+## Consequences
+
+**Positive**
+- Server stays trivial and schema-agnostic; the document can evolve client-only.
+- One authoritative tree, globally reachable → resume and watch are natural.
+- Reuses the normal open flow for content binding on resume.
+
+**Negative / open**
+- Requires lifting layout state out of `usePanes` into Pinia (a real refactor,
+  scoped to swapping the composable's internal refs for store refs).
+- **The reconnect path is currently untested and possibly broken.** The
+  per-socket subscription model is ephemeral — a dropped WS forgets all
+  subscriptions, and a fresh socket must re-subscribe + re-pull each surface to
+  head. Session resume is a *superset* of "reconnect correctly," so the reconnect
+  path must work first. A Playwright reconnect test (open docs+terminal+chat,
+  kill the WS, let it reconnect, assert surfaces re-bind to current content) is a
+  prerequisite, tracked separately.
+- **True multi-user divergent forks are gated on filesystem forking.** There is
+  one shared FS view per project today (the DBFS linear change-log — see
+  [ADR-001](/design/decisions/adr-001-db-vfs/)); two users cannot have divergent
+  working trees until that becomes branchable. Layout/focus forks and read-only
+  watch work on the shared FS as-is.
+
+## Alternatives considered
+
+- **Blob PUT/GET on the user record (the original v1 sketch).** Simpler, but
+  makes multi-session/per-device a v2 retrofit and forces whole-document writes
+  instead of small patches. The dedicated table + path patches costs little more
+  and scales to watch/multi-window without rework.
+- **CRDT (e.g. Yjs) for the session doc.** Unnecessary under single-producer LWW;
+  revisit only if the optional two-way-shared mode proves worth building.
+- **Keep the tree in the composable and attach sync there (Option B).** Smaller
+  immediately, but anchors sync to `ProjectPage` and re-introduces the prop-
+  drilling the `workspaceStore` migration already removed; likely reworked once
+  watch/multi-window lands.
+
+## Related
+
+- [ADR-001: Database-backed Filesystem](/design/decisions/adr-001-db-vfs/) — the
+  linear-vs-branchable FS model that gates true multi-user forks.
+- GitHub `fdimitri/carbide2` #24 (persist + restore — the first milestone under
+  this umbrella), #22 (presence/typing), #8 (CRDT editor content), #18 (wire
+  protocol versioning).
