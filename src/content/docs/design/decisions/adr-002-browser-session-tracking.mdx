@@ -129,6 +129,24 @@ Define the store's state so its shape **is** the wire document. Then:
 
 This makes the Vue-watcher capture path natural and keeps the server dumb.
 
+### Constraint: the wire document is hash-keyed all the way down
+
+The server's `apply_op` navigates **hashes only** — it maps every path segment to
+a string and creates missing intermediates as hashes. It **cannot index into an
+array.** This dictates the document shape:
+
+- `panes` is a **map keyed `"0"`…`"3"`**, not an array, so a fine-grained path
+  like `["panes", "2", "activeTab"]` addresses a single pane's field.
+- A pane's `tabs` (an array) is only ever **set as a whole value at a leaf**
+  (`["panes", "0", "tabs"] = [ … ]`) — never index-navigated on the server. The
+  server stores it opaquely; reordering/adding/removing a tab replaces the array.
+
+The client keeps `panes` as a 4-element array at runtime (for `usePanes`
+ergonomics) and converts to/from the hash-keyed wire form at the boundary
+(`toDoc` / `loadDoc` / `applyOps`). The client's op-application is array-aware;
+the server's is deliberately not — which is exactly why the wire form is
+hash-keyed.
+
 ### Flows
 
 - **Resume:** on load, `session/list` → pick the session → `session/resume`
