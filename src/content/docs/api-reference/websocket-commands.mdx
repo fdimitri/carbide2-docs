@@ -108,6 +108,43 @@ field is not implemented on the wire today.
 | `done` | S→C | N2 | `{ conversation_id, agent, content, turn, finish_reason, reasoning? }` |
 | `error` | S→C | N2 | `{ conversation_id, agent, message }` |
 
+## `session`
+
+Server-side browser-session tracking (layout / focus / navigation). The server
+is a **dumb path-patch store**: it applies generic ops to an opaque `doc` (jsonb),
+persists every patch, and rebroadcasts to watchers. It has no schema knowledge of
+the document — all semantics live client-side. See
+[ADR-002: Browser Session Tracking](/design/decisions/adr-002-browser-session-tracking/).
+
+The wire shape of `doc` and `ops` is intentionally generic while the document
+schema is still being designed. An `op` is:
+
+```json
+{ "path": ["key", "…"], "value": <any> }   // set (default)
+{ "path": ["key", "…"], "op": "delete" }    // delete
+```
+
+| Command | Direction | Security | Payload |
+|---------|-----------|----------|---------|
+| `create` | C→S | N2 | `{ from_uuid?, name?, doc? }` → reply `session/created` with `{ session_uuid, name, doc, forked_from }`. With `from_uuid`, forks that session (clones its doc); you become the producer. |
+| `resume` | C→S | N2 | `{ session_uuid }` (must own it) → reply `session/resumed` with `{ session_uuid, name, doc }`; become producer + subscribe. |
+| `patch` | C→S | N2 | `{ session_uuid, ops: [op, …] }` (producer only) → reply `session/patched` with `{ session_uuid, rev }`; relays `session/patch` to watchers. |
+| `subscribe` | C→S | N2 | `{ session_uuid }` → reply `session/snapshot`; read-only watch, receives future `session/patch`. |
+| `unsubscribe` | C→S | N2 | `{ session_uuid }` → reply `session/unsubscribed`. |
+| `snapshot` | C→S | N2 | `{ session_uuid }` → reply `session/snapshot` with `{ session_uuid, name, doc }`. |
+| `list` | C→S | N2 | `{}` → reply `session/list` with `{ sessions: [{ session_uuid, name, updated_at, created_at }] }`. |
+| `created` | S→C | N2 | `{ session_uuid, name, doc, forked_from }` |
+| `resumed` | S→C | N2 | `{ session_uuid, name, doc }` |
+| `snapshot` | S→C | N2 | `{ session_uuid, name, doc }` |
+| `patch` | S→C | N2 | Watcher relay: `{ session_uuid, ops: [op, …] }` |
+| `patched` | S→C | N2 | Producer ack: `{ session_uuid, rev }` |
+| `list` | S→C | N2 | `{ sessions: [...] }` |
+| `unsubscribed` | S→C | N2 | `{ session_uuid }` |
+
+Ownership is single-producer-per-session (last-write-wins). Opening an existing
+session **forks by default**; **watching** (`subscribe`) is read-only and creates
+no row. Subscriptions are ephemeral per socket — a reconnect must re-subscribe.
+
 ## Fanout semantics
 
 | Stream | Fanout | Durability | Recovery |
@@ -116,6 +153,7 @@ field is not implemented on the wire today.
 | `chat/message` | broadcast to room members | durable in `chat_messages` | request history |
 | `term/output` | broadcast to subscribers of terminal id | ephemeral stream | reopen terminal; no guaranteed replay |
 | `agent/done` | final response to conversation listeners | final assistant message persisted | reload history |
+| `session/patch` | relay to session watchers (not the producer) | `doc` persisted per patch in `browser_sessions` | re-`subscribe` for a fresh `session/snapshot` |
 
 ## Concrete examples
 
