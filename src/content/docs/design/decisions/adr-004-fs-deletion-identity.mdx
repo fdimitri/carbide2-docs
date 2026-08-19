@@ -1,0 +1,98 @@
+---
+title: "ADR-004: Filesystem Deletion & Identity Lifecycle"
+description: Why external deletes must not destroy DBFS history, and how file identity survives git and atomic-save writes.
+sidebar:
+  order: 4
+---
+
+**Status:** Proposed · **Date:** 2026-08-18 · **Extends:** ADR-001 · **Related:** ADR-003, fdimitri/carbide2#72, fdimitri/carbide2#75
+
+## Context
+
+`VfsWatcher` currently handles an inotify `:delete` / `:moved_from` by calling
+`entry.destroy!`, which cascades `has_many :file_changes, dependent: :destroy` —
+**the file's entire DBFS history is erased.** A subsequent `close_write` for the
+same path finds no entry and re-imports it as a *brand-new* `DirectoryEntry` with
+a single revision-0 `setContents`.
+
+This is not an edge case. It is the *normal* outcome of ordinary version-control
+use, because **git updates a tracked file by unlinking it and creating a new
+one**, not by rewriting in place. Verified on the pod:
+
+```
+strace:   unlink("f.txt") = 0
+          openat("f.txt", O_WRONLY|O_CREAT|O_EXCL, 0666)
+inotify:  DELETE f.txt → CREATE f.txt → MODIFY → CLOSE_WRITE
+```
+
+So a plain `git pull`, `git submodule update`, or branch switch drives the
+watcher through `destroy!` (history gone) then re-import (fresh identity, new
+rev-0). Atomic-save editors (`vim`, and any editor doing write-temp-then-rename)
+trip the same path. Note also that the **inode is unreliable as an identity
+signal** — in testing the kernel *recycled* the same inode number across the
+unlink/create, so identity cannot be keyed on inode; only the `DELETE→CREATE`
+event sequence on a stable `srcpath` is trustworthy.
+
+Renames have the same disease: `moved_from` + `moved_to` are handled as
+independent delete-then-create, so a shell `mv` also discards history and mints a
+new identity, even though inotify hands us a **cookie** that pairs the two events.
+
+## Decision (proposed)
+
+File **history and identity are anchored to `srcpath`, and are never destroyed by
+a filesystem event.**
+
+1. **Never hard-delete history.** An external `rm` marks the `DirectoryEntry`
+   deleted (a tombstone) but **retains its FileChange log**. History outlives the
+   file — a deletion is itself a historical fact, not an erasure of the past.
+2. **Resurrection rebinds identity.** If a file reappears at a tombstoned
+   `srcpath`, it rebinds to the *same* `DirectoryEntry` and continues that
+   entry's revision lineage (a new `setContents` on the existing log), rather than
+   spawning a new identity.
+3. **Pair delete+create as a modify.** An unlink immediately followed by a
+   create/`close_write` for the same `srcpath` (within one event batch / short
+   window) is a **content change**, not a delete: append a `setContents` to the
+   existing entry (identity, history, and revision sequence preserved). This is
+   what makes a `git pull` land as "AgentConfigPane.vue advanced one revision"
+   instead of "deleted and recreated from scratch."
+4. **Renames follow the cookie.** Pair `moved_from`/`moved_to` by inotify cookie
+   and **update `srcpath` on the same entry** — identity and history intact.
+
+## Consequences
+
+**Positive**
+- History survives git operations, atomic saves, and renames — the common cases
+  that silently destroyed it before.
+- No `fs/deleted → fs/created` flicker at clients for what is really a modify.
+- Deletions become auditable/undoable rather than irreversible.
+
+**Negative / to resolve**
+- The explorer must learn about tombstones (hidden by default) and resurrection.
+- `srcpath` uniqueness is scoped per project; a tombstoned `/x` coexisting with a
+  live `/x` needs the unique constraint to exclude tombstones (partial index) or
+  a lineage model.
+- Tombstones accumulate — a retention/GC policy is an **open question** (they are
+  cheap, but not free).
+
+## Open questions
+
+- **Pairing mechanism:** rely on the `rb-inotify` per-`process` batch (delete and
+  create usually arrive together) or a short debounce timer? The batch is simpler
+  but not guaranteed across a queue-overflow boundary.
+- **Same-path, different-file intent:** if a user `rm`s a file and later creates
+  an unrelated file at the same path, is that the same lineage or a new document?
+  Proposed default: same `srcpath` = same lineage; revisit if it surprises users.
+- **External vs in-app deletes:** a delete issued through the app's own op
+  protocol may warrant different treatment (explicit intent) than an inotify
+  delete (possibly transient). Unify or distinguish?
+
+## Alternatives considered
+
+- **Status quo — eager `destroy!` on any delete.** Simple, and wrong: silent
+  history loss on every `git pull` and every `vim` save.
+- **Inode-based identity.** Rejected — inode numbers are recycled across
+  unlink/create (observed), so inode is not a stable identity.
+- **Reconcile-authoritative full diff** (handlers only mark dirty; a bidirectional
+  sweep is the source of truth). Cleaner long-term, but a larger rewrite and it
+  *still* depends on this "never delete, rebind by srcpath" decision to avoid the
+  same history loss during the sweep.

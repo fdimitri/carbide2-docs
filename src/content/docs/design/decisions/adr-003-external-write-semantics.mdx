@@ -1,0 +1,89 @@
+---
+title: "ADR-003: External VFS Write Semantics (setContents-since)"
+description: How userspace writes to the pod filesystem fold back into the append-only DBFS log.
+sidebar:
+  order: 3
+---
+
+**Status:** Accepted · **Date:** 2026-08-18 · **Extends:** ADR-001
+
+## Context
+
+ADR-001 established the DBFS as a **server-authoritative, linear** append-only
+`file_changes` log per `directory_entries` row: clients send ops, the worker
+validates and appends revisions in order, and current content is derived by
+replay (`DirectoryEntry#calc_current`).
+
+That model assumes every mutation arrives as an *op* against a *known base
+revision*. But the workspace pod is a real machine. Userspace programs — a
+terminal `vim`, a compiler emitting output, `git checkout`, `sed -i` — write the
+on-disk filesystem directly, never touching the op protocol. `VfsWatcher`
+observes these writes via inotify (`close_write` / `moved_to`) and must fold them
+back into the log so collaborators and history stay coherent.
+
+The problem is that we **do not observe the editing session** that produced an
+external write — only its result at `close_write`. Consider: a user opens `vim`,
+and a week later hits `:w` once. We never saw the open, never saw the
+keystrokes, and cannot know which DBFS revision the editor's buffer was based on
+(it may predate dozens of intervening changes, or none). There is no trustworthy
+base revision to diff against, and the bytes now on disk are the only ground
+truth we have.
+
+## Decision
+
+**An external write is recorded as a single `setContents` FileChange carrying
+the entire new file — a full snapshot, never a delta against a prior revision.**
+
+- The watcher reads the file at `close_write`, and if its content differs from
+  the entry's current content, appends one `setContents` change as the next
+  revision, then broadcasts `fs/set_contents` so open editors converge. External
+  writes and in-editor ops share **one linear log** — an external snapshot is
+  just another revision.
+- **Content-equality short-circuit:** if on-disk content equals current content,
+  no revision is appended (stat refresh only). This prevents no-op revisions and
+  breaks feedback loops.
+- **Feedback suppression:** paths written by `VfsFlusher` (the DBFS-to-disk
+  cache writer) are suppressed, so the watcher never re-imports its own writes.
+- **Binary entries** carry no FileChange — bytes live on disk behind the
+  `binary` passthrough flag (per ADR-001); an external write refreshes stat and
+  emits `fs/changed`.
+
+The rationale is representational, not lazy: `setContents` is the *only*
+representation guaranteed correct when the base is unknowable. A delta would
+require a base revision we cannot establish.
+
+## Consequences
+
+**Positive**
+- Always correct regardless of how much editing happened off-log, or when.
+- External writes unify with the op log — one replay path, one broadcast path.
+- Every `setContents` is a natural full-file **keyframe**, which ADR-005 exploits
+  to bound replay cost.
+
+**Negative**
+- Fine-grained attribution/history is lost *for external edits*: a week of `vim`
+  work collapses to one `setContents` with one author and one timestamp. This is
+  acceptable — we never had per-keystroke data for edits made outside the editor,
+  so nothing recoverable is discarded.
+- A large external write appends a full copy of the file, growing the log by the
+  file size rather than by an edit-sized delta.
+
+## Note: revision numbering is a separate defect
+
+`revision` is currently derived from `file_changes.count` — assigned in
+`FileChange.append!` and read back in `DirectoryEntry#get_revision`. That is a
+racy, non-durable implementation (concurrent appends collide; the count resets if
+rows are removed). It is a **bug against an already-intended contract** ("a
+durable, monotonic per-entry sequence"), not an architectural choice, so it does
+not get its own ADR — it is tracked as a fix in fdimitri/carbide2#74 (adopt a per-entry atomic
+sequence and a unique `(directory_entry_id, revision)` index). Recorded here only
+because it lives on this write path.
+
+## Alternatives considered
+
+- **Track a base revision and emit deltas for external writes** — impossible
+  without observing the editing session or a reliable base; the `vim`-saved-once
+  case has neither.
+- **Disk-primary with inotify sync as the source of truth** — rejected in
+  ADR-001 (conflict-prone for concurrent editing, loses per-keystroke history for
+  in-editor work).

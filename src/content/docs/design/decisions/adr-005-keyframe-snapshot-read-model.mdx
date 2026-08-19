@@ -1,0 +1,87 @@
+---
+title: "ADR-005: Keyframe Snapshot Read Model"
+description: Bounding FileChange replay cost with per-entry keyframes, while preserving full history.
+sidebar:
+  order: 5
+---
+
+**Status:** Proposed · **Date:** 2026-08-18 · **Extends:** ADR-001 · **Related:** ADR-003, fdimitri/carbide2#74, fdimitri/carbide2#76
+
+## Context
+
+`DirectoryEntry#calc_current` renders a file by replaying its **entire**
+FileChange log from revision 0 (`file_changes.order(:revision, :id)`, applying
+each change to an `FsDocument`). ADR-001 already flagged the cost: *"read cost
+grows with change-log length (full replay); compaction policy needed."*
+
+A long-lived, heavily-edited file accumulates thousands of keystroke-level
+changes. Every cold render — a cache miss, or any Rails-side read where the
+worker's live `Document` cache is absent — pays O(history). Meanwhile, ADR-003
+guarantees that every external write already lands as a `setContents`: a
+full-file snapshot that makes all preceding changes irrelevant *for computing
+current content*. Those snapshots are natural replay restart points we are not
+yet exploiting.
+
+Crucially, this is a **read-path** concern. It must not become an excuse to throw
+away history — history is the whole point of the DBFS (ADR-001).
+
+## Decision (proposed)
+
+1. **Per-entry keyframe pointer.** A `DirectoryEntry` references its most-recent
+   `setContents` FileChange. `calc_current` / `get_content` start replay **at the
+   keyframe** and apply only the deltas after it, instead of from revision 0.
+   The pointer is derived state — reconstructable from the log — and is
+   maintained as `setContents` changes are appended.
+2. **History is never deleted.** Pre-keyframe rows are retained in full. The
+   keyframe is *only* a "where to start replaying" hint; it is explicitly **not**
+   a retention or deletion mechanism. Time-travel and attribution over the full
+   history remain intact.
+
+## Consequences
+
+**Positive**
+- Replay cost is bounded by "changes since the last snapshot," not total history.
+- Keyframes appear for free: external writes already emit `setContents`
+  (ADR-003), and an occasional explicit snapshot can be inserted deliberately.
+- Purely additive — no change to the on-disk/on-DB history, so it composes with
+  ADR-004 (a resurrected entry keeps its keyframe lineage).
+
+**Negative / to resolve**
+- The pointer must stay consistent under concurrent appends (it is a cache of
+  "max revision whose type is `setContents`"); a wrong pointer must degrade to a
+  correct-but-slower full replay, never to wrong content.
+- Sync cursors must understand keyframes: a client resuming from a revision must
+  treat a keyframe as a valid, self-contained resume point.
+- Interacts with the revision-ordering fix noted in ADR-003 (fdimitri/carbide2#74) — the keyframe
+  is identified by a revision/id, so it depends on that ordering being durable.
+
+## Open questions: change coalescing (NOT deletion)
+
+Separate from keyframes, there is an optional **coalescing** optimization that
+reduces row count *while preserving semantic history*:
+
+- Typing `int main()` produces ~10 `insertDataSingleLine` rows, each with its own
+  timestamp. A run of **same-user, adjacent-position** single-character inserts
+  within a short time window could be merged into one multi-character insert.
+  Fewer rows, and still cheap to decode on replay.
+- This is a **merge, not an erasure**: the edit is fully retained; what is lost is
+  only the sub-second *keystroke timing granularity* (that the run was typed over
+  three seconds rather than pasted at once). Pre-keyframe rows are still never
+  deleted.
+
+Undecided:
+
+- **When** to coalesce — at write time (adds latency to the hot path) or as a
+  periodic background pass (extra machinery)?
+- **The merge predicate** — same user, contiguous positions, time window `W`.
+  Never merge across users, and never merge across a `setContents` boundary.
+- Whether the storage/decode savings justify the complexity at carbide's scale at
+  all — it may simply not be worth doing.
+
+## Alternatives considered
+
+- **Replay from revision 0 (status quo).** Simplest; O(history) per cold read.
+- **Periodic hard compaction — deleting superseded rows.** Rejected: that is
+  history loss, which contradicts ADR-001's reason for existing.
+- **External snapshot store** separate from the log. Redundant, since ADR-003's
+  `setContents` changes already serve as in-log snapshots.
