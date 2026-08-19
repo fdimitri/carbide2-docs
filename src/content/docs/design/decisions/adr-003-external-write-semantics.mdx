@@ -3,9 +3,16 @@ title: "ADR-003: External VFS Write Semantics (setContents-since)"
 description: How userspace writes to the pod filesystem fold back into the append-only DBFS log.
 sidebar:
   order: 3
+status: Accepted
+date: "2026-08-18"
+extends:
+  label: ADR-001
+  href: /design/decisions/adr-001-db-vfs/
 ---
 
-**Status:** Accepted · **Date:** 2026-08-18 · **Extends:** ADR-001
+import AdrHeader from '../../../../components/AdrHeader.astro';
+
+<AdrHeader {...frontmatter} />
 
 ## Context
 
@@ -57,8 +64,8 @@ require a base revision we cannot establish.
 **Positive**
 - Always correct regardless of how much editing happened off-log, or when.
 - External writes unify with the op log — one replay path, one broadcast path.
-- Every `setContents` is a natural full-file **keyframe**, which ADR-005 exploits
-  to bound replay cost.
+- Every `setContents` is a natural full-file **keyframe**, which the keyframe
+  snapshot read-model proposal exploits to bound replay cost.
 
 **Negative**
 - Fine-grained attribution/history is lost *for external edits*: a week of `vim`

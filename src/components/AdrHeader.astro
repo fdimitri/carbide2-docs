@@ -1,0 +1,106 @@
+---
+// AdrHeader — renders ADR/proposal metadata from frontmatter.
+// Spread the page frontmatter into it: <AdrHeader {...frontmatter} />.
+import { Badge } from '@astrojs/starlight/components';
+
+interface LinkRef {
+  label: string;
+  href: string;
+}
+
+interface Props {
+  status?: 'Proposed' | 'Accepted' | 'Superseded' | 'Deprecated' | 'Rejected';
+  date?: string;
+  note?: string;
+  extends?: LinkRef;
+  supersedes?: LinkRef[];
+  related?: LinkRef[];
+}
+
+const {
+  status,
+  date,
+  note,
+  extends: extendsFrom,
+  supersedes = [],
+  related = [],
+} = Astro.props;
+
+const statusVariant = {
+  Proposed: 'note',
+  Accepted: 'success',
+  Superseded: 'caution',
+  Deprecated: 'caution',
+  Rejected: 'danger',
+} as const;
+---
+
+{
+  (status || date || note || extendsFrom || supersedes.length > 0 || related.length > 0) && (
+    <div class="adr-meta">
+      {status && <Badge variant={statusVariant[status] ?? 'default'}>{status}</Badge>}
+      {date && <span class="adr-date">{date}</span>}
+      {note && <span class="adr-note">{note}</span>}
+      {extendsFrom && (
+        <span class="adr-rel">
+          <span class="adr-rel-label">Extends</span>
+          <a href={extendsFrom.href}>{extendsFrom.label}</a>
+        </span>
+      )}
+      {supersedes.length > 0 && (
+        <span class="adr-rel">
+          <span class="adr-rel-label">Supersedes</span>
+          {supersedes.map((s) => (
+            <a href={s.href}>{s.label}</a>
+          ))}
+        </span>
+      )}
+      {related.length > 0 && (
+        <span class="adr-rel">
+          <span class="adr-rel-label">Related</span>
+          {related.map((r) => (
+            <a href={r.href}>{r.label}</a>
+          ))}
+        </span>
+      )}
+    </div>
+  )
+}
+
+<style>
+  .adr-meta {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem 1.25rem;
+    margin-block: 0.75rem 1.5rem;
+    font-size: 0.9rem;
+    color: var(--sl-color-gray-2, #6b7280);
+  }
+  .adr-date {
+    font-variant-numeric: tabular-nums;
+  }
+  .adr-note {
+    color: var(--sl-color-gray-2, #6b7280);
+  }
+  .adr-rel {
+    display: inline-flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem;
+  }
+  .adr-rel-label {
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--sl-color-gray-3, #9ca3af);
+  }
+  .adr-rel a {
+    color: var(--sl-color-text-accent, #6366f1);
+    text-decoration: none;
+    font-weight: 500;
+  }
+  .adr-rel a:hover {
+    text-decoration: underline;
+  }
+</style>

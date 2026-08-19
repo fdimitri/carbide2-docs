@@ -1,11 +1,25 @@
 ---
-title: "ADR-005: Keyframe Snapshot Read Model"
+title: "Keyframe Snapshot Read Model"
 description: Bounding FileChange replay cost with per-entry keyframes, while preserving full history.
 sidebar:
-  order: 5
+  order: 2
+status: Proposed
+date: "2026-08-18"
+extends:
+  label: ADR-001
+  href: /design/decisions/adr-001-db-vfs/
+related:
+  - label: ADR-003
+    href: /design/decisions/adr-003-external-write-semantics/
+  - label: carbide2#74
+    href: https://github.com/fdimitri/carbide2/issues/74
+  - label: carbide2#76
+    href: https://github.com/fdimitri/carbide2/issues/76
 ---
 
-**Status:** Proposed · **Date:** 2026-08-18 · **Extends:** ADR-001 · **Related:** ADR-003, fdimitri/carbide2#74, fdimitri/carbide2#76
+import AdrHeader from '../../../../../components/AdrHeader.astro';
+
+<AdrHeader {...frontmatter} />
 
 ## Context
 
@@ -44,7 +58,8 @@ away history — history is the whole point of the DBFS (ADR-001).
 - Keyframes appear for free: external writes already emit `setContents`
   (ADR-003), and an occasional explicit snapshot can be inserted deliberately.
 - Purely additive — no change to the on-disk/on-DB history, so it composes with
-  ADR-004 (a resurrected entry keeps its keyframe lineage).
+  the filesystem deletion & identity proposal (a resurrected entry keeps its
+  keyframe lineage).
 
 **Negative / to resolve**
 - The pointer must stay consistent under concurrent appends (it is a cache of

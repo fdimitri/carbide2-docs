@@ -1,0 +1,92 @@
+---
+title: "Shell Pod Resource Limits"
+description: Where per-project shell pod CPU/memory live and how they are applied durably.
+sidebar:
+  order: 4
+status: Proposed
+date: "2026-08-19"
+---
+
+import AdrHeader from '../../../../../components/AdrHeader.astro';
+
+<AdrHeader {...frontmatter} />
+
+## Context
+
+User shells run in a per-project pod, `proj-<id>-shell`, created at runtime by
+the worker (`ProjectPod#create!` — `kubectl apply -f -` with a generated spec),
+not by the operator or Helm. That pod's CPU/memory is currently hardcoded in
+`project_pod.rb`:
+
+```ruby
+resources: {
+  requests: { cpu: '50m', memory: '128Mi' },
+  limits:   { cpu: '1',   memory: '1Gi'   },
+}
+```
+
+A long build in that shell hit the 1Gi limit and was OOM-killed. Raising it is
+not a simple patch: Kubernetes pod `resources` are immutable, so a running pod
+can't be edited, and any one-off change (patch the worker code and restart, or
+recreate the shell with different values) is lost on the next recreate because
+the spec is regenerated from code each time.
+
+What's missing is a **durable, per-project** source for the shell pod's limits —
+durable meaning "the value a recreate converges on," not "the value that
+happens to be live right now."
+
+## Decision
+
+1. **Source of truth is `ProjectSetting`.** Add nullable columns for shell pod
+   CPU/memory request/limit (`shell_cpu_request`, `shell_cpu_limit`,
+   `shell_mem_request`, `shell_mem_limit`), alongside the existing
+   `shell_image`. Nil means "use the system default."
+2. **The worker reads settings from the DB at pod-create time**, reusing the
+   5-second TTL cache pattern already in `VfsFlusher#refresh_settings_cache!`.
+   Env vars (`CARBIDE_SHELL_*`) remain the fallback when the row/column is nil,
+   so nothing breaks if settings aren't seeded.
+3. **Application is create-time only.** Pod resources are immutable, so a change
+   takes effect by deleting the shell pod and letting the reference-counted
+   lifecycle recreate it. The next `create!` re-reads the durable row, so any
+   temporary patch is always overwritten by the source of truth.
+4. **No new transport.** The existing `PATCH /api/projects/:id/settings` writes
+   the row and the per-project seed ensures a row exists. The worker already
+   has direct Postgres access; no queue-to-server-API-with-ack is introduced.
+
+## Consequences
+
+**Positive**
+
+- A settings change is durable and idempotent: delete the shell pod, get the
+  new limits on recreate, and never worry a temporary patch has drifted.
+- Runtime-editable via the existing settings API; the worker process itself does
+  not need to restart, only the shell pod.
+- Matches the `shell_image` / `VfsFlusher` precedent instead of inventing a new
+  mechanism.
+
+**Negative / to resolve**
+
+- Propagation is eventually-consistent (bounded by the 5s cache plus the shell
+  pod lifecycle). Acceptable here: limits only matter at create, and speed is
+  not the requirement.
+- Nil-vs-default semantics must be explicit in validation and the fallback chain
+  so an empty setting means "default," never "zero/absent."
+- The worker remains responsible for shell pod config; this is one more column
+  set to keep in sync if the shell pod spec changes shape.
+
+## Alternatives considered
+
+- **Env vars on the workspace pod (`CARBIDE_SHELL_*`).** Per-project in practice
+  (one workspace pod per project) and simplest, but not runtime-editable and
+  requires a workspace re-deploy/restart to change. The existing settings API
+  and `shell_image` column already point at DB-backed settings.
+- **Workspace CRD `resources`.** Wrong lifecycle: the operator owns the workspace
+  Deployment, the worker owns shell pods. A CRD change would need
+  operator→worker indirection for a pod the operator doesn't manage.
+- **Queue settings to the server API until ack.** More machinery than the problem
+  needs: resources are only consulted at create, the worker already has direct
+  DB access, and the DB row is already the durable store. An ack seam adds
+  failure modes without adding durability.
+- **Postgres `NOTIFY`/`LISTEN` to invalidate the cache faster.** A natural future
+  upgrade if propagation ever needs to be sub-5s; not required while limits
+  only matter at pod create.

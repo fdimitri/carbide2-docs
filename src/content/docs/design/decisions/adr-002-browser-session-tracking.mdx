@@ -3,9 +3,25 @@ title: "ADR-002: Browser Session Tracking"
 description: How the client's live UI/session state is synced to a server-authoritative document.
 sidebar:
   order: 2
+status: Accepted
+date: "2026-07-15"
+note: "Server side implemented; client side in progress"
+related:
+  - label: ADR-001 (Database-backed Filesystem)
+    href: /design/decisions/adr-001-db-vfs/
+  - label: carbide2#24 (persist + restore)
+    href: https://github.com/fdimitri/carbide2/issues/24
+  - label: carbide2#22 (presence/typing)
+    href: https://github.com/fdimitri/carbide2/issues/22
+  - label: carbide2#8 (CRDT editor content)
+    href: https://github.com/fdimitri/carbide2/issues/8
+  - label: carbide2#18 (wire protocol versioning)
+    href: https://github.com/fdimitri/carbide2/issues/18
 ---
 
-**Status:** Accepted (server side implemented; client side in progress) · **Date:** 2026-07-15
+import AdrHeader from '../../../../components/AdrHeader.astro';
+
+<AdrHeader {...frontmatter} />
 
 ## Context
 
@@ -194,11 +210,3 @@ hash-keyed.
   immediately, but anchors sync to `ProjectPage` and re-introduces the prop-
   drilling the `workspaceStore` migration already removed; likely reworked once
   watch/multi-window lands.
-
-## Related
-
-- [ADR-001: Database-backed Filesystem](/design/decisions/adr-001-db-vfs/) — the
-  linear-vs-branchable FS model that gates true multi-user forks.
-- GitHub `fdimitri/carbide2` #24 (persist + restore — the first milestone under
-  this umbrella), #22 (presence/typing), #8 (CRDT editor content), #18 (wire
-  protocol versioning).

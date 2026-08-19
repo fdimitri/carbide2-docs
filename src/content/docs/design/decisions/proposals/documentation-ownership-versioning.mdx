@@ -1,0 +1,125 @@
+---
+title: "Documentation Ownership, Versioning, and Seam Contracts"
+description: Where docs live, how they version with code, and how cross-repo seams are documented.
+sidebar:
+  order: 3
+status: Proposed
+date: "2026-08-19"
+related:
+  - label: carbide2 README (meta-repo + client publication model)
+    href: https://github.com/fdimitri/carbide2
+  - label: Documentation Standards
+    href: /standards/documentation-standards/
+  - label: ADR-002 (first cross-repo ADR)
+    href: /design/decisions/adr-002-browser-session-tracking/
+---
+
+import AdrHeader from '../../../../../components/AdrHeader.astro';
+
+<AdrHeader {...frontmatter} />
+
+## Context
+
+`carbide2-docs` is an Astro/Starlight site published under the `carbide2-site`
+umbrella (`www.carbidecore.online` and `docs.carbidecore.online`), standing in
+"for now" while the real documentation story is sorted out.
+
+Three problems have emerged:
+
+1. **Docs drift from code.** Architecture and ADR pages describe behavior in the
+   four component repos (`server`, `worker`, `client`, `control`), but they live
+   in a fifth repo that nothing pins. ADR-001/002 already read stale against the
+   current implementation because nothing forces a doc to change when the code
+   it describes changes.
+2. **Cross-repo seams have no home.** The worker and Rails share a Postgres
+   schema; the worker and client share a WebSocket protocol. Neither component
+   repo is authoritative for a seam, and there is no single place that records
+   "worker version W talks to client version C via protocol P."
+3. **No per-version access.** "Show me the docs for this exact pinned build" is
+   not answerable today, and there is no defined discussion surface for readers
+   that is separate from the published site.
+
+## Decision
+
+### Two-tier ownership: source near the code, site as artifact
+
+- **Per-component docs** (API reference, worker command reference, model/schema
+  notes, component-local ADRs) live **in the component repo** under `docs/`,
+  versioning with the code they describe.
+- **Cross-repo documents** (ADRs that span two or more repos, seam contracts,
+  protocol/schema agreements) live in the **`carbide2` meta repo** — the only
+  repo that already ties component SHAs into a known-good set.
+- **`carbide2-docs` remains the *published* site**, not the source of truth for
+  per-repo or cross-repo material. It authors only global/generic content
+  (get-started, operations, standards, release notes, the rendered ADR index)
+  and **assembles** the per-repo and cross-repo sections at build time from the
+  meta checkout at its pinned submodule SHAs.
+
+### Versioning is a meta-repo commit
+
+A docs build is the site built from a `carbide2` checkout at commit X with
+submodules at their pinned SHAs. Publish statically to the same tier the client
+builds already use: `/docs/<sha>/` with a `latest` pointer (plus tags when they
+exist). This mirrors the existing client publication model and introduces no new
+mechanism. Externally, a version's docs are just static files.
+
+### Seam contracts are versioned interfaces, not prose
+
+Each seam (worker↔client WS protocol, worker↔Rails shared schema, control↔server
+JWT claims) is documented as a **numbered contract with a compatibility floor**,
+and enforced in code where possible (the worker already does this with
+`PROTOCOL`/`MIN_CLIENT`). The contract lives in the meta repo because neither
+endpoint is authoritative for the other. "How did worker vX talk to client vY"
+is answered by reading the contract at the meta commit that pinned both.
+
+### Discussion lives on GitHub, not in the static site
+
+ADRs link to a GitHub Discussion/Issue on the owning repo (meta for cross-repo,
+component for single-repo). `carbide2-docs` stays publish-only; `carbide2-site`
+stays marketing/branding. This keeps a review surface that is not the Astro repo
+and not the deployed site.
+
+### ADR lifecycle hygiene
+
+- `decisions/` holds **accepted** decisions only; `proposals/` holds Proposed
+  documents with open questions.
+- Decisions are append-only: change a decision by writing a new ADR and flipping
+  the old one's status to "Superseded by ADR-00N". Do not rewrite bodies — git
+  history is the versioning. The status line is the only mutable field.
+- Write ADRs **at decision time** in the owning repo; avoid retro-documentation
+  (ADR-001 is the cautionary example).
+
+## Consequences
+
+**Positive**
+
+- Docs version with code; "docs for build X" is a static artifact, externally
+  accessible at `/docs/<sha>/`.
+- Seams get an authoritative, versioned, testable home.
+- The published site becomes a publisher, not a source of truth that silently
+  drifts.
+
+**Negative / to resolve**
+
+- Build-time assembly requires `carbide2-docs` to read the meta checkout (added
+  as a submodule or fetched at pinned SHAs). Until then the split is stated but
+  not mechanically enforced, and `carbide2-docs` remains a separate checkout.
+- Migration cost: existing `carbide2-docs` content must be triaged into "stays
+  here (global)" vs "moves to a component repo" vs "moves to the meta repo".
+- Serving inside the k3s cluster is explicitly **not** a goal: docs are
+  external-facing static artifacts. An in-cluster mirror is possible but not
+  authoritative and not required.
+
+## Alternatives considered
+
+- **Keep everything in `carbide2-docs` (status quo).** Simple, but docs drift
+  from code and there is no real per-version access.
+- **Delete `carbide2-docs`; put ADRs only in repos.** Loses the aggregated
+  public site and the global-content home, and makes non-repo readers hunt
+  across five checkouts.
+- **Make the in-cluster copy canonical.** Wrong axis: the cluster runs the
+  product; docs are a build artifact whose requirement is external, versioned
+  access.
+- **Merge docs into `carbide2-site` (the umbrella).** That site is marketing and
+  branding; mixing reference docs with marketing blurs ownership and review
+  surfaces. Keep them separate.
