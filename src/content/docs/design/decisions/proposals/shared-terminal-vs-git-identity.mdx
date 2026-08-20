@@ -1,0 +1,130 @@
+---
+title: "Shared Terminals vs. Git's Per-User Commit Identity"
+description: "A problem statement: in a shared, long-lived terminal there is no trustworthy answer to 'who is the author of this commit', and Git offers no per-user seam."
+sidebar:
+  order: 7
+status: Problem
+date: "2026-08-19"
+related:
+  - label: Per-User Shell Identity
+    href: /design/decisions/proposals/per-user-shell-identity/
+---
+
+import AdrHeader from '../../../../../components/AdrHeader.astro';
+
+<AdrHeader {...frontmatter} />
+
+# Shared terminals vs. Git's per-user commit identity
+
+## Thesis
+
+CARB/IDE2's product shape — many authenticated users sharing the same
+long-lived workspace and the same terminal sessions — is in direct opposition
+to how Git models authorship. Git attributes commits to a *machine-level*
+identity (`user.name` / `user.email`, one per home directory, plus one signing
+key per `GNUPGHOME`), not to the *person* who typed the commands. In a shared
+shell, those two notions diverge, and Git gives us no per-user seam to
+reconcile them.
+
+This is not a bug to patch around; it is a product/architecture decision we
+have not yet made explicit. This document is a **problem statement**: the
+architecture is not yet proposed, and the direction is deliberately open.
+
+## The product shape
+
+- One workspace = one filesystem, one PVC, shared by every member of the
+  project.
+- Terminals are **shared and long-lived**. The whole point is a big shared
+  terminal: multiple users watch and drive the same session, sometimes
+  simultaneously, sometimes in sequence.
+- Users authenticate to the workspace (JWT); the kernel/PTY does **not** know
+  which authenticated user is producing any given keystroke.
+
+## How Git actually works
+
+- Commit authorship is read from config at commit time: `user.name` and
+  `user.email`, resolved through system → global → local → worktree.
+- `~/.gitconfig` is per **home directory**, not per user or per session.
+- Commit signing resolves a signing key from `~/.gnupg` (or `GNUPGHOME`), also
+  per home directory.
+- The PTY running `git` is just an anonymous byte stream. Git has no notion of
+  "who is driving the terminal right now."
+
+## Where they collide
+
+1. **Shared global identity.** Every user who commits through the shared
+   workspace inherits the same `~/.gitconfig` identity. Whoever's name is in
+   there becomes the author of *everyone's* commits.
+2. **Shared signing key.** A GPG key placed in the shared `~/.gnupg` is readable
+   by every user of the shell pod. That is not a naming bug; it is a credential
+   leak across users.
+3. **No driver attribution.** Even if identity config is correct, a shared PTY
+   gives Git no way to tell whether the commit was made by Alice, Bob, or
+   "whoever typed last."
+4. **Long-lived sessions span many users.** Spawn-time-only identity ("the user
+   who opened the terminal") breaks the moment a different user drives that same
+   session later.
+5. **Product promise vs. Git's model.** We want *communal* terminals; Git wants
+   *a single accountable author per commit*. There is no built-in way to express
+   "this commit was made by the group, but driven by X."
+
+## The concrete failure we just hit
+
+During setup, an agent created a Git identity and a GPG key in the shared
+workspace home directory. Immediately this exposed:
+
+- `git config --global` edits write to the pod's shared `~/.gitconfig`, so they
+  apply to **all** users of that workspace.
+- The GPG secret key sits in the shared `~/.gnupg`, so it is shared by every
+  user who has a terminal in that pod.
+
+This is the same tension in miniature: a single home directory cannot represent
+multiple people, and Git has no other place to look.
+
+## Design tension to resolve
+
+We need to decide, explicitly, what a commit made from a shared CARB/IDE2
+terminal *means*:
+
+- **Owner model** — the terminal has one owner; whoever drives it is
+  authoring *as that owner*. Sharing = "drive under the owner's identity."
+- **Driver model** — identity follows the user currently typing (the one with
+  "the floor"). Sharing = each driver's commits are attributed to them.
+- **Session model** — the terminal/workspace is itself the author (a bot or
+  group identity), with the human driver recorded as a trailer/metadata rather
+  than the `Author` field.
+
+Each has very different implications for signing keys, provenance, and what
+"verified" even means on GitHub.
+
+## Possible directions (not yet decided)
+
+- **Spawn-time injection.** Set `GIT_AUTHOR_*` / `GIT_COMMITTER_*` (or a
+  per-user `GIT_CONFIG_GLOBAL`) when the terminal is created. Only satisfies the
+  owner model; does not survive a second user driving the same session.
+- **Git shim.** Wrap `git` to stamp author identity per invocation from
+  worker-tracked "who is driving now." Requires a driver-tracking signal (from
+  the client), because the PTY stream alone cannot tell us.
+- **Per-user `GNUPGHOME` / config.** Route signing and identity through
+  per-user directories the worker materializes, so credentials never live in
+  the shared home.
+- **Refuse to sign.** Treat shared terminals as unsigned-by-default, and require
+  an explicit per-user action to sign, rather than silently inheriting a shared
+  key.
+
+## Open questions
+
+- Is the terminal **owner-based** or **driver-based**, or do we need both?
+- Where does the "who is driving" signal come from, and can it be trusted enough
+  to stamp authorship/signatures?
+- Should shared-terminal commits be signed at all, or is the shared workspace
+  fundamentally a place where signatures are "best effort / group identity"?
+- How do we keep per-user GPG material out of the shared PVC without breaking
+  the long-lived-shell model?
+
+## Related
+
+- The operator already authenticates terminal creation via JWT; that is the
+  natural place to bind identity to a session.
+- Worker already manages per-project shell pods (`ProjectPod`); the same layer
+  would own any shim or per-user config materialization.

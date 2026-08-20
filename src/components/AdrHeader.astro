@@ -9,7 +9,7 @@ interface LinkRef {
 }
 
 interface Props {
-  status?: 'Proposed' | 'Accepted' | 'Superseded' | 'Deprecated' | 'Rejected';
+  status?: 'Problem' | 'Proposed' | 'Accepted' | 'Superseded' | 'Deprecated' | 'Rejected';
   date?: string;
   note?: string;
   extends?: LinkRef;
@@ -27,6 +27,7 @@ const {
 } = Astro.props;
 
 const statusVariant = {
+  Problem: 'note',
   Proposed: 'note',
   Accepted: 'success',
   Superseded: 'caution',
