@@ -1,0 +1,170 @@
+---
+title: "Agentic Interaction and User Decision Requests"
+description: How an agent pauses a turn to ask the people in a conversation a question — and what that implies for attribution, multiuser semantics, and turn budgeting.
+sidebar:
+  order: 5
+status: Proposed
+date: "2026-08-19"
+---
+
+import AdrHeader from '../../../../../components/AdrHeader.astro';
+
+<AdrHeader {...frontmatter} />
+
+## Context
+
+An agent turn today is a closed loop: the worker POSTs the conversation to the
+model, executes any tool calls, and repeats until the model returns a plain
+reply or hits `MAX_TURNS`. The model cannot stop and ask a human a question
+mid-turn. In a product whose whole premise is several people watching and
+driving one workspace together, that is a missing primitive: the agent can
+propose, but it cannot ask.
+
+This ADR records the settled shape of agentic interaction to date and proposes
+the one genuinely new surface: a tool that interrupts the turn and puts a
+decision to the people in the conversation.
+
+## What is already settled
+
+- **Streaming.** Replies arrive as `agent/stream` deltas; tool calls are
+  reassembled and executed server-side.
+- **Tool discovery.** The worker advertises its tool catalog over `agent/tools`
+  so the client never holds a hardcoded list.
+- **Steering and memory.** `/AGENTS.md` is injected as a system message each
+  turn; memory is a pull model over `/.carbide/memories/`.
+- **Identity is stored but not surfaced.** `agent_messages.user_id` records who
+  sent each message, but `to_history_entry` drops it — the model receives only
+  role and content. For single-user conversations that is harmless; for
+  multi-user decision requests it is not.
+
+## Decision
+
+### `ask_user` is a tool call, not a new protocol
+
+The model expresses "I need a human decision" exactly the way it expresses any
+other external need: by calling a tool. `ask_user` is that tool. The difference
+is not timing — every tool call has an indeterminate runtime (a `shell_exec` can
+wait on a terminal for as long as the agent asks it to), and the model is not
+sensitive to any of that. The difference is that the tool's *output is produced
+by a person*: the question must reach that person through the UI, and the
+returned value is a decision with an author rather than a computed result. A
+timeout therefore yields a synthetic "no user available" answer instead of an
+error.
+
+A question is a first-class, persisted thing: the worker writes it before
+broadcasting. Persistence is **durable history**, not resume support — the
+prompt, its choices, and each answer are kept as part of the conversation
+record so a refresh, a later reader, or an audit can see what was asked and who
+decided what. A worker restart cannot resume the in-flight model call; it only
+ever re-reads history.
+
+### Data shape
+
+`AgentConversation has_many AgentPromptQuestions`. A question carries its
+`choices` and the selected answer: a `selected_choice` index plus an always-
+available freeform `answer` field, and `answered_by_user_id` for attribution.
+Freeform is a real field, not a sentinel empty string at the end of the choices
+list. (The names are placeholders; the shape is the decision.)
+
+### The model knows who said what
+
+Surfacing authorship into the model's context is a settled requirement. The
+data already exists (`agent_messages.user_id`); the gap is only in
+`to_history_entry`, which must begin emitting the author so the model can
+distinguish "Frank says stop and discuss" from "a user says stop and discuss."
+The same author field applies to answers, so group-answer results are legible
+to the model.
+
+### Multiuser semantics
+
+Questions are broadcast to every client listening to the conversation. Answers
+are broadcast the same way, so a watcher sees a decision land in real time.
+
+- **First answer wins by default.** The first submission resolves the prompt;
+  it is no longer open, and later submissions are rejected.
+- **Group answer is configurable** per conversation. It never blocks on
+  absentees: the UI shows the timeout, a submit button, who has not submitted,
+  and a "complete without other users" control. Participants who did not answer
+  resolve to an explicit `not_answered` state rather than being omitted.
+- **Freeform is always allowed.** Every question has the choices the agent
+  proposes *and* an unconstrained text answer. The human cannot be gated by
+  what the model thought to offer — "stop and discuss" is a legitimate answer
+  the agent then reacts to.
+- **Attribution is recorded.** Each answer carries `answered_by_user_id`.
+
+### Batching
+
+One `ask_user` call may carry several questions. They are presented together
+with numbered navigation and a review step rather than popping up one at a
+time. This is faster for the human and cheaper for the agent, which is blocked
+waiting regardless.
+
+### Timeout
+
+The timeout is configuration, not something the model chooses. Interactive
+mode waits longer; auto mode waits briefly and then feeds the model an
+auto-response in the shape of "a user is not available — make good choices."
+The exact bounds are open (below).
+
+### Turn budgeting
+
+A question consumes a turn — it is a tool call, so it counts against the
+budget. `max_turns` becomes two-tiered: a very high hard ceiling (safety) and
+a soft limit that asks "continue?", where one yes from any listener in the
+conversation is sufficient to proceed.
+
+### A separate lookup primitive
+
+`ask_user` must not absorb read-only directory lookups. A distinct tool (name
+to be chosen; not `query_user`, which reads too close to `ask_user`) lets the
+agent ask "who has `priv_role_admin`" or "what is the policy for applying this
+change" synchronously, with no queue, no timeout, and no interruption. It is an
+ordinary tool call.
+
+## Consequences
+
+**Positive**
+
+- The agent gains a real decision channel, and decisions are durable and
+  re-renderable rather than a transient UI state.
+- Multiuser answers carry attribution, so the model can reason about who
+  decided what in a shared conversation.
+- Batching keeps a multi-question turn from degrading into prompt ping-pong.
+
+**Negative / to resolve**
+
+- A worker restart kills the in-flight model call — there is no mid-turn resume
+  with the current API. Recovery is either re-drive from persisted history (a
+  fresh completion that includes the recorded answers) or abort; which of
+  those, if either, is desirable is open.
+- The client surface is the bulk of the work: question cards, options,
+  freeform, countdown, per-user answer status, and the "complete without
+  others" control.
+- The lookup tool needs an explicit visibility boundary: roles and membership
+  are clearly fair game, but returning full roster identity may not be.
+
+## Open questions
+
+- **Timeout defaults:** the concrete auto-mode and interactive-mode bounds, and
+  the exact auto-response text.
+- **Restart recovery:** re-drive from history vs. abort for a turn that dies
+  with a worker (resume is not possible).
+- **Soft/hard turn limits:** the concrete numbers for the two tiers.
+- **Lookup visibility:** what the directory-lookup tool may return to the
+  model.
+- **Naming:** the lookup tool's name, given `ask_user` is taken and
+  `query_user` is too close.
+
+## Alternatives considered
+
+- **Ask questions one at a time.** Simpler protocol, but the human endures a
+  popup per question and the agent is blocked waiting each time. Batching wins
+  on both axes.
+- **No persistence — fire the question and forget.** A refresh or restart
+  would strand the model waiting on a question nobody can see. Persist-before-
+  broadcast is mandatory.
+- **Fold the directory lookup into `ask_user`.** Rejected: a synchronous
+  read-only lookup shares none of the queue/timeout/multiuser machinery and
+  should not inherit it.
+- **Let the model set its own timeout.** Rejected: the timeout is a product
+  policy, not a model preference, and belongs in agent configuration.

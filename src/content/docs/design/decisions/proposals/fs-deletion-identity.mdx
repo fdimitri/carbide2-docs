@@ -9,8 +9,6 @@ extends:
   label: ADR-001
   href: /design/decisions/adr-001-db-vfs/
 related:
-
-$0
   - label: ADR-003
     href: /design/decisions/adr-003-external-write-semantics/
   - label: carbide2#72
@@ -31,6 +29,12 @@ import AdrHeader from '../../../../../components/AdrHeader.astro';
 same path finds no entry and re-imports it as a *brand-new* `DirectoryEntry` with
 a single revision-0 `setContents`.
 
+That behavior was never the intent. Deletion was never meant to delete DBFS
+entries — the whole point of an append-only revision log is that nothing is
+erased from it — and the eager `destroy!` was an implementation choice picked up
+along the way, not a designed semantics. This ADR records the intended behavior
+and the `destroy!` path as the defect.
+
 This is not an edge case. It is the *normal* outcome of ordinary version-control
 use, because **git updates a tracked file by unlinking it and creating a new
 one**, not by rewriting in place. Verified on the pod:
@@ -47,7 +51,10 @@ rev-0). Atomic-save editors (`vim`, and any editor doing write-temp-then-rename)
 trip the same path. Note also that the **inode is unreliable as an identity
 signal** — in testing the kernel *recycled* the same inode number across the
 unlink/create, so identity cannot be keyed on inode; only the `DELETE→CREATE`
-event sequence on a stable `srcpath` is trustworthy.
+event sequence on a stable `srcpath` is trustworthy. An inode is at most a
+transient correlation hint, valid only while the underlying VFS/mount is
+unchanged — it does not survive a backend change, so it can never be durable
+identity.
 
 Renames have the same disease: `moved_from` + `moved_to` are handled as
 independent delete-then-create, so a shell `mv` also discards history and mints a
@@ -74,6 +81,54 @@ a filesystem event.**
 4. **Renames follow the cookie.** Pair `moved_from`/`moved_to` by inotify cookie
    and **update `srcpath` on the same entry** — identity and history intact.
 
+### Change vocabulary
+
+The log's edit operations today are line-oriented — `insertDataSingleLine`,
+`insertDataMultiLine`, `deleteDataSingleLine`, `deleteDataMultiLine` — plus the
+full-file `setContents` snapshot (ADR-003). Each `file_changes` row is a
+`change_type` plus a JSON `change_data` payload (roughly
+`insertDataSingleLine => { start_line, start_char, str }`; the live keys are
+camelCase and the text lives under `data`, with start/end line/char duplicated
+into the row's own columns).
+
+New instance-oriented operations are needed:
+
+- `replaceDataSingle` — replace the first instance of a match.
+- `replaceDataMulti` — replace every instance of a match.
+- `fileAttributeChange` — a metadata-only entry recording owner / POSIX
+  attributes (mode, owner, group); no content change.
+
+`replaceDataSingle`/`replaceDataMulti` are **instance-based, not line-based**:
+the match is a substring, the payload is the replacement. They serve two callers
+at once — agent edit semantics (find a string and replace it) and find-and-
+replace in files — while recording one replace op rather than a delete+insert,
+preserving the editor's intent and keeping one revision for one find-and-
+replace.
+
+### File lifecycle as log facts
+
+Existence is recorded as events in the log, never erased from it. These are new
+`change_type`s (each a JSON `change_data` payload — `method` lives inside that
+payload, not as a separate column):
+
+```ruby
+fileRemoved => { method: :vfs_inode, at: Time.now }   # watcher/inotify saw it go
+fileCreated => { method: :dbfs,     at: Time.now }    # created through a DBFS op
+```
+
+`method` records the event's origin: `:vfs_inode` for out-of-band filesystem
+events observed by the watcher, `:dbfs` for in-app operations. The current file
+view is the `DirectoryEntry`'s `file_changes` collection anchored at the
+**newest `fileCreated` entry** — that entry names the current incarnation. An
+earlier `fileCreated` is a prior incarnation of the same path, and a
+`fileRemoved` marks the end of the incarnation it follows, without deleting the
+log.
+
+`fileAttributeChange` slots into the same stream: a chmod/chown/utimes on disk
+raises inotify `IN_ATTRIB`; the watcher stats the file and appends a
+metadata-only entry carrying the new mode/owner/group, leaving content
+untouched.
+
 ## Consequences
 
 **Positive**
@@ -95,9 +150,32 @@ a filesystem event.**
 - **Pairing mechanism:** rely on the `rb-inotify` per-`process` batch (delete and
   create usually arrive together) or a short debounce timer? The batch is simpler
   but not guaranteed across a queue-overflow boundary.
-- **Same-path, different-file intent:** if a user `rm`s a file and later creates
-  an unrelated file at the same path, is that the same lineage or a new document?
-  Proposed default: same `srcpath` = same lineage; revisit if it surprises users.
+- **Same-path, different-file intent — and what identity is anchored to.**
+  Three behaviors, laid out side by side:
+
+  - **Current:** unlink → `destroy!` → the FileChange collection is cascade-
+    deleted. History is *completely lost*.
+  - **Single unique `srcpath`, tombstoned `DirectoryEntry`:** the path owns one
+    row; `fileRemoved`/`fileCreated` events mark incarnations in that row's
+    log. History is *always retained at that path*.
+  - **Multiple `DirectoryEntry`s for one `srcpath`:** history is retained but
+    *per row*; each row is effectively a different document, and we must then
+    decide whether to merge them. If we do not, all changes live attached to
+    what are essentially separate documents — they could be recombined higher
+    up, but to what purpose?
+
+  **Resolution: the multiple-row model buys nothing.** The question it is
+  trying to answer — "was this a deliberate delete or a transient git/vim
+  recreate?" — does not have to be decided at unlink/create time by physical
+  layout. It can be answered heuristically *at any later time* from the
+  lifecycle events (`fileRemoved`/`fileCreated` with their `method`) already in
+  the log: a long dead gap, or an explicit in-app delete, marks a boundary;
+  an immediate recreate does not. Just as many rows could be merged later, the
+  changes in a single row can equally be sorted into per-file-life buckets
+  later. Splitting or merging is a *view* over the log, not a property the
+  schema has to commit to at the moment of unlink. So the physical model stays
+  one `DirectoryEntry` per `srcpath` (unique), tombstoned; the
+  deliberate-vs-transient distinction is derived, not stored.
 - **External vs in-app deletes:** a delete issued through the app's own op
   protocol may warrant different treatment (explicit intent) than an inotify
   delete (possibly transient). Unify or distinguish?
@@ -107,7 +185,18 @@ a filesystem event.**
 - **Status quo — eager `destroy!` on any delete.** Simple, and wrong: silent
   history loss on every `git pull` and every `vim` save.
 - **Inode-based identity.** Rejected — inode numbers are recycled across
-  unlink/create (observed), so inode is not a stable identity.
+  unlink/create (observed), and an inode is only meaningful while the underlying
+  VFS is unchanged. Useful as a transient hint, never as durable identity.
+- **Deciding merge-vs-split at unlink/create time via heuristics and a
+  pairing window.** Rejected. Inferred intent cannot be correct 100% of the
+  time — any window length or heuristic is a criterion, and criteria mis-fire
+  in practice (a fast `rm`-then-`create` of two unrelated files falsely merges;
+  a git unlink→create that straddles a queue-overflow boundary falsely splits).
+  More importantly, it is **moot**: the deliberate-vs-transient distinction
+  does not have to be committed at the moment of unlink, and the decision is
+  re-derivable from the lifecycle events already in the log. We can just figure
+  it out later, with better and better signals, rather than bind the schema to a
+  prediction made at the moment of maximum uncertainty.
 - **Reconcile-authoritative full diff** (handlers only mark dirty; a bidirectional
   sweep is the source of truth). Cleaner long-term, but a larger rewrite and it
   *still* depends on this "never delete, rebind by srcpath" decision to avoid the

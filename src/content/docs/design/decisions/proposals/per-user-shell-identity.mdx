@@ -1,0 +1,115 @@
+---
+title: "Per-User Shell Identity"
+description: Real OS identities for project members inside the workspace shell, backed by CarbIDE membership instead of one shared carbide user.
+sidebar:
+  order: 6
+status: Proposed
+date: "2026-08-19"
+---
+
+import AdrHeader from '../../../../../components/AdrHeader.astro';
+
+<AdrHeader {...frontmatter} />
+
+## Context
+
+The workspace shell pod runs as a single baked-in `carbide` user (uid 1000)
+with a shared home directory. There is no connection between a project
+membership in CarbIDE and an actual operating-system account inside the shell:
+everyone who gets a terminal is the same uid, writes into the same `$HOME`,
+and inherits the same `~/.gitconfig` and `~/.gnupg`.
+
+That model already caused a real credential loss: a GPG signing key created in
+the shared home vanished when the shell pod was recreated, because the home is
+an ephemeral container layer. It also makes attribution meaningless at the OS
+level — there is no "who am I" answer beyond the shared `carbide` uid, and any
+per-user git identity or signing material is a leak across users.
+
+The fix is not more dotfiles on the shared home. It is to give each project
+member a real, durable OS identity inside the workspace.
+
+## Decision
+
+### Keep `carbide` as the default, then add real users
+
+The existing `carbide` user remains the **default shell identity** — the one a
+terminal gets when it is opened without a specific user, preserving the
+"big shared terminal" behavior that already exists. On top of it, CarbIDE
+materializes **one OS account per project member**.
+
+A member can launch a shell **as themselves**, and that shell runs under their
+own uid/gid and their own home, not the shared `carbide` account.
+
+### Identity comes from CarbIDE membership, not the image
+
+The source of truth for accounts is the project's membership, held by the
+control plane (and mirrored into the workspace). The shell pod image does not
+bake users in. Instead, project members are exposed to the pod's name
+services through an NSS/PAM shim: `getpwnam`/`getpwent` answer from CarbIDE's
+user model, so a real login can resolve the member to a uid, gid, home, and
+shell without a static `/etc/passwd` entry.
+
+### Homes are per user and durable
+
+Each member gets a per-user home on persistent storage, not the container's
+writable layer. That home survives pod churn, so `~/.gitconfig`, `~/.gnupg`,
+shell history, and SSH material follow the user rather than dying with the pod.
+The shared `carbide` home stays separate and, by default, carries no per-user
+identity material.
+
+### Secrets are injected at session start, not stored in the home
+
+A durable home is necessary but not sufficient: a signing key resting in a
+home directory is still a file that can be copied. Identity and signing
+material are pulled from a secret store and injected when the user's session
+starts (or on first use), so the durable home holds configuration, while
+credentials stay out of the writable filesystem and are tied to the
+authenticated session.
+
+## Consequences
+
+**Positive**
+
+- File ownership, audit records, and shell history finally mean something: a
+  change is attributable to a real OS principal, not a shared uid.
+- Per-user git identity and signing keys stop leaking across members, and they
+  survive pod churn.
+- The same principal feeds agent attribution (see the agentic-interaction
+  proposal) — "who said what" becomes an OS-level fact, not a string on a
+  message.
+
+**Negative / to resolve**
+
+- NSS/PAM against a per-project membership is new plumbing, and the shell pod's
+  current `runAsUser: 1000` / root-initContainer ownership model changes.
+- Uid/gid allocation must be stable across pod restarts and across members.
+- "Workspace-local account" vs "cluster-wide account" is a scoping decision
+  NSS does not make for us.
+- More persistent state means a retention/cleanup story for homes when a member
+  leaves the project.
+
+## Open questions
+
+- **Account scope:** is a member's account meaningful per-workspace (one uid
+  per project membership) or cluster-wide (one uid per person across all
+  workspaces)?
+- **NSS/PAM backend:** a custom module answering from the workspace DB, an
+  SSSD/LDAP bridge, or something lighter?
+- **Secret lifecycle:** where do per-user GPG/SSH keys live, and what injects
+  them at session start — and does that survive the pod, the user, or both?
+- **Agent and sharing policy:** when a member launches a shell as themselves,
+  is it available to agents, and can other members share it (the same
+  watch/drive model as the shared terminal)?
+- **Home storage:** per-user subPath on the project PVC, or a separate
+  user-state volume?
+
+## Alternatives considered
+
+- **One shared `carbide` home, but persistent.** Fixes the churn but not the
+  leak: identity and signing material still mix across users, and ownership
+  still collapses to one uid.
+- **Ephemeral homes rebuilt from a seed at pod start.** Immutable and clean,
+  but anything not in the seed is lost, and it does not give a real per-user
+  OS principal.
+- **Bake users into the image.** Works only if membership is static at image
+  build time — it is not — and re-bakes on every membership change.

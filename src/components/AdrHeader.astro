@@ -38,7 +38,7 @@ const statusVariant = {
 {
   (status || date || note || extendsFrom || supersedes.length > 0 || related.length > 0) && (
     <div class="adr-meta">
-      {status && <Badge variant={statusVariant[status] ?? 'default'}>{status}</Badge>}
+      {status && <Badge text={status} variant={statusVariant[status] ?? 'default'} />}
       {date && <span class="adr-date">{date}</span>}
       {note && <span class="adr-note">{note}</span>}
       {extendsFrom && (
