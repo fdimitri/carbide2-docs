@@ -64,6 +64,11 @@ agent:                            // a fresh "new conversation", no UUID yet
 This makes multiple agent panes independent: changing the dropdown in one pane mutates
 that pane's tab key, not a shared ref.
 
+A fresh `agent:` tab becomes `agent:<uuid>` on the first successful `agent/started`
+(worker-assigned UUID), rewriting its tab key without duplicating the transcript or losing
+per-pane composer state. Closing the last pane that references a no-UUID `agent:` tab discards
+its transient state; no map entry remains.
+
 ### 3. Subscribe/unsubscribe membership, mirroring chat and files
 
 Agent conversations adopt the same explicit subscriber model the rest of the live surface
@@ -93,6 +98,16 @@ Buffering is therefore **subscription-scoped**: only subscribed conversations ac
 memory, and only for as long as a subscription exists. This is a correctness/backpressure
 property, not a scale optimization — conversations can be many megabytes each, and an
 unbounded "everything broadcast to everyone, buffered forever" model does not converge.
+
+### Canonical transcript + ref-counted lifecycle
+
+The client holds **one** transcript per `conversation_id`, shared by every pane/tab subscribed
+to that conversation. Pane tab keys reference the same canonical map entry rather than each
+pane keeping a private copy. Subscription is **reference-counted at the client** (pane tabs +
+socket interests): a conversation is unsubscribed only when the last reference goes away, so
+closing one pane never drops the buffer while another pane still shows the conversation. The
+server-side subscriber set is the authority for delivery; the client ref-count only decides
+when to send `unsubscribe` and when it is safe to release the buffered transcript.
 
 ### Delivery model (current)
 
@@ -172,8 +187,9 @@ non-active joined conversation still records the question.
 The agent tab key changes from `agent:0` to `agent:<uuid>`, which is a breaking change to the
 opaque session document. Bump `SESSION_DOC_VERSION` (ADR-002's mechanism). The new parser
 **discards** stale `agent:0` / `agent:<integer>` tabs (treats them as "no agent tab" or a
-fresh conversation) — no migration, no graceful upgrade path. The opaque doc can be overwritten;
-this is acceptable while the user base is tiny.
+fresh conversation) — no migration, no graceful upgrade path. This is intentionally
+**out of scope**: session versions exist so compatibility can break; the opaque doc can be
+overwritten; and there is no user base to protect.
 
 ## Consequences
 
@@ -183,6 +199,8 @@ this is acceptable while the user base is tiny.
 - A conversation thinking in pane 1 no longer blocks Send in pane 2.
 - Multiple agent panes are independent and each resumes its own conversation.
 - Streaming into a non-active joined conversation no longer forces a re-render on switch.
+- One canonical transcript per conversation, shared across panes, with a client-side
+  ref-count that unsubscribes only at zero references.
 
 **Negative / to resolve**
 
