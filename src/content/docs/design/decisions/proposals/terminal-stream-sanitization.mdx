@@ -3,11 +3,14 @@ title: "Terminal Stream Sanitization"
 description: Where the system owns terminal semantics for sanitizing PTY output, and who is responsible for preventing terminal-query re-triggering.
 sidebar:
   order: 10
-status: Proposed
+status: Rejected
 date: "2026-08-21"
+note: "Rejected: superseded by #89 (per-terminal-tab renderer model). See the Rejected section for justification."
 related:
   - label: carbide2#87 (terminal query responses leak into shell input)
     href: https://github.com/fdimitri/carbide2/issues/87
+  - label: carbide2#89 (per-terminal-tab TerminalPane renderer model)
+    href: https://github.com/fdimitri/carbide2/issues/89
   - label: carbide2#88 (terminal winsize shared fit)
     href: https://github.com/fdimitri/carbide2/issues/88
 ---
@@ -95,6 +98,20 @@ structural rather than patched at replay.
 - The query-stripping regex must be kept complete as terminal protocols evolve (a future `OSC 10;?` or
   other query form needs to be added).
 - The chosen option does not address the adjacent #88 winsize shared-fit problem, only the query loop.
+
+## Rejected
+
+This proposal is **Rejected**.
+
+**Justification**: the framing was wrong. It treated the terminal-stream boundary as the design problem
+when the actual problem was the client's terminal component model. #89 (one `TerminalPane` per open
+terminal tab, keyed by stable `terminal:<uuid>`, kept mounted and hidden with `v-show`) removes the
+replay-on-tab-switch amplification that produced the query/response loop in #87.
+
+What remains is a one-time replay on a **genuine first join** (page load, WS reconnect, or opening a
+fresh terminal tab). That is a small follow-up, not an architecture decision. If it is ever worth
+addressing, the worker-side replay strip (Option A here) is the likely minimal fix — but it can be made
+without an ADR.
 
 ## Alternatives considered
 
