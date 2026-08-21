@@ -1,0 +1,100 @@
+---
+title: "Terminal Renderer Model"
+description: How terminal tabs map to xterm renderers in the client, and why a terminal is limited to one tab per client for now.
+sidebar:
+  order: 11
+status: Proposed
+date: "2026-08-21"
+related:
+  - label: carbide2#87 (terminal query responses leak into shell input)
+    href: https://github.com/fdimitri/carbide2/issues/87
+  - label: carbide2#89 (per-terminal-tab TerminalPane renderer model)
+    href: https://github.com/fdimitri/carbide2/issues/89
+  - label: carbide2#88 (terminal winsize shared fit)
+    href: https://github.com/fdimitri/carbide2/issues/88
+---
+
+import AdrHeader from '../../../../../components/AdrHeader.astro';
+
+<AdrHeader {...frontmatter} />
+
+## Context
+
+The client renders terminal sessions inside panes via a `TerminalPane` component wrapping an xterm.js
+instance. Historically the mapping was implicit and collapsed: one `TerminalPane` per PANE, bound to
+whatever terminal happened to be that pane's active tab.
+
+This old pattern had several consequences:
+
+- A hidden terminal tab had no mounted renderer — it was just a data entry in `pane.tabs`.
+- Switching tabs destroyed and recreated the `TerminalPane` (via a changing `:key` derived from the
+  active tab), re-running `bindTerminal` → `term/join` → full scrollback replay every switch.
+- Replaying the scrollback re-fed terminal query sequences (`CSI 6n`, `OSC 11;?`) into xterm.js, which
+  answered them again; the answers leaked into the shell as input (#87).
+- Switching between two terminals in one pane called `xterm.reset()`, losing the in-memory buffer.
+
+The old pattern was an idiotic hack that barely saved any code time and produced exactly the
+cross-contamination and scrollback loss one would expect.
+
+## Decision
+
+### One renderer per open terminal tab
+
+Each open terminal tab owns a `TerminalPane`, keyed by the stable terminal uuid, mounted for the tab's
+lifetime and hidden with `v-show` when it is not the pane's active tab.
+
+Consequences:
+
+- Switching tabs only toggles visibility; there is no remount, rejoin, or replay.
+- Each renderer joins its terminal exactly once (idempotent join).
+- Each renderer keeps its own scrollback across tab switches.
+- Hidden renderers receive live output (they remain subscribed), so switching back is instant rather
+  than a replay.
+
+### One terminal per tab per client (for now)
+
+A terminal is limited to a single tab within a client for now. The same terminal is NOT rendered in two
+panes simultaneously.
+
+Rationale:
+
+- The client has ONE WebSocket per project, and the worker keys terminal subscribers by `ws.object_id`,
+  so two panes viewing the same terminal would collapse to one subscriber entry while still joining
+  twice, producing duplicate replays and ambiguous resize/input ownership.
+- A single-client-consumer-with-fan-out (one listener fanning to N renderers) is the correct shape for
+  multi-view but is more plumbing than is needed right now.
+
+This limitation may be revisited if true multi-view becomes a requirement.
+
+### Fit is 0×0-guarded
+
+`fit()` is never run against a hidden (0×0) container. It is guarded by `clientWidth/clientHeight` and
+re-runs via a `ResizeObserver` plus a guarded fit on activation, so a terminal mounted hidden still
+fits once it becomes visible without ever pushing a bogus zero-size resize to the worker.
+
+## Consequences
+
+**Positive**
+
+- Eliminates the query-response loop (#87) at the source.
+- Preserves scrollback across tab switches.
+- Removes duplicate `term/join` and duplicate scrollback replays.
+- Bounds terminal renderer lifecycle to the terminal tab, not the pane's transient active state.
+
+**Negative / to resolve**
+
+- Memory grows with the number of open terminal tabs (one xterm + buffer each); acceptable at this
+  scale but worth remembering.
+- Multi-view of one terminal is not supported for now (see "one terminal per tab per client").
+- #88 (winsize shared-fit) is still open: with multiple panes each having their own terminal, each
+  renderer sends its own resize, and the shared-fit policy is a separate decision.
+
+## Alternatives considered
+
+- **Single client consumer + fan-out to N renderers.** Correct for multi-view but more plumbing (a
+  shared per-terminal listener that dispatches to every pane rendering it). Revisit if multi-view is
+  required.
+- **Keep the old one-renderer-per-pane model.** Rejected: it caused #87 and lost scrollback on every
+  switch.
+- **Replay-side sanitization only.** Rejected as the primary fix: it addresses the symptom (query
+  re-triggering) without fixing the renderer lifecycle that causes the replay in the first place.
