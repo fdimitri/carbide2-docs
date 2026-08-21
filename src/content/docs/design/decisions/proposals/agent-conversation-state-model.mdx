@@ -79,7 +79,8 @@ membership-scoped instead:
   `tool_call` / `tool_result` / `done` / `user_turn` / `stopped` frames for that conversation
   are delivered to it.
 - `agent/unsubscribe { conversation_id }` → stop delivery; the conversation's buffered state
-  is eligible to be dropped once no pane (and no socket) still references it.
+  **must** be dropped once no pane (and no socket) still references it — not retained "just in
+  case" a pane reopens.
 
 Authorization lives at **subscribe time**, not emit time: `agent/subscribe` checks
 `convo.visible_to?(session.user_id)` and rejects unauthorized subscribers. `emit` becomes a
@@ -95,9 +96,11 @@ reconnect re-subscribes cleanly (see the existing replay-on-`system/connected` p
 `useChat`).
 
 Buffering is therefore **subscription-scoped**: only subscribed conversations accumulate in
-memory, and only for as long as a subscription exists. This is a correctness/backpressure
-property, not a scale optimization — conversations can be many megabytes each, and an
-unbounded "everything broadcast to everyone, buffered forever" model does not converge.
+memory, and only for as long as a subscription exists. An unsubscribed conversation's
+buffered transcript **must actually be dropped**, not merely stop growing. This is a
+correctness/backpressure property, not a scale optimization — conversations can be many
+megabytes each, and an unbounded "everything broadcast to everyone, buffered forever" model
+does not converge.
 
 ### Canonical transcript + ref-counted lifecycle
 
@@ -173,6 +176,10 @@ non-active joined conversation still records the question.
 - **Open a conversation** is `load` (replay persisted history) **plus** `subscribe` (live
   events), as one logical action. The per-conversation map owns the in-flight streaming buffer
   and the `liveStreamMsg()` logic moves out of the singleton and is keyed by `conversation_id`.
+- **Switching back to an already-buffered conversation is a hard requirement:** the pane must
+  render the accumulated transcript directly and must **not** tear down + re-fetch/re-render on
+  pane switch. Background buffering exists so this property holds; an implementation that
+  re-fetches on every switch does not satisfy the design.
 - **Late join / mid-turn subscribe** returns a lightweight **in-flight snapshot**: the
   conversation's current status (`idle`/`thinking`) plus the partial assistant text/reasoning
   and any open tool calls. This seeds a late subscriber's status and avoids a frozen pane
@@ -198,7 +205,9 @@ overwritten; and there is no user base to protect.
 - Conversation B can no longer leak streams/tool calls into conversation A.
 - A conversation thinking in pane 1 no longer blocks Send in pane 2.
 - Multiple agent panes are independent and each resumes its own conversation.
-- Streaming into a non-active joined conversation no longer forces a re-render on switch.
+- Streaming into a non-active joined conversation accumulates in place; reactivating its pane
+  renders the buffered transcript without a re-fetch/re-render (hard requirement — see
+  Decision 6).
 - One canonical transcript per conversation, shared across panes, with a client-side
   ref-count that unsubscribes only at zero references.
 
