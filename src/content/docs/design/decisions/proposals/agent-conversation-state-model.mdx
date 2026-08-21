@@ -153,6 +153,28 @@ the worker — these are new leaf fields, not new path-navigation semantics.
 Under this model it routes into the per-conversation map like every other event, so a
 non-active joined conversation still records the question.
 
+### 6. Lifecycle: subscribe, load, late-join, and visibility flips
+
+- **Open a conversation** is `load` (replay persisted history) **plus** `subscribe` (live
+  events), as one logical action. The per-conversation map owns the in-flight streaming buffer
+  and the `liveStreamMsg()` logic moves out of the singleton and is keyed by `conversation_id`.
+- **Late join / mid-turn subscribe** returns a lightweight **in-flight snapshot**: the
+  conversation's current status (`idle`/`thinking`) plus the partial assistant text/reasoning
+  and any open tool calls. This seeds a late subscriber's status and avoids a frozen pane
+  until the next `done`. (No full-history replay here — history comes from `load`.)
+- **`private → project` flip** is manual discovery: newly-authorized clients see the
+  conversation in `recent` and open it themselves; the worker does not push an invitation.
+- **`project → private` flip** prunes unauthorized subscribers immediately (and the client
+  drops its buffered transcript for that conversation).
+
+### 7. Session compatibility: break, don't migrate
+
+The agent tab key changes from `agent:0` to `agent:<uuid>`, which is a breaking change to the
+opaque session document. Bump `SESSION_DOC_VERSION` (ADR-002's mechanism). The new parser
+**discards** stale `agent:0` / `agent:<integer>` tabs (treats them as "no agent tab" or a
+fresh conversation) — no migration, no graceful upgrade path. The opaque doc can be overwritten;
+this is acceptable while the user base is tiny.
+
 ## Consequences
 
 **Positive**
@@ -170,6 +192,13 @@ non-active joined conversation still records the question.
 - Subscription lifecycle must be reconciled with reconnect and with panes being closed or
   hidden: a conversation is unsubscribed only when no socket and no pane references it, and a
   reconnect must re-subscribe (mirroring chat's rejoin-on-`system/connected`).
+- `agent/subscribe` returns an in-flight snapshot (status + partial text + open tool calls) for
+  mid-turn joins; `load` remains the full-history path. The two must be composed without
+  double-appending (`done` finalizing a streamed message must not duplicate a replayed row).
+- `parseTabKey` needs an explicit `agent` branch: the id is a UUID string, not the numeric id
+  the current `Number(rawId)` fallback would produce.
+- Typed/prepended UUIDs are shelved: the wire/DB keep bare UUIDs for now; revisit later if
+  cross-table forensics from bare tokens becomes worth the schema/wire churn.
 - Memory is bounded by *subscriptions*, not by "everything ever broadcast": conversations can
   be many megabytes and numerous, so an unsubscribed conversation's buffered transcript must
   actually be dropped, not merely stop growing.
