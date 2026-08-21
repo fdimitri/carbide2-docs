@@ -1,0 +1,102 @@
+---
+title: "Terminal Stream Sanitization"
+description: Where the system owns terminal semantics for sanitizing PTY output, and who is responsible for preventing terminal-query re-triggering.
+sidebar:
+  order: 10
+status: Proposed
+date: "2026-08-21"
+related:
+  - label: carbide2#87 (terminal query responses leak into shell input)
+    href: https://github.com/fdimitri/carbide2/issues/87
+  - label: carbide2#88 (terminal winsize shared fit)
+    href: https://github.com/fdimitri/carbide2/issues/88
+---
+
+import AdrHeader from '../../../../../components/AdrHeader.astro';
+
+<AdrHeader {...frontmatter} />
+
+## Context
+
+Terminal output flows from the PTY through the worker to the client's xterm.js, and user input flows
+back through the worker to the PTY. For most of its life the worker has treated PTY bytes as opaque:
+it scrubs invalid UTF-8 (a serialization requirement) and otherwise tees output to clients and input to
+the slave.
+
+Carbide2#87 exposed a case where that opacity is the problem. Terminal *queries* — `CSI 6n` (cursor
+position request), `OSC 11;?` (background color probe), device-attribute requests, and similar — are
+legitimate shell→terminal output. xterm.js answers them, and the answer goes back as input. That is
+correct when it happens **once, live**.
+
+The failure mode:
+
+1. The query is echoed by the PTY and stored in the worker's scrollback.
+2. On client rejoin, the worker replays the entire scrollback.
+3. xterm.js interprets the embedded query and answers it again.
+4. The answer is forwarded as input and reaches bash outside of a read (idle prompt or heredoc).
+5. Bash echoes + attempts to execute it (`command not found`), and the noise lands back in scrollback.
+6. The next rejoin replays the polluted scrollback, growing the loop.
+
+The decision is not just "strip the sequences" — it is **where the system is allowed to know about
+terminal semantics** to do that stripping.
+
+## Decision (open)
+
+The boundary of terminal-stream sanitization is not yet decided. This proposal records the options.
+
+### Option A — strip at scrollback replay (worker, `replay_to_client`)
+
+Filter the complete scrollback through a query-stripping regex when a client joins.
+
+- **Pros**: single place; operates on the whole buffer (no chunk-boundary ambiguity); no wire change;
+  no client rebuild.
+- **Cons**: worker becomes terminal-schema-aware (though it already knows `OSC 633;D` for agent
+  shell_exec, so this is an extension of existing awareness, not a first breach). Only protects replay,
+  which is the correct boundary because live is the legitimate handshake.
+
+### Option B — strip in the client `term/output` handler
+
+- **Pros**: keeps the worker dumb.
+- **Cons**: the client cannot distinguish replay from live (both are `term/output`), so it would also
+  strip legitimate live readline queries. Requires a new `term/replay` command or a flag — a wire
+  change and client rebuild.
+
+### Option C — never store query sequences in scrollback (worker, at append time)
+
+Strip queries when appending to `@scrollback`, but still broadcast them live.
+
+- **Pros**: structural invariant — scrollback never contains queries, so replay cannot re-trigger them.
+  Cleaner seam than patching at replay.
+- **Cons**: `append_scrollback` and the live broadcast diverge; slightly more code; still terminal-aware.
+
+### Option D — prevent the emulator from answering on replay (client)
+
+- **Pros**: client-side, no worker change.
+- **Cons**: xterm.js has no "write but don't answer queries" mode; requires a new replay command to
+  distinguish replay from live — same wire-change cost as B.
+
+## Tentative lean
+
+**A now** — minimal, breaks the loop, no wire change/rebuild, and the worker's opacity is already
+qualified by `OSC 633;D`. **C** is the cleaner invariant if "scrollback never contains queries" should be
+structural rather than patched at replay.
+
+## Consequences
+
+**Positive**
+
+- Stops the self-growing query/response loop.
+- Preserves the live readline handshake (queries still answered once, live).
+- No wire-protocol bump for Option A.
+
+**Negative / to resolve**
+
+- The worker gains responsibility for a small slice of terminal semantics.
+- The query-stripping regex must be kept complete as terminal protocols evolve (a future `OSC 10;?` or
+  other query form needs to be added).
+- The chosen option does not address the adjacent #88 winsize shared-fit problem, only the query loop.
+
+## Alternatives considered
+
+See Options A–D above. The rejected-until-wire-change variants (B, D) share the same root cause: the
+client currently has no way to distinguish replayed scrollback from live output.
