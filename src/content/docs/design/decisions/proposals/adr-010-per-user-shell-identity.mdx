@@ -1,13 +1,13 @@
 ---
 title: "Per-User Shell Identity"
-description: Real OS identities for project members inside the workspace shell, backed by CarbIDE membership instead of one shared carbide user.
+description: Real OS identities for project members inside the workspace shell, backed by CARBIDE membership instead of one shared carbide user.
 sidebar:
   order: 6
 status: Proposed
 date: "2026-08-19"
 related:
   - label: Shared Terminals vs. Git's Per-User Commit Identity
-    href: /design/decisions/proposals/shared-terminal-vs-git-identity/
+    href: /design/decisions/proposals/adr-008-shared-terminal-vs-git-identity/
 ---
 
 import AdrHeader from '../../../../../components/AdrHeader.astro';
@@ -18,7 +18,7 @@ import AdrHeader from '../../../../../components/AdrHeader.astro';
 
 The workspace shell pod runs as a single baked-in `carbide` user (uid 1000)
 with a shared home directory. There is no connection between a project
-membership in CarbIDE and an actual operating-system account inside the shell:
+membership in CARBIDE and an actual operating-system account inside the shell:
 everyone who gets a terminal is the same uid, writes into the same `$HOME`,
 and inherits the same `~/.gitconfig` and `~/.gnupg`.
 
@@ -37,18 +37,18 @@ member a real, durable OS identity inside the workspace.
 
 The existing `carbide` user remains the **default shell identity** — the one a
 terminal gets when it is opened without a specific user, preserving the
-"big shared terminal" behavior that already exists. On top of it, CarbIDE
+"big shared terminal" behavior that already exists. On top of it, CARBIDE
 materializes **one OS account per project member**.
 
 A member can launch a shell **as themselves**, and that shell runs under their
 own uid/gid and their own home, not the shared `carbide` account.
 
-### Identity comes from CarbIDE membership, not the image
+### Identity comes from CARBIDE membership, not the image
 
 The source of truth for accounts is the project's membership, held by the
 control plane (and mirrored into the workspace). The shell pod image does not
 bake users in. Instead, project members are exposed to the pod's name
-services through an NSS/PAM shim: `getpwnam`/`getpwent` answer from CarbIDE's
+services through an NSS/PAM shim: `getpwnam`/`getpwent` answer from CARBIDE's
 user model, so a real login can resolve the member to a uid, gid, home, and
 shell without a static `/etc/passwd` entry.
 
