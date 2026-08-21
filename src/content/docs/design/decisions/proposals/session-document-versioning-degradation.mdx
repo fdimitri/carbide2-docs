@@ -1,0 +1,99 @@
+---
+title: "Session Document Versioning & Degradation"
+description: What a client at one session-document version must do with older and newer documents, and how a version bump degrades without nuking the whole session.
+sidebar:
+  order: 9
+status: Proposed
+date: "2026-08-21"
+related:
+  - label: ADR-002 (Browser Session Tracking)
+    href: /design/decisions/adr-002-browser-session-tracking/
+  - label: carbide2#85 (agent conversations are a global singleton)
+    href: https://github.com/fdimitri/carbide2/issues/85
+---
+
+import AdrHeader from '../../../../../components/AdrHeader.astro';
+
+<AdrHeader {...frontmatter} />
+
+## Context
+
+ADR-002 introduced `SESSION_DOC_VERSION` and the rule "bump on a breaking doc-shape
+change," but it does not say what a client at version **N** must do with a document at
+**N−1**, **N−2**, **N+1**, or **N+2**. The only visible behavior is the session picker's
+`docIncompatible` warning, which still attempts to resume. That silence leaves every
+doc-shape change to re-decide compatibility ad hoc.
+
+The de facto posture has become: *completely breaking is allowed, but we should endeavor
+not to.* This proposal makes that explicit and, more importantly, adds the missing
+granularity rule: **one version bump must not invalidate the whole session document.**
+
+## Decision
+
+### 1. Compatibility is directional and bounded
+
+The client tolerates **older** documents by loading them and dropping/normalizing unknown
+or legacy fields. It does not attempt to preserve fields it no longer understands.
+
+A client does **not** promise forward compatibility: a document from a **newer** version may
+be resynced (overwritten with the current build's normalized shape via `session/resync`) or
+refused — never half-applied into a broken UI.
+
+Concretely:
+
+| Doc version | Behavior |
+| --- | --- |
+| N (current) | load as-is |
+| N−1 | load; normalize legacy fields in place |
+| N−2 and older | best-effort load; unknown fields dropped |
+| N+1, N+2 | refuse or resync to current; never render a foreign shape blindly |
+
+The exact N−1/N−2 boundaries are implementation tolerance, not a hard compatibility
+contract — the contract is only that older is best-effort and newer is refused/resynced.
+
+### 2. Degradation is field-level, not document-level
+
+A version bump does not mean "the whole document is unusable." The parser treats each pane
+tab and each leaf field independently:
+
+- A field it understands is loaded.
+- A field it does not understand (or whose *kind* it no longer supports) is dropped.
+- A tab whose identity format is stale — e.g. `agent:0` after the move to `agent:<uuid>` — is
+  discarded **as a tab**, while the rest of the pane/document survives.
+
+The outcome for #85: missing agent tabs is acceptable; a broken or blank workspace is not.
+There is no migration path for stale fields — they are simply ignored. The opaque document
+can be overwritten (`session/resync`), so compatibility is not a durability requirement.
+
+### 3. Resync only happens from a loaded document
+
+`session/resync` is a **rewrite of a document the client already loaded** (normalized
+`loadDoc` → `toDoc`), not a standalone "fix the version" operation. There is no resync
+without load, so a version mismatch must first load as well as it can and then resync
+rather than erroring into a blank state.
+
+## Consequences
+
+**Positive**
+
+- Doc-shape changes no longer force an all-or-nothing compatibility decision.
+- A single version bump (e.g. `agent:0` → `agent:<uuid>`) drops only the affected tabs,
+  not the pane layout, other tabs, or the whole session.
+- The versioning contract is explicit: older is best-effort, newer is refused/resynced.
+
+**Negative / to resolve**
+
+- "Best-effort" for older documents is deliberately loose; if exact normalization rules are
+  ever required, they belong in a field-by-field migration table rather than here.
+- Forward mismatch currently surfaces only as a warning in the session picker; the actual
+  refuse/resync behavior on N+1 is not yet implemented and should be made explicit there.
+
+## Alternatives considered
+
+- **Hard version gate (refuse any non-N document).** Simplest, but makes a single field
+  rename destroy every session document — far more destructive than the degradation the
+  system needs.
+- **Full migration for every version bump.** Requires preserving every old shape forever;
+  not worth it for a pre-alpha product and an opaque, overwritable document.
+- **Leave it implicit (current state).** Every doc change re-decides compatibility ad hoc and
+  the "endeavor not to break" posture is only visible as a warning, not a rule.
