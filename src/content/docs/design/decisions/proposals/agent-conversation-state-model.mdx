@@ -1,0 +1,197 @@
+---
+title: "Agent Conversation State Model & Per-Pane Identity"
+description: How agent conversations stop being a client-side global singleton and become per-conversation, per-pane, and resumable via the opaque session document.
+sidebar:
+  order: 8
+status: Proposed
+date: "2026-08-20"
+related:
+  - label: ADR-002 (Browser Session Tracking)
+    href: /design/decisions/adr-002-browser-session-tracking/
+  - label: carbide2#85 (agent conversations are a global singleton)
+    href: https://github.com/fdimitri/carbide2/issues/85
+  - label: carbide2#79 (per-message author)
+    href: https://github.com/fdimitri/carbide2/issues/79
+  - label: carbide2#80 (broadcast user turn)
+    href: https://github.com/fdimitri/carbide2/issues/80
+---
+
+import AdrHeader from '../../../../../components/AdrHeader.astro';
+
+<AdrHeader {...frontmatter} />
+
+## Context
+
+Agent conversations in the client are modeled as a single global singleton. `workspaceStore`
+holds one `agentConversationId`, one `agentMessages` array, and one `agentStatus`. Every
+`AgentPane` and `Composer` reads those same refs, and the agent tab is bound as the
+identity-less `agent:0` (unlike `file:<path>`, `channel:<id>`, `terminal:<uuid>`).
+
+The worker is already correct: `AgentSession` is keyed by `conversation_id`, and
+`AgentSession#emit` merges `conversation_id` into every frame. The client discards it in
+most handlers, so streams, tool calls, and replies from conversation B render into
+conversation A's single timeline. Because `agentStatus` is global, one thinking
+conversation also disables Send in every pane.
+
+Full symptom report: [carbide2#85](https://github.com/fdimitri/carbide2/issues/85).
+
+## Decision
+
+### 1. Key all live agent state by `conversation_id` (UUID)
+
+Replace the singleton fields with maps keyed by conversation id:
+
+```js
+agentMessagesByConversation: { [conversationId]: Message[] }
+agentStatusByConversation:  { [conversationId]: 'idle'|'thinking'|'error' }
+```
+
+`conversation_id` is already a UUID end-to-end (`AgentConversation.uuid` +
+`SecureRandom.uuid` on the wire); no schema change is required for identity — the fix is
+client-side keying and the tab key. Every inbound `agent/*` broadcast handler routes by
+`payload.conversation_id` into the right map entry instead of appending to whichever
+conversation currently owns `agentMessages`.
+
+### 2. Tab identity = `agent:<conversationUuid>`
+
+The agent tab key becomes conversation-bearing, mirroring `terminal:<uuid>`:
+
+```
+agent:<conversationUuid>          // a concrete, loaded conversation
+agent:                            // a fresh "new conversation", no UUID yet
+```
+
+This makes multiple agent panes independent: changing the dropdown in one pane mutates
+that pane's tab key, not a shared ref.
+
+### 3. Subscribe/unsubscribe membership, mirroring chat and files
+
+Agent conversations adopt the same explicit subscriber model the rest of the live surface
+uses. Today `AgentSession#emit` is project-wide broadcast (visibility-filtered); it becomes
+membership-scoped instead:
+
+- `agent/subscribe { conversation_id }` → this socket is interested; future `stream` /
+  `tool_call` / `tool_result` / `done` / `user_turn` / `stopped` frames for that conversation
+  are delivered to it.
+- `agent/unsubscribe { conversation_id }` → stop delivery; the conversation's buffered state
+  is eligible to be dropped once no pane (and no socket) still references it.
+
+Authorization lives at **subscribe time**, not emit time: `agent/subscribe` checks
+`convo.visible_to?(session.user_id)` and rejects unauthorized subscribers. `emit` becomes a
+pure fan-out to the conversation's subscriber set — no visibility branch in the delivery path.
+The visibility logic does not vanish, it moves to the subscribe gate plus a prune on
+`visibility_changed` (a `project → private` flip drops subscribers who are no longer
+authorized).
+
+This is exactly the pattern `chat` already uses (`join`/`leave` on a `ChatRoom`) and files
+use (`fs/open`/`fs/close` on an `OpenDocument`). A socket's session record tracks its
+conversation memberships the way `Session#rooms` and `Session#open_files` do today, so a
+reconnect re-subscribes cleanly (see the existing replay-on-`system/connected` path in
+`useChat`).
+
+Buffering is therefore **subscription-scoped**: only subscribed conversations accumulate in
+memory, and only for as long as a subscription exists. This is a correctness/backpressure
+property, not a scale optimization — conversations can be many megabytes each, and an
+unbounded "everything broadcast to everyone, buffered forever" model does not converge.
+
+### Delivery model (current)
+
+There is **no** `agent/subscribe` / `agent/unsubscribe` today. `AgentSession#emit` fans every
+event out to every session in the project for `project`-visibility conversations (owner-only
+for `private`). Chat and files are already membership-based; agent conversations are the
+outlier. The fix is parity: a per-conversation subscriber set replaces the project-wide fan-out.
+
+### Confidentiality: least-privilege delivery
+
+Assume conversations may carry confidential material and default to not leaking it:
+
+- **Authorize at subscribe, deliver to subscribers.** `emit` fans out to the subscriber set
+  only; `agent/subscribe` is the authorization gate. "Private" reduces to "only the owner may
+  subscribe"; "project" reduces to "any member may subscribe."
+- **Delivery set = subscriber set**, never a project-wide superset, and never re-derived from
+  visibility at emit time. A visibility flip from `project → private` prunes unauthorized
+  subscribers so in-flight viewers drop off immediately.
+- **Role-scoped conversations are a natural extension**: `visible_to?` becomes an ACL
+  predicate (owner / role / member) rather than a two-value boolean, and the delivery layer
+  is unchanged — it still only knows the subscriber set. Design the subscribe gate to be an
+  arbitrary authorization predicate, even if only `project`/`private` is implemented first.
+- **Metadata must be scoped too.** Two current leaks to fix:
+  1. `agent/set_visibility` → `Command.broadcast_project(... 'visibility_changed', ...)`
+     announces a private conversation's id, owner, and visibility to every project client.
+     Scope this to the conversation's authorized audience.
+  2. `DebugStream.emit(:agent, ...)` includes the ask text prefix and per-turn metadata but
+     is only project-scoped (opt-in debug), so a private conversation's content/meta reaches
+     any project debug subscriber. Scope agent debug events to the conversation's authorized
+     audience (or suppress them for private conversations).
+- **Client-side retention** is part of the same property: buffered transcript state is kept
+  only for subscribed conversations and dropped on unsubscribe / when a conversation
+  becomes private to someone else.
+
+### 4. Per-pane agent tab state in the opaque document
+
+Each pane's agent tab records, in the session doc:
+
+```json
+{
+  "key": "agent:<uuid>",
+  "kind": "agent",
+  "id": "<uuid>",
+  "label": "Agent",
+  "agentSlug": "coder",
+  "composerHeightPx": 96
+}
+```
+
+Panels resume independently. The composer height is therefore **per pane** (per agent tab), not
+one workspace-wide `localStorage` value and not per-conversation — two panes viewing the same
+conversation may legitimately have different heights (see #82). The session doc stays opaque to
+the worker — these are new leaf fields, not new path-navigation semantics.
+
+### 5. Fold #80 into the routing model
+
+`agent/user_turn` (added in #80) currently drops turns whose conversation is not current.
+Under this model it routes into the per-conversation map like every other event, so a
+non-active joined conversation still records the question.
+
+## Consequences
+
+**Positive**
+
+- Conversation B can no longer leak streams/tool calls into conversation A.
+- A conversation thinking in pane 1 no longer blocks Send in pane 2.
+- Multiple agent panes are independent and each resumes its own conversation.
+- Streaming into a non-active joined conversation no longer forces a re-render on switch.
+
+**Negative / to resolve**
+
+- This is a real rewrite of the client agent layer (`workspaceStore`, `useAgents`, `AgentPane`,
+  `Composer`, `WorkspacePaneShell`) **and** the worker's delivery path (per-conversation
+  subscriber sets + subscribe/unsubscribe commands), plus a session-doc shape addition.
+- Subscription lifecycle must be reconciled with reconnect and with panes being closed or
+  hidden: a conversation is unsubscribed only when no socket and no pane references it, and a
+  reconnect must re-subscribe (mirroring chat's rejoin-on-`system/connected`).
+- Memory is bounded by *subscriptions*, not by "everything ever broadcast": conversations can
+  be many megabytes and numerous, so an unsubscribed conversation's buffered transcript must
+  actually be dropped, not merely stop growing.
+- Confidentiality is a delivery property, not just a UI concern: content, visibility-change
+  metadata, and debug events must all be scoped to the conversation's authorized audience
+  (see the Confidentiality section above).
+
+## Alternatives considered
+
+- **Per-pane arrays instead of per-conversation maps.** Two panes viewing the same
+  conversation would hold divergent copies and need reconciliation. A single canonical map
+  keyed by `conversation_id` keeps one transcript per conversation regardless of how many
+  panes view it.
+- **Filter-only fix (keep singleton, add `conversation_id` guards).** The minimal patch that
+  makes the wrong-conversation rendering stop, but it cannot fix the global `agentStatus`
+  blocking every pane, the pane-sync behavior, or independent resume. Rejected as it leaves
+  the architecture that caused #85 in place.
+- **Explicit `agent/subscribe` + `agent/unsubscribe` (chosen).** Matches the `chat` and `fs`
+  subscriber models that already bound delivery and memory; the tab-derived "open somewhere"
+  set is the client-side mirror that decides *when* to subscribe/unsubscribe, but the server
+  keeps an authoritative per-conversation subscriber set rather than fanning out to the whole
+  project.
+- **Add a UUID *type* distinct from the existing `uuid` column.** Unnecessary — the model
+  already has a unique `uuid` string column and the wire already uses it. Adding a second
+  identity would create two sources of truth for the same resource.
