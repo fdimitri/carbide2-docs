@@ -96,5 +96,11 @@ rather than erroring into a blank state.
   system needs.
 - **Full migration for every version bump.** Requires preserving every old shape forever;
   not worth it for a pre-alpha product and an opaque, overwritable document.
+- **Modular loader / translation boundary.** Move version translation out of the client
+  entirely: a loader reads `doc@N` and emits `doc@current`, so the client never accumulates
+  historical shape knowledge. Cleaner long-term, but it is schema-aware by definition and
+  therefore either evolves ADR-002's "opaque, schema-agnostic server" boundary (worker-side
+  translation at resume/snapshot) or adds a separate service. Deferred as a follow-up;
+  tracked in carbide2#86.
 - **Leave it implicit (current state).** Every doc change re-decides compatibility ad hoc and
   the "endeavor not to break" posture is only visible as a warning, not a rule.
