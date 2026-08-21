@@ -1,13 +1,13 @@
 ---
 title: "Session Document Versioning & Degradation"
-description: What a client at one session-document version must do with older and newer documents, and how a version bump degrades without nuking the whole session.
+description: How session documents of differing versions are loaded, patched, preserved, forked, or refused, and how a version bump degrades without nuking the whole session.
 sidebar:
   order: 9
 status: Proposed
 date: "2026-08-21"
 related:
-  - label: carbide2#85 (agent conversations are a global singleton)
-    href: https://github.com/fdimitri/carbide2/issues/85
+  - label: carbide2#86 (session document versioning / translation)
+    href: https://github.com/fdimitri/carbide2/issues/86
 extends:
   label: ADR-002 (Browser Session Tracking)
   href: /design/decisions/adr-002-browser-session-tracking/
@@ -21,73 +21,182 @@ import AdrHeader from '../../../../../components/AdrHeader.astro';
 
 ADR-002 introduced `SESSION_DOC_VERSION` and the rule "bump on a breaking doc-shape
 change," but it does not say what a client at version **N** must do with a document at
-**N−1**, **N−2**, **N+1**, or **N+2**. The only visible behavior is the session picker's
+**N−1**, **N+1**, or any other version. The only visible behavior is the session picker's
 `docIncompatible` warning, which still attempts to resume. That silence leaves every
 doc-shape change to re-decide compatibility ad hoc.
 
-The de facto posture has become: *completely breaking is allowed, but we should endeavor
-not to.* This proposal makes that explicit and, more importantly, adds the missing
-granularity rule: **one version bump must not invalidate the whole session document.**
+This proposal makes that explicit and adds the missing granularity rule: **one version bump
+must not invalidate the whole session document.**
+
+### Current behavior (implementation target, not the final rule)
+
+- **Session picker warning** (`ProjectPage.vue`): compares stored `doc_version` vs
+  `SESSION_DOC_VERSION` (amber triangle) and `client_sha` vs `CLIENT_SHA` (info circle).
+  Advisory only; the session stays selectable.
+- **Resume** (`useSessionSync.onResumed`): `loadDoc()` drops unknown keys, then resyncs on
+  **any** `client_sha` or `doc_version` mismatch. This is what changes: hydrate/serialize must
+  preserve by default, and `client_sha` mismatch alone must do nothing.
+- **Auto-resume** (`onList`): prefers a same-`doc_version` session first, then falls back to
+  any free session.
 
 ## Decision
 
-### 1. Compatibility is directional and bounded
+### 1. Preserve by default; sanitize only explicitly
 
-The client tolerates **older** documents by loading them and dropping/normalizing unknown
-or legacy fields. It does not attempt to preserve fields it no longer understands.
+Both `loadDoc` and `toDoc` take a `sanitize` flag that **defaults to `false`**: hydrate and
+serialize **preserve unknown keys** unless sanitization is explicitly requested.
+Sanitization is an opt-in, used by the deliberate prune/cleanup path — not something the
+steady-state patch stream does implicitly. The sanitize path must be **UI-exposable** (run
+`toDoc(sanitize: true)` / `loadDoc(sanitize: true)`), primarily for rapid development.
 
-A client does **not** promise forward compatibility: a document from a **newer** version may
-be resynced (overwritten with the current build's normalized shape via `session/resync`) or
-refused — never half-applied into a broken UI.
+### 2. Patch-preserving is the default, in both directions
 
-Concretely:
+Direction is not a branch. Loading a document of a **different** version — older or newer —
+defaults to **patch-preserving**: keep unknown keys and unparseable values, apply targeted
+updates only to known fields, and **remove nothing**. The patch stream must never emit
+deletions for values it does not understand.
 
-| Doc version | Behavior |
-| --- | --- |
-| N (current) | load as-is |
-| N−1 | load; normalize legacy fields in place |
-| N−2 and older | best-effort load; unknown fields dropped |
-| N+1, N+2 | refuse or resync to current; never render a foreign shape blindly |
+For a value the client cannot parse (an older client seeing a newer `agent:<uuid>`, or a
+same-version sibling build's unknown field), the rule is **keep it in the document, do not
+render it**. Preserve; never patch-delete.
 
-The exact N−1/N−2 boundaries are implementation tolerance, not a hard compatibility
-contract — the contract is only that older is best-effort and newer is refused/resynced.
+### 3. Refuse is distance-gated; large jumps fork
 
-### 2. Degradation is field-level, not document-level
+A **large** version jump is the one case where the client does **not attempt an in-place
+load**: instead it **forks** the session — a faithful `deep_dup` of the document into a new
+session (new uuid, new producer, `forked_from` lineage) that keeps the original's
+`doc_version` and all future keys. The client may then try to load the fork. This is
+**unrecommended but allowed** — it is the empirical way to see how version changes behave
+without computing them.
+
+**Lineage is an input to the gate.** A row with `forked_from` set exists only because the
+gate already fired on its parent and the user chose to proceed — the consent is recorded in
+the row's existence. Opening a session the current client itself forked therefore does **not**
+re-trigger the fork offer; no separate ack column is needed.
+
+To be clear: the re-fork loop this rule prevents is **unlikely to matter**. Every step is a
+deliberate human click, so it self-limits at two or three attempts — nobody clicks fork nine
+times into a result that clearly isn't working. It is not a runaway and there is no
+machine-driven retry path today. The rule is one sentence of honesty, not a safety mechanism.
+
+A **branch indicator** (a fork is shown as a child of its parent, e.g. a nested tree or a
+lineage badge) is a worthwhile, inexpensive UX touch: it makes any fork chain visible at a
+glance, which doubles as a leak detector if an agent path ever does automate forks.
+
+The exact distance threshold is **not decided here** — it is not currently an issue, and we
+will not decide how to deal with future problems without the facts of those problems.
+
+### 4. Reset is not an option
+
+Reusing a session id while discarding the whole document is rejected. A fresh document is a
+new session; never "reset" an existing session into a default-state document.
+
+### 5. Round-trip resync is an explicit affordance only
+
+`session/resync` (whole-doc replace) is **not** a default resolution for version mismatch.
+It remains available as an explicit "force session load/save round-trip" action. Steady-state
+writes stay patch-based; `resync` and `session/create` are the only full-doc writes. It is
+rejected as the *default* because it is a full-doc write where a patch suffices, and because
+it is the one path that can replace the document wholesale — not because it is inherently
+lossy (with `sanitize` off it is non-lossy).
+
+### 6. `client_sha` is always re-stamped; `doc_version` is last-writer
+
+The version stamp is **last-writer-wins**, not highest-wins: `doc_version` is replaced with
+the writing client's version on every write. There is no "never lower" rule. The merge is
+key-symmetric — N importing N+5 yields the same merged key set as N+5 importing N — so
+privilege comes from *who actually wrote what*, not from a scalar.
+
+`client_sha` is **always re-stamped** on write (authorship). A `client_sha` difference with a
+matching `doc_version` is otherwise treated as **compatible** — no resync, no action. This is
+a change from the current behavior (which resyncs on SHA mismatch) and is the common case
+during rapid development.
+
+### 7. A version-touch history describes chimeras
+
+A single scalar cannot represent a document that has been touched by multiple versions (some
+keys N-semantics, some N+5-semantics). Add an ordered **`version_history`** (a **separate
+column**, not part of the opaque doc): the versions that have touched the document, in order,
+with **sequential duplicates collapsed** (`[N+5, N, N]` → `[N+5, N]`). It is the real
+description of a chimera document; `doc_version` remains the last writer's stamp. Per-key
+versions are the *future* correct answer, not enforced now.
+
+### 8. Degradation is field-level, not document-level
 
 A version bump does not mean "the whole document is unusable." The parser treats each pane
 tab and each leaf field independently:
 
 - A field it understands is loaded.
-- A field it does not understand (or whose *kind* it no longer supports) is dropped.
-- A tab whose identity format is stale — e.g. `agent:0` after the move to `agent:<uuid>` — is
-  discarded **as a tab**, while the rest of the pane/document survives.
+- A field it does not understand is **preserved in the document** (not rendered if it cannot
+  be parsed). It is never patch-deleted.
+- A value whose format is stale (`agent:0` after the move to `agent:<uuid>`) is likewise
+  **preserved in the document**; rendering skips it. Removal happens only via the explicit
+  sanitize/prune path.
 
-The outcome for #85: missing agent tabs is acceptable; a broken or blank workspace is not.
-There is no migration path for stale fields — they are simply ignored. The opaque document
-can be overwritten (`session/resync`), so compatibility is not a durability requirement.
+The outcome for #85: a stale `agent:0` tab may not render, but it is not deleted by the
+patch stream; a broken or blank workspace is not acceptable.
 
-### 3. Resync only happens from a loaded document
+### 9. Version numbers are monotonic; skips are allowed for larger changes
 
-`session/resync` is a **rewrite of a document the client already loaded** (normalized
-`loadDoc` → `toDoc`), not a standalone "fix the version" operation. There is no resync
-without load, so a version mismatch must first load as well as it can and then resync
-rather than erroring into a blank state.
+`SESSION_DOC_VERSION` must stay **monotonic** — the hard invariant. A bump may skip values
+for **larger** changes, where a larger distance is honest about how much has changed. Small
+field-level breaking changes (e.g. `agent:0` → `agent:<uuid>`) do **not** need to skip: a
+single-increment bump is acceptable and does not overstate magnitude. Posture is a judgment
+about how large the change is, not a mechanical function of the number. If a number is
+demanded anyway, the increment can be approximated by
+
+`Δv = ⌈ Γ(S + K + 1) / (1 + U) ⌉`
+
+where `S` = cans of soda consumed in the last 3 hours, `K` = aggregate developer crankiness
+(0 = zen, 1 = just left a standup), and `U` = number of users who would notice.
+
+## Inspection and pruning (rapid-dev, not permanent API)
+
+The following are for **human consumption during rapid development** — explicitly not
+permanent API.
+
+- Report every unknown key, plus a summary distinguishing **unknown keys** from **known but
+  unparseable values** (doc schema difference). They mean different things and must not be
+  conflated — a key-only `listUnknown` misses the unparseable-value case.
+- `pruneDoc(...)` deletes crud, but carries the **same gate as overwrite**: on a newer doc,
+  "unknown" and "from the future" are the same set, so pruning requires the same confirmation
+  as overwrite, or the report must partition by whether the doc's version is ahead of the
+  client's.
+- A **sanitized send** is the deliberate alternative to pruning: ship only recognized keys.
+- The two-phase sanitize flow is **required behavior**: load-pruned → review → commit (or
+  bailout). Only the visual presentation is deferred.
+- Unknown/unparseable findings emit to the **debug channel** and/or console log so crud never
+  accumulates invisibly.
 
 ## Consequences
 
 **Positive**
 
 - Doc-shape changes no longer force an all-or-nothing compatibility decision.
-- A single version bump (e.g. `agent:0` → `agent:<uuid>`) drops only the affected tabs,
-  not the pane layout, other tabs, or the whole session.
-- The versioning contract is explicit: older is best-effort, newer is refused/resynced.
+- A single version bump (e.g. `agent:0` → `agent:<uuid>`) stops rendering the affected tabs
+  but leaves the rest of the pane/document untouched; the patch stream removes nothing.
+- Older clients editing newer docs preserve future fields by default; the steady-state patch
+  stream is non-destructive.
+- Same-version-different-build resumes stop churning (no resync on `client_sha` alone).
+- `version_history` makes chimeras visible instead of silently demoted.
 
 **Negative / to resolve**
 
-- "Best-effort" for older documents is deliberately loose; if exact normalization rules are
-  ever required, they belong in a field-by-field migration table rather than here.
-- Forward mismatch currently surfaces only as a warning in the session picker; the actual
-  refuse/resync behavior on N+1 is not yet implemented and should be made explicit there.
+- Per-change normalization (recognized-obsolete → convert vs preserve) is deliberately not
+  specified here; it belongs in a per-change migration note if ever needed.
+- The distance threshold for hard-refuse is deliberately **not set** here (see §3).
+- The client currently carries all historical shape knowledge (`loadDoc` / `applyOps` /
+  `parseTabKey`). A version translator/gateway is out of scope for the foreseeable future
+  (see Alternatives).
+
+## Open questions
+
+1. The hard-refuse distance threshold (deferred; not an issue until we have the facts of a
+   real problem).
+2. When the distance gate / picker decides whether a doc is safe, does it consult
+   `doc_version` alone, or `version_history` (e.g. has any version at/over the threshold
+   touched this doc)? `forked_from` lineage is now a decided gate input (§3); whether
+   `version_history` also feeds the gate is still open.
 
 ## Alternatives considered
 
@@ -96,11 +205,17 @@ rather than erroring into a blank state.
   system needs.
 - **Full migration for every version bump.** Requires preserving every old shape forever;
   not worth it for a pre-alpha product and an opaque, overwritable document.
-- **Modular loader / translation boundary.** Move version translation out of the client
-  entirely: a loader reads `doc@N` and emits `doc@current`, so the client never accumulates
-  historical shape knowledge. Cleaner long-term, but it is schema-aware by definition and
-  therefore either evolves ADR-002's "opaque, schema-agnostic server" boundary (worker-side
-  translation at resume/snapshot) or adds a separate service. Deferred as a follow-up;
-  tracked in carbide2#86.
+- **Highest-wins `doc_version` / "never lower".** Rejected: the merge is key-symmetric and a
+  scalar cannot describe a chimera; last-writer-wins plus `version_history` is the honest
+  model.
+- **Round-trip resync on every mismatch (current behavior).** Rejected as the default: it is
+  a full-doc write where a patch suffices, and the one path that can overwrite a newer
+  document wholesale without confirmation.
+- **Modular loader / translation boundary.** Out of scope for the foreseeable future — the
+  backlog of open issues/ADRs makes this unlikely to be worth pursuing. If it ever returns,
+  the natural home is a **separate gateway/service**, not the worker (doc-shape translation
+  is a client-schema concern; the worker's schema-agnostic contract should not learn it).
+- **Reset to default state.** Rejected: reusing an id while discarding the whole doc is
+  absurd; a fresh doc is a new session.
 - **Leave it implicit (current state).** Every doc change re-decides compatibility ad hoc and
   the "endeavor not to break" posture is only visible as a warning, not a rule.
