@@ -1,0 +1,325 @@
+---
+title: "Authentication Behavior, Token Ownership & Lifetime"
+description: Who mints the workspace tokens, what the TTLs are, how renewal works, and why the workspace verifies but does not mint identity.
+sidebar:
+  order: 15
+status: Proposed
+date: "2026-08-22"
+related:
+  - label: carbide2#84 (pre-expiry session extension)
+    href: https://github.com/fdimitri/carbide2/issues/84
+---
+
+import AdrHeader from '../../../../../components/AdrHeader.astro';
+
+<AdrHeader {...frontmatter} />
+
+## Context
+
+Authentication has accreted two parallel designs and neither has been reconciled.
+Today there are at least three different short-lived token shapes in flight,
+minted by two different services, with overlapping but not identical claims.
+The TTLs below are **per the repo, not the deployed cluster** — before Accept,
+verify both `USER_TOKEN_TTL` (control) and `WORKER_TOKEN_EXPIRY_SECONDS` (server)
+against what is actually running:
+
+| Token | Minter | TTL | Claims | Verified by |
+|---|---|---|---|---|
+| Control login token | control `SessionsController` | 24h | `iss`, `sub`, `aud`, `user_id`, `scope` | control `ApplicationController` |
+| Workspace API bearer | server `AuthController#issue_user_token` | 10m | `sub`, `scopes` | server `Api::BaseController` |
+| Worker WS token | server `WorkerTokenIssuer` | 10m | `sub`, `user`, `project`, `name` | worker `validate_token` (legacy branch) |
+| Control workspace token | control `JwtIssuer` | 5m | `iss`, `aud`, `project_id`, `user_id`, `scope` | worker `validate_token` (new-format branch) — but nothing mints it into the runtime path |
+
+The control workspace token (`JwtIssuer`) is minted during login, then **discarded**:
+`auth_controller#login` calls `ControlPlaneAuth.workspace_token`, takes only the
+user object, and mints its own `issue_user_token` instead. The worker's
+new-format verification branch (iss/aud/scope) therefore guards a handoff that
+never happens; the runtime actually uses the legacy server-minted shapes.
+
+There is also direct evidence the path is **vestigial, not merely unused**:
+control signs `JwtIssuer` tokens with `CARBIDE_JWT_SECRET`, while the worker's
+new-format branch verifies with `WORKER_JWT_SECRET`. Different env names mean
+the handoff could not have worked even if the token had been passed through —
+the two sides never shared a secret.
+
+The consequence is the worst of both worlds for the two properties that matter:
+
+- **Authority.** Control owns users and membership, but the workspace pod mints
+  identity claims about those users using a mirrored, second `User` table.
+- **Revocation.** This is the stronger driver. With workspace-minted tokens,
+  removing someone's membership in control does not stop the pod from minting
+  for them unless the pod checks membership — which means calling control
+  anyway, giving up the offline property. Control-minted tokens make revocation
+  "stop issuing," with an exposure window of one short TTL.
+- **Observability** is real but separable: control can record an exchange
+  whether or not it signs the result (issuing and recording are distinct), and
+  each workspace already has durable Postgres, so session records outlive the
+  pod. It is not the reason to choose control ownership.
+
+Issue #84 (pre-expiry session extension) forces this decision now, because adding
+a renew endpoint on top of the current chain would codify the inconsistency.
+
+## Decision
+
+### Control owns identity and minting; workspaces verify, not mint
+
+The control plane is the single authority for **who a user is** and **how long
+they may stay authenticated**. It mints all tokens that carry identity. The
+workspace pod and the worker verify those tokens locally (no per-request
+round-trip to control), but they do not mint identity tokens of their own.
+
+Minting is stateless and cheap, so this is **not** a scaling problem: control
+only mints on rare events (login, renew, workspace entry). Verification is
+signature-checked locally at each consumer, so steady-state traffic never
+touches control.
+
+### Asymmetric signing is what makes "verify, not mint" true
+
+The split only holds with **asymmetric** signing (RS256). Under the
+current HS256, a pod that verifies control's tokens must hold the signing
+secret — and a secret that verifies also mints. A compromised pod could then
+mint valid tokens for any workspace. Therefore:
+
+- Control holds the **private** key and is the only minter.
+- Each workspace pod (and its worker) holds the **public** key and can verify
+  but never mint.
+
+The cost is real: this is a key-management surface (keypair generation,
+per-pod public-key distribution, rotation), not a shared string in an env var.
+Without it, "workspaces verify but do not mint" is not actually true.
+
+### Stable identity: control-plane UUIDs in the token, never pod-local ids
+
+Model B means every workspace pod has its own local integer PKs, and the same
+human is a different `users.id` in control and in every pod they have used. A
+cluster-wide token must therefore not carry a pod-local integer.
+
+- **Users get a `uuid`** in the control DB, unique and backfilled. This is the
+  stable identity used in `sub` / `user_uuid` across all tokens.
+- **Control projects (workspaces) also get a `uuid`**, now rather than later:
+  since the token is being touched anyway, it should carry `project_uuid` from
+  the start instead of baking in the integer and re-migrating later. This is
+  for the **token claim** only — it does not change routing or naming.
+- **Workspace-local `Project` rows do NOT get a cluster uuid.** Their identity
+  is the control-plane `workspace:<uuid>`; a local integer is an
+  implementation detail of one pod.
+
+The migration is additive and non-breaking: add `uuid`, backfill existing rows,
+add a unique index; leave existing integer PKs and FKs in place. The token gains
+uuid claims alongside the existing integer claims; other `_id` consumers migrate
+to `_uuid` later, in independent changes — nothing is renamed or dropped as part
+of this decision.
+
+### One workspace token shape, scope-limited
+
+The control-minted `JwtIssuer` format becomes the single workspace token:
+
+```
+iss: carbide-control
+aud: workspace:<id>        # kept (staged removal)
+sub: user:<id>             # kept (staged removal)
+user_id: <id>              # kept (staged removal)
+project_id: <id>           # kept (staged removal)
+user_uuid: <uuid>          # added now (future plumbing)
+project_uuid: <uuid>       # added now (future plumbing)
+scope: workspace:rw
+iat, exp (5m)
+```
+
+The integer claims (`sub`/`aud`/`user_id`/`project_id`) stay for now to **stage**
+the change, not for backward compatibility. There is no installed base to
+protect: pre-alpha, one deployment, three repos shipped together — so the
+integer claims are only retained so the change lands in pieces, not because a
+running consumer depends on them. The uuid claims are laid alongside them as
+future plumbing; the integer claims are removed in a later refinement once every
+consumer (worker, workspace REST, mirrored User) has migrated to uuid
+resolution.
+
+Signed asymmetrically (see above): the public key is sufficient to verify, so
+pods cannot mint.
+
+The workspace REST layer and the worker both verify this format. If audience
+separation is later wanted (HTTP vs WS), it is **two scopes of one issuer**
+(e.g. `workspace:http`, `workspace:ws`), not two issuers. The current
+accidental split — server `issue_user_token` + `WorkerTokenIssuer` — is removed.
+
+Consumers keep resolving by the integer ids for now (the uuid claims are not
+yet authoritative). Later, once the workspace pod's mirrored `User` table gains
+a `control_uuid` column and project resolution moves to `project_uuid` → `aud`,
+the integer claims are dropped from the token.
+
+The integer/uuid mismatch rule belongs at **that mirror step**, not in the
+token. Control's own `uuid` backfill cannot assign a "wrong" uuid — each row
+gets an independent `gen_random_uuid()`, so there is no mapping to get wrong.
+The mapping that can disagree is the pod-side `control_uuid` (mirroring control
+users by email or by a mirrored integer), where duplicate emails, a changed
+control id, or a drifted mirror can make the integer and the uuid point at
+different humans. Separately, re-backfilling after restoring control from a
+pre-uuid snapshot regenerates every uuid, so anything that stored a uuid
+persistently now points at nothing — tokens self-heal by expiring in minutes;
+persistent stores do not. Document the rule where the mirror is built.
+
+The workspace token carries **no `auth_time`**. It is deliberate, not an
+omission: the ceiling is enforced at mint time on control, and a pod verifying a
+workspace token only needs "is this token currently valid," not "how old is the
+session behind it." A workspace token therefore cannot tell a one-minute-old
+session from a six-day-old one — and that is fine, because the 5m token is the
+thing that keeps the session alive; the ceiling lives on the login token.
+Someone re-adding `auth_time` to the workspace token later should treat it as a
+conscious design change, not a bug fix.
+
+### Renewal: sliding, with an absolute ceiling
+
+The control login token may be renewed while still valid via a dedicated
+renew endpoint (no password re-entry). Renewal re-signs with a fresh `exp` but
+**preserves `auth_time`** (the original login time).
+
+A renew is rejected once `now - auth_time` exceeds an absolute ceiling of
+**7 days**. The ceiling is configurable and enforced at mint time, not by the
+client. After the ceiling, the existing decline/ignore path (full login)
+applies — no new failure mode is introduced.
+
+Renewal must re-key derived tokens in order: control login token → workspace
+token (re-exchange) → worker WS token (system/reauth). Cross-window renew is
+propagated via a `storage` event listener, because tokens live in shared
+`localStorage` and another window's renew must be noticed without a reload.
+
+### TTL and ceiling are control-side settings columns, not env vars
+
+The workspace-token TTL and the session ceiling are **configuration**, and they
+follow the pattern already set in [ADR-007 (Shell Pod Resource
+Limits)](/design/decisions/adr-007-shell-pod-resource-limits/): a durable
+control-side settings column is the source of truth, read at mint time, with a
+short-TTL cache and an env fallback for bootstrap only. The signing keypair is
+**not** configuration in this sense — it stays a Kubernetes Secret, never a
+column.
+
+### Two tokens, never combined
+
+The login token and the workspace token are **two distinct credentials** with
+different audiences and lifetimes:
+
+Login token:
+
+```
+iss: carbide-control
+sub: user:<id>
+aud: control:dashboard
+user_id: <id>
+user_uuid: <uuid>       # added now (future plumbing)
+scope: control:user
+auth_time: <first-auth unix seconds>  # fixed at login; carried through renew
+iat, exp (24h)
+```
+
+Workspace token:
+
+```
+iss: carbide-control
+sub: user:<id>
+aud: workspace:<id>
+user_id: <id>
+project_id: <id>
+user_uuid: <uuid>
+project_uuid: <uuid>
+scope: workspace:rw
+iat, exp (5m)
+```
+
+They are never collapsed into one token carrying both scopes. A combined token
+would have to pick one lifetime: 24h and revocation stops biting quickly, or 5m
+and the user re-authenticates constantly. Two audiences, two tokens.
+
+### Worker legacy branch dies now; UUID migration is the deferred part
+
+The worker's legacy-format verification branch (no `iss`/`aud`, claims
+`user`/`project`) and the server-side minters that feed it
+(`WorkerTokenIssuer`, `AuthController#issue_user_token`) are removed **now**.
+The runtime switches to the new control format. This is distinct from the UUID
+change: the new format still carries integer `user_id`/`project_id` claims as a
+staged step (see above — not backward-compat); those are retired later. Legacy =
+token shape/ownership, not integer-vs-uuid identity.
+
+### Revocation latency is a stated number, not an emergent one
+
+Revoking membership stops **issuance** but does not retroactively invalidate a
+token already in flight (JWTs are stateless). An already-open WebSocket keeps
+working until its token expires. That is the actual revocation latency:
+
+- **Today:** the worker WS token is 10 minutes, so a revoked user keeps their
+  open socket for up to 10 minutes after revocation.
+- **Decided:** the single workspace token is **5 minutes** (control's existing
+  `JwtIssuer` TTL). Adding the worker's ~30s sweep grace gives a worst case of
+  **~5.5 minutes** from revocation to a dead socket. This is the floor with no
+  new mechanism; anything faster needs a `jti` denylist or in-band revocation.
+
+The 5m value is the default, configurable as a control-side settings column
+(see the TTL/ceiling decision above); the server **inherits** it from control
+rather than holding its own copy. The server's `WORKER_TOKEN_EXPIRY_SECONDS`
+becomes irrelevant once the server stops minting. If 5m proves too aggressive
+during development (re-auth churn, flaky reconnects), change it in one place on
+control and restate the consequence here — not by inheriting a second default
+from the server.
+
+## Consequences
+
+**Positive**
+
+- **Revocation is "stop issuing."** Removing a user's membership in control
+  means no new workspace tokens are minted for them; the exposure window is one
+  short TTL, not the lifetime of an already-issued token.
+- One place to enforce ceiling/revocation policy.
+- A leaked workspace **token** is audience-scoped and short-lived, so it cannot
+  be replayed against the dashboard or another workspace. (This concerns a
+  leaked token, not a compromised pod; the pod-compromise case is what the
+  asymmetric-signing rule above bounds.)
+- Verification stays local and offline; no per-request dependency on control.
+- Auditing is available but not the point: control can record every exchange it
+  is asked to perform, and per-workspace session records live in durable
+  Postgres, so observability is separable from signing.
+
+**Negative / to resolve**
+
+- Requires removing server-side `issue_user_token` and `WorkerTokenIssuer`,
+  and teaching the workspace REST layer to verify control's claims shape.
+- A transient **rollout** window (not a long dual-mode): old server-minted
+  tokens already in flight run out their TTL while new tokens use the control
+  format. This is measured in minutes (the TTL), not maintained indefinitely.
+- The workspace REST and WS consumers must agree on the control token shape
+  (one more verification contract to keep in sync by hand, like JWT_CLAIMS.md).
+
+## Open questions
+
+1. **Audience separation** — is `workspace:http` vs `workspace:ws` worth it now,
+   or does one `workspace:rw` token serve both?
+2. **Asymmetric key management details** — rotation cadence and how per-pod
+   public keys are distributed (RS256 is decided; the mechanics are open).
+3. **Slug migration for the ingress prefix / `ws-<id>` naming** — **not now.**
+   The `/w/<id>/` prefix and operator naming keep the integer for the time
+   being. Their retirement is a separate, later change and will use **slugs**,
+   not UUIDs. The token's `project_uuid` claim is carried now as future
+   plumbing, but routing stays on the integer until that change lands.
+
+## Alternatives considered
+
+- **Workspace-owned JWTs (server mints, control unaware).** Gives local blast
+  radius and tenant self-containment, but loses cheap revocation (the pod must
+  check membership on every mint, i.e. call control) and duplicates identity
+  authority — which is exactly the drift the current code already exhibits.
+  Rejected.
+- **HS256 with a single shared signing secret (status quo).** Simplest — one
+  env var, every pod both mints and verifies. But a pod that verifies holds
+  the minting secret, so "verify, not mint" is false and a compromised pod
+  can forge tokens for other workspaces. Rejected in favor of asymmetric
+  signing.
+- **Control-owned JWTs with per-request control verification.** Centralizes
+  everything but makes control a hot path and a runtime dependency for every
+  request. Rejected; verification should be local.
+- **Unbounded sliding renewal.** Simplest, but means "touch the token every
+  24h to stay logged in forever." Rejected: the Renewal section above sets the
+  7-day ceiling via `auth_time`; this alternative is the no-ceiling form of the
+  same mechanism.
+- **Refresh-token pair with server-side revocation store.** Full control over
+  revocation and per-device sessions, but abandons the stateless simplicity
+  this codebase uses and adds a session store. Not needed now; revisit if
+  revocation becomes a requirement.
