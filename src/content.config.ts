@@ -15,7 +15,7 @@ const docs = defineCollection({
   schema: docsSchema({
     extend: z.object({
       status: z
-        .enum(['Problem', 'Proposed', 'Accepted', 'Superseded', 'Deprecated', 'Rejected'])
+        .enum(['Problem', 'Proposed', 'Accepted', 'Implemented', 'Superseded', 'Deprecated', 'Rejected'])
         .optional(),
       date: z.string().optional(),
       note: z.string().optional(),

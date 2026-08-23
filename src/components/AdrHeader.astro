@@ -9,7 +9,7 @@ interface LinkRef {
 }
 
 interface Props {
-  status?: 'Problem' | 'Proposed' | 'Accepted' | 'Superseded' | 'Deprecated' | 'Rejected';
+  status?: 'Problem' | 'Proposed' | 'Accepted' | 'Implemented' | 'Superseded' | 'Deprecated' | 'Rejected';
   date?: string;
   note?: string;
   extends?: LinkRef;
@@ -30,6 +30,7 @@ const statusVariant = {
   Problem: 'note',
   Proposed: 'note',
   Accepted: 'success',
+  Implemented: 'success',
   Superseded: 'caution',
   Deprecated: 'caution',
   Rejected: 'danger',

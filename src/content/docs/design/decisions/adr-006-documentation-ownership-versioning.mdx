@@ -1,8 +1,11 @@
 ---
-title: "Documentation Ownership, Versioning, and Seam Contracts"
+title: "ADR-006: Documentation Ownership, Versioning, and Seam Contracts"
 description: Where docs live, how they version with code, and how cross-repo seams are documented.
 sidebar:
-  order: 3
+  order: 6
+  badge:
+    text: Proposed
+    variant: note
 status: Proposed
 date: "2026-08-19"
 related:
@@ -81,8 +84,10 @@ and not the deployed site.
 
 ### ADR lifecycle hygiene
 
-- `decisions/` holds **accepted** decisions only; `proposals/` holds Proposed
-  documents with open questions.
+- All ADRs live flat in `decisions/`, one file per number. Lifecycle state is
+  carried by the frontmatter `status` field — `Proposed`, `Accepted`,
+  `Implemented` (accepted and shipped), `Rejected`, or `Problem` — and rendered
+  as a badge in the sidebar, not by which folder the file sits in.
 - Decisions are append-only: change a decision by writing a new ADR and flipping
   the old one's status to "Superseded by ADR-00N". Do not rewrite bodies — git
   history is the versioning. The status line is the only mutable field.
