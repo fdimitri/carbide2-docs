@@ -1,0 +1,127 @@
+---
+title: "ADR-000: A Note on CARB/IDE ADRs"
+description: What an ADR is in this project, how its lifecycle works, and the rules that keep an LLM-authored record honest.
+sidebar:
+  order: 0
+  badge:
+    text: Proposed
+    variant: note
+status: Proposed
+date: "2026-08-24"
+---
+
+import AdrHeader from '../../../../components/AdrHeader.astro';
+
+<AdrHeader {...frontmatter} />
+
+## What an ADR is here
+
+An ADR is a **decision record**: why a decision was made, what was considered,
+and what it costs. It is not a spec, not a tutorial, and not a status tracker.
+The point is that the *why* outlives the chat where the decision was made.
+
+
+## Where we deviate from ADRs, and the reason they're not ADRs
+
+These perhaps ought to be called CDAs (CARB/IDE Decision Artifacts) -- but the
+name ADR gives a hint to an observer whether an LLM or human. As a real life
+human (probably), I am not bound by convention and these ADRs are more artifacts
+from the conversation with an LLM, subsequent decisions, and a rough guide for
+how an implementation must behave.
+
+The ADRs are largely written by an LLM with its understanding of a problem and
+the general way the architecture must be built. It is also an important
+project artifact, both for the LLM and myself. Or even the casual observer.
+
+## The two axes of a decision
+
+A decision has two independent properties, and the frontmatter tracks them
+separately.
+ 
+**`status`** is *currency* — where the decision stands relative to the current
+direction:
+
+- `Exploratory` — a known problem or an undecided area, pre-proposal. Awaiting
+  a decision; does not imply work in flight.
+- `Proposed` — being shaped, not yet ratified.
+- `Accepted` — ratified, the direction to follow.
+- `Implemented` — accepted and shipped (implies `implementation_exists`).
+- `Superseded` — replaced by a later decision.
+- `Deprecated` — still present, no longer preferred. Only a decision that was
+  actually built can be deprecated.
+- `Rejected` — considered and declined. The single exit for anything
+  pre-proposal that does not advance.
+
+**`implementation_exists`** is *whether code ever shipped* — a boolean,
+defaulting to `false`. It records whether the decision ever produced code,
+regardless of `status`.
+
+The two axes exist because the same `status` path can mean two different
+things:
+
+```
+Proposed → Accepted → (implementation_exists: true)  → Superseded
+Proposed → Accepted → (implementation_exists: false) → Superseded
+```
+
+Both end at `Superseded`. The first was built, shipped, then replaced — there
+is real code to migrate or remove. The second was replaced before anyone built
+it — there is nothing to clean up, only a reader to point onward. `status`
+alone cannot tell them apart; `implementation_exists` does.
+
+`implementation_exists` is **vacuous before `Accepted`**. At `Exploratory` and
+`Proposed` there is no ratified decision to build, so `false` carries no weight.
+It becomes meaningful at `Accepted` — a ratified decision that never shipped —
+and again at the terminal states.
+
+`Exploratory` covers both a known problem awaiting a decision and a planned
+area not yet designed. The two are the same lifecycle position, and the word
+carries both without implying a defect.
+
+A rejected ADR opens its body with a one-line reason, so the two cases stay
+distinguishable when scanning: "Rejected: superseded in scope by ADR-024"
+reads differently from "Rejected: the approach does not survive the
+multi-tenant case."
+
+## Git is the implementation record
+
+Do not store the landing git SHA in frontmatter — that denormalizes git into a
+yaml file that will drift. Implementation commits carry the ADR number in the
+message, and the SHA is recovered with:
+
+```
+git log --grep ADR-NNN
+```
+
+`implementation_exists` is an index over that convention, not a substitute for
+git. It only answers "did anyone build this?" — which is the one thing git
+cannot answer at a glance if the branch is gone and the commit unreachable.
+
+## Numbering and naming
+
+- Numbered `adr-NNN-<slug>` in creation order. Never renumber. Gaps are
+  expected and honest.
+- They are called ADRs, not "design artifacts" or a bespoke acronym, because
+  the name already signals "decisions live here, with their reasoning."
+  The form drifts; the signal is the point — especially to an LLM reading the
+  tree.
+
+## What is mutable
+
+A `Proposed` ADR is a draft and may be edited in place while it is being
+shaped. Once a decision has shipped or been acted on, it is history: change it
+by writing a new ADR and flipping the old one's `status`, not by rewriting the
+body. Git history is the versioning; `status` and `implementation_exists` are
+the mutable fields.
+
+## The failure mode these rules exist to prevent
+
+Most ADRs here are drafted by an LLM. That means they are over-confident,
+over-complete, and sometimes wrong about the most checkable fact of all —
+whether the decision ever actually landed. The guard against that is not more
+prose; it is discipline:
+
+- `implementation_exists` is asserted by **reading the code**, never by memory
+  or by trusting an old `Implemented` label.
+- A decision that was accepted but never built is a real state, and it must be
+  visible as `implementation_exists: false`, not papered over.

@@ -15,8 +15,9 @@ const docs = defineCollection({
   schema: docsSchema({
     extend: z.object({
       status: z
-        .enum(['Problem', 'Proposed', 'Accepted', 'Implemented', 'Superseded', 'Deprecated', 'Rejected'])
+        .enum(['Exploratory', 'Proposed', 'Accepted', 'Implemented', 'Superseded', 'Deprecated', 'Rejected'])
         .optional(),
+      implementation_exists: z.boolean().default(false),
       date: z.string().optional(),
       note: z.string().optional(),
       extends: adrLink.optional(),

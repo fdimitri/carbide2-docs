@@ -75,22 +75,37 @@ and enforced in code where possible (the worker already does this with
 endpoint is authoritative for the other. "How did worker vX talk to client vY"
 is answered by reading the contract at the meta commit that pinned both.
 
-### Discussion lives on GitHub, not in the static site
+### Discussions and Issues live on GitHub
 
-ADRs link to a GitHub Discussion/Issue on the owning repo (meta for cross-repo,
-component for single-repo). `carbide2-docs` stays publish-only; `carbide2-site`
-stays marketing/branding. This keeps a review surface that is not the Astro repo
-and not the deployed site.
+ADRs link to a GitHub Discussion/Issue on the owning repo (ALWAYS the meta repo,
+never the component repos -- for now). 
 
 ### ADR lifecycle hygiene
 
 - All ADRs live flat in `decisions/`, one file per number. Lifecycle state is
   carried by the frontmatter `status` field — `Proposed`, `Accepted`,
-  `Implemented` (accepted and shipped), `Rejected`, or `Problem` — and rendered
-  as a badge in the sidebar, not by which folder the file sits in.
-- Decisions are append-only: change a decision by writing a new ADR and flipping
-  the old one's status to "Superseded by ADR-00N". Do not rewrite bodies — git
-  history is the versioning. The status line is the only mutable field.
+  `Implemented` (accepted and shipped), `Rejected`, `Exploratory`, `Superseded`,
+  `Deprecated` — and rendered as a badge in the sidebar, not by which folder
+  the file sits in.
+- **Implementation is a separate axis from status.** `implementation_exists`
+  (frontmatter, defaults to `false`) records whether the decision ever produced
+  code, regardless of its terminal status. Two ADRs can share the identical
+  `Proposed → Accepted → Superseded` path and mean different things:
+
+  - `implementation_exists: true` — accepted, **built**, shipped, then replaced.
+    There is real code to migrate or remove.
+  - `implementation_exists: false` — accepted, then replaced **before anyone
+    built it**. There is nothing to clean up; just point the reader onward.
+
+  `implementation_exists` is only load-bearing for non-`Implemented` statuses;
+  `Implemented` already implies it. Do not store the git SHA in frontmatter —
+  recover it from git. Implementation commits carry the ADR number in the
+  message, and the landing SHA is found with `git log --grep ADR-NNN`.
+- Decisions are append-only in practice: change a decision by writing a new ADR
+  and flipping the old one's status. Bodies are not a sacred text — a `Proposed`
+  ADR may be edited in place while it is still being shaped. Once a decision has
+  shipped or been acted on, git history is the versioning; the status line and
+  the implementation flags are the mutable fields.
 - Write ADRs **at decision time** in the owning repo; avoid retro-documentation
   (ADR-001 is the cautionary example).
 

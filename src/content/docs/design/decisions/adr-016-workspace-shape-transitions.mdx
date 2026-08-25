@@ -1,0 +1,294 @@
+---
+title: "ADR-016: Workspace Shape Transitions, Templates, and the Control Plane Boundary"
+description: The two classes of per-workspace change (patch vs migrate), what a workspace template is, and the invariants that let the user path separate from the operator later.
+sidebar:
+  order: 16
+  badge:
+    text: Proposed
+    variant: note
+status: Proposed
+date: "2026-08-24"
+supersedes:
+  - label: ADR-007 Shell Pod Resource Limits
+    href: /design/decisions/adr-007-shell-pod-resource-limits/
+---
+
+import AdrHeader from '../../../../components/AdrHeader.astro';
+
+<AdrHeader {...frontmatter} />
+
+## Context
+
+The Workspace CR is the only contract between the control plane and the
+operator: Rails writes nothing but Workspace CRs, the operator reads nothing
+but Workspace CRs, and both sides derive everything they need from `spec`.
+That contract was designed for **creation**, and it is silent on **change**.
+
+Today there are two live gaps that force the question:
+
+- **Storage resizing does not exist.** The operator deliberately treats the
+  PVC spec as immutable (`IMMUTABLE_SPEC_KINDS = %i[persistent_volume_claim]`)
+  and only propagates labels on reconcile. Bumping `spec.storageSize` on an
+  existing workspace therefore does nothing; resizing a bound PVC is a
+  `kubectl patch` a human has to remember, and the CR never learns it happened.
+- **Memory/CPU and image do not reach existing workspaces.** A `resources` or
+  `workspaceImageTag` change on the CR is also outside the reconcile path, so
+  the blog's "deploy does not reach existing workspaces" problem repeats for
+  per-workspace shape: there is no expression of "move this workspace from its
+  current shape to this other shape."
+
+The thing that makes the two gaps different is **whether data has to move.**
+Memory is a patch; disk is a migration. That distinction is the whole decision,
+and templates fall out of it.
+
+## Decision
+
+### 1. Two transition classes, one reconcile path
+
+A workspace shape transition is either a **patch** (the object in place
+converges to the new spec) or a **migration** (new object, data copied, then
+cutover). The operator detects both the same way — by comparing `spec` against
+live cluster state — and routes to one of the two paths.
+
+**Patch transitions** (no data movement; update the existing object):
+
+- `resources.requests` / `resources.limits` (CPU/memory)
+- `workspaceImage` / `workspaceImageTag` / `workspaceImagePullPolicy`
+- the workspace **shell** image/tag (the `carbide2-shell` image the shell pod runs)
+- ingress fields
+
+**Migration transitions** (data movement; new object + copy + cutover):
+
+- `storageSize`
+
+Memory is the cheap reference case: patch the Deployment, reconcile, done. The
+existence of that path proves the mechanism before disk asks for the same
+operation with a data-movement suffix.
+
+**Image tags are registry-read; build/push is out of scope.** Both the
+workspace pod and the shell pod have an image, and both are patch transitions —
+roll the relevant pod, no data movement. The available tags are **read from the
+image registry** (the same "list what exists" shape the client picker uses
+against the MinIO tier), so the dashboard/API offers a real set of choices
+rather than a free-text field. What is **not** in scope now is **producing**
+those tags: downloading source, building, and pushing a new image into the
+registry is a separate, later decision. This ADR only covers **selecting and
+applying** tags that already exist in the registry.
+
+### 2. Storage class is deployment-level, not a workspace transition
+
+`storageClassName` is **not** a per-workspace knob and is not offered as a
+transition. It is fixed when carbide is deployed: k3d/k3s-single default to
+`local-path`, k3s-multi defaults to Longhorn, and k3s-single may be deployed
+as Longhorn. The CR's `storageClassName` field is a read-through of that
+deployment choice, not a target the operator migrates toward. Moving between
+tiers is a redeploy/relocation decision, not a per-workspace operation, and
+including it in the template surface would be scope creep.
+
+`storageSize` migration happens **within a tier** and splits by direction:
+
+**Grow** (target larger than live PVC) is **in-place preferred**:
+
+- `allowVolumeExpansion: true` → patch the PVC request in place; the
+  provisioner grows the volume. This is the default. Longhorn and Rancher
+  local-path both support it when the flag is set.
+- `allowVolumeExpansion: false` → copy migration: provision a larger PVC, copy,
+  cutover, retire the old.
+
+**Shrink** (target smaller than live PVC) is **possible only by copy, and only
+when the data fits.** Before a shrink is attempted, control must establish that
+the workspace's current on-disk usage is smaller than the target size:
+
+- If usage fits → copy migration into a smaller PVC, cutover, retire the old.
+- If usage does not fit → the shrink is rejected with a condition stating why
+  ("10Gi used of a 16Gi volume; cannot shrink to 4Gi").
+
+This requires a **disk-usage query**: the workspace (`-server`) must expose a
+cheap API endpoint reporting current project-disk usage, and control calls it
+before authorizing a shrink. The operator does not trust the requested size
+blindly.
+
+### 3. Templates are named presets of CR spec fragments
+
+A **WorkspaceTemplate** is a name → partial `spec`. It is not a new CRD and
+does not carry lifecycle of its own; short-term storage is a ConfigMap in
+`carbide-system`. The Workspace CR remains the single source of truth — a
+template is only how the resolved fields get filled at creation, and how
+"retemplate this workspace" knows its target.
+
+A template carries exactly the fields that are legitimate per-workspace
+**shape**:
+
+- `resources` (CPU/memory, for both the workspace pod and the shell pod)
+- `storageSize`
+
+It does **not** carry image/tag, nor `storageClassName` (deployment-level, see
+above), nor ingress/postgres/git (per-workspace identity, not shape). Image is a
+**transition** (a tag change is a pod rollout), but it is not a **template**
+concern — a template is "how much does this workspace get," not "which build is
+it running." Image/tag changes are handled by the same reconcile mechanism, just
+not expressed as a preset.
+
+Start with four, chosen to prove the mechanism rather than to model a real
+tier catalog:
+
+| Template | Shell-CPU | Shell-RAM | Workspace-CPU | Workspace-RAM | storageSize |
+|---|---|---|---|---|
+| `tiny` | 200m/1C | 128MB/1GB | 200m/1C | 512MiB/1GB | 1GB |
+| `small` | 1000m/2C | 256MB/2GB | 500m/2C | 512MiB/2GB | 4GB |
+| `medium` | 2000m/4C | 512MB/4GB | 1000m/2C | 512MiB/3GB | 16GB |
+| `carbide` | 2000m/6C | 512MiB/12GB | 1000m/2C | 512MiB/3GB | 64GB |
+
+The names and numbers are placeholders. What the first templates must address
+is the two transition classes: `resources` (patch) and `storageSize`
+(migrate). Image is not part of the template surface; it changes through the
+same reconcile path as a direct tag update, not as a preset.
+
+### 4. Storage migration is a state machine, not a patch
+
+The copy path is ordered and reversible at every step until the old PVC is
+deleted. **The copy is the correctness requirement, not an implementation
+detail: the new PVC must contain the same file contents as the old one before
+the Deployment is ever pointed at it.** A cutover to a new volume that is
+empty or partial is the one failure this sequence exists to make impossible.
+
+1. Provision the new PVC at the target size (same StorageClass).
+2. Scale the workspace Deployment to 0 (Recreate strategy, single replica —
+   already the shape).
+3. Copy old → new (a one-shot copy job in the workspace namespace) such that
+   the new volume is a byte-for-byte replica of the old.
+4. Verify the copy — file count and, for text files under a size threshold,
+   content — before touching the Deployment.
+5. Patch the Deployment's volume to reference the new PVC.
+6. Scale back to 1 and verify the workspace is Ready.
+7. Update the CR `spec.storageSize` (it is already the desired value; this is
+   convergence bookkeeping) and only then delete the old PVC.
+
+Rollback up to step 6 is "flip the Deployment back to the old PVC." The old
+PVC is kept until verification succeeds; deletion is the only irreversible
+step, and it happens last. A shrink is authorized only after the disk-usage
+check in section 2 confirms the data fits in the target size.
+
+### 5. Drift detection compares spec to live state, not to generation
+
+The storage trigger is `spec.storageSize != PVC.status.capacity.storage`,
+**not** a CR generation bump. A size change that fails to migrate must keep
+retrying on the next reconcile, not silently converge to "the spec was
+ignored" the way the current immutable-PVC branch does. The same principle
+applies to `resources` and image: the operator reconciles toward spec, and a
+transition in flight is a condition on the CR status, not an error to swallow.
+
+### 6. The user path and the control path stay separate-in-principle
+
+`-control` today is two responsibilities sharing one pod: the **user
+interaction path** (auth, dashboard, project registry, "resize my workspace") and
+the **control machinery** (the operator, CR → k8s reconciliation). They are
+kept combined short-term because the user path is still only the dashboard
+and splitting now is premature.
+
+They separate later by promoting the existing CR seam into a deployment
+boundary: the operator and the CRD are the control plane; Rails + dashboard
+become a web app that holds write access to exactly one CR type. That split is
+cheap **iff** three invariants hold, and they are already the documented
+contract:
+
+1. **The operator stays DB-free.** The moment it reads a `Project` row to get
+   a field, the CR stops being the complete contract and the split requires
+   giving the operator a DB connection.
+2. **Rails writes nothing but Workspace CRs.** A single `kubectl patch pvc`
+   from Rails re-couples the two halves; the storage resize is expressed as a
+   CR `spec` change, never as a direct k8s write.
+3. **The CR stays the complete desired-state contract.** Every field the
+   operator needs to build or migrate lives in `spec`. Resize state that is
+   not in the CR would force the operator to reach outside the seam.
+
+These three invariants are the split; the rest is packaging.
+
+### 7. The shell pod moves to `-control`, superseding ADR-007
+
+[ADR-007 (Shell Pod Resource
+Limits)](/design/decisions/adr-007-shell-pod-resource-limits/) documented shell
+settings in `ProjectSetting` and the worker creating the shell pod. The worker
+has owned shell launching through every backend: **bare-run → docker → kube.**
+In bare-run it spawned the shell directly; in docker it ran `docker exec`; when
+the cluster arrived (~6/2) that responsibility was translated to `kubectl apply`
+via `ProjectPod`, because the kube backend had to work that week and "shell
+still launches" was the priority, not "which process should own shell pods."
+Even if the ownership smell had been noticed then, fixing it would have ranked
+below making the shell work in kube at all. It is inherited responsibility,
+kept through three backends, not a decision that was correct and then broke.
+
+Now that the operator owns every other workspace resource, "the worker shells
+out to `kubectl` to make a pod" is the same worker-reaches-into-the-cluster
+smell the API-not-exec correction targets. **ADR-007 was also never
+implemented**: the `shell_cpu_*` / `shell_mem_*` columns it proposed do not
+exist in `project_settings`, and `project_pod.rb` still hardcodes the same
+limits the ADR opened with. Superseding it here is therefore the first time the
+durable shell-shape source of truth actually lands, not a migration off a live
+implementation. The shell pod becomes a **workspace
+resource**, owned by `-control`'s operator path:
+
+- The worker asks control (an API call) for a shell, instead of `kubectl apply`
+  itself. "Give me a shell for project N" becomes a request to the control
+  plane, not a subprocess the worker spawns against the cluster.
+- Shell shape (image, CPU, memory) lives in the Workspace CR / template, the
+  same as the workspace pod's shape, and is applied by the operator at shell
+  create time.
+- The worker keeps the **PTY streaming** — the one legitimate exec (spawning
+  and streaming `bash`) stays in the shell pod, but the pod itself is
+  provisioned by `-control`, not by the worker reaching into k8s.
+
+## Consequences
+
+**Positive**
+
+- Resizing and re-resourcing become CR edits, so the dashboard/API gets them
+  for free: user path states intent, operator executes, CR stays the record.
+- The patch-vs-migrate split makes the cheap case trivial and isolates the
+  expensive case in one state machine instead of a stack of `kubectl` one-offs.
+- Templates give the dashboard a small, honest surface (pick a preset) without
+  inventing a new kind of object or a second source of truth.
+- The invariants name the exact conditions that keep the future split cheap.
+
+**Negative / to resolve**
+
+- The migration path is real machinery: a copy job, a cutover ordering, and a
+  rollback story — all for a feature (grow disk) that in-place expansion makes
+  a one-line patch when the StorageClass allows it.
+- Drift detection must be careful not to fight in-place expansion: if the
+  provisioner is still growing, `status.capacity` may lag the request, and the
+  operator must not treat "in progress" as "needs copy."
+- `IMMUTABLE_SPEC_KINDS` has to change meaning: it currently means "never touch
+  the PVC spec." It must become "never *blindly* touch the PVC spec; route to
+  the expansion or copy path instead."
+- One more reconciliation contract (the transition conditions on CR status) to
+  keep in sync across the operator and the dashboard.
+
+## Open questions
+
+1. **Copy job shape and correctness check.** A one-shot `rsync`/`tar` sidecar,
+   an init container, or a short-lived Job? The ordering in section 4 requires a
+   byte-for-byte replica and a verification step before cutover; the
+   implementation of both the copy and the verify is open.
+2. **Disk-usage query shape.** Section 2 requires a `-server` endpoint for
+   project-disk usage before a shrink is authorized. Its exact contract (what
+   "usage" means — DBFS text + binary PVC bytes, or PVC bytes only) is open.
+3. **Template storage.** ConfigMap now is the proposal; a CRD becomes worth it
+   only when templates need versioning or their own lifecycle. Revisit if the
+   catalog grows past a handful of static presets.
+
+## Alternatives considered
+
+- **`kubectl` patch for storage (status quo).** Works for a human, invisible to
+  the CR, and leaves drift between desired and actual. Rejected: the CR is the
+  contract, and a resize must be a spec change, not a cluster write.
+- **New WorkspaceTemplate CRD now.** More correct long-term (versioned presets),
+  but adds a second kind of object before the mechanism that consumes it is
+  proven. Rejected in favor of a ConfigMap until templates need lifecycle.
+- **`storageClassName` as a template field / transition.** Attractive for
+  "upgrade to Longhorn," but it is deployment-level, not per-workspace, and
+  the operator has no safe story for cross-node data relocation of an RWO
+  volume. Rejected and explicitly out of scope.
+- **Recreate-on-resize (delete PVC, lose data).** Simplest possible path and
+  obviously wrong for a workspace that holds user state. Not considered except
+  as the thing the migration state machine exists to avoid.
