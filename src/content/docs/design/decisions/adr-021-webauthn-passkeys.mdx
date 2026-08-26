@@ -1,0 +1,132 @@
+---
+title: "ADR-021: WebAuthn / Passkey Login"
+description: "Passkey login is a required authentication path; how credentials are registered and asserted, and how it composes with the existing JWT token model."
+sidebar:
+  order: 21
+  badge:
+    text: Exploratory
+    variant: note
+status: Exploratory
+date: "2026-08-26"
+extends:
+  label: ADR-015 (Authentication Token Ownership & Lifetime)
+  href: /design/decisions/adr-015-authentication-token-ownership/
+---
+
+import AdrHeader from '../../../../components/AdrHeader.astro';
+
+<AdrHeader {...frontmatter} />
+
+## Context
+
+CARB/IDE2 must support **passkey login** (WebAuthn / FIDO2). This is a stated
+requirement, not an open question. A user must be able to register a passkey
+and use it to authenticate to the control plane, receiving the same login
+token the password path already mints.
+
+The rest of the design is deliberately open: attestation, device/platform
+requirements, resident-key policy, whether password stays as a fallback, and
+how registration is gated (during signup, in-session, or both). This ADR is
+a problem statement that fixes the one hard requirement and enumerates the
+decisions that still need making.
+
+The control plane is the single authority for authentication (ADR-015). All
+of this lands in `carbide2-control`, at the same place `Api::SessionsController`
+currently mints the dashboard JWT (`mint_user_token`). A passkey assertion
+must terminate in the same token shape, not a parallel session mechanism.
+
+## The one settled fact
+
+Passkey login must work end to end: a user with a registered passkey can
+assert it and receive a valid control login token (`iss: carbide-control`,
+`aud: control:dashboard`, the same claims `mint_user_token` already emits).
+Nothing about the downstream token model (workspace tokens, worker WS auth,
+ADR-015/018) changes — passkeys are one more way to *obtain* the login token.
+
+## What WebAuthn needs, mechanically
+
+WebAuthn is two ceremonies against the control plane, both driven by the
+browser's `navigator.credentials` API:
+
+1. **Registration** — server issues a challenge + `PublicKeyCredentialCreationOptions`
+   (RP id, user handle, `pubKeyCredParams`, `authenticatorSelection`),
+   the authenticator creates a keypair, and the server stores the credential
+   id + public key (the "credential record") against a user.
+2. **Assertion** — server issues a challenge + `PublicKeyCredentialRequestOptions`,
+   the authenticator signs it, and the server verifies the signature against
+   the stored public key, then mints the login token.
+
+The server-side pieces are therefore: credential storage (credential id, public
+key, sign count, transports), challenge storage (short-lived, one-time), and
+verification (signature, `rpId`, origin, user presence/verification flags).
+
+## Decisions to make (all open)
+
+### Attestation
+
+Do we accept any authenticator (attestation `none`), or verify device
+attestation (Packed / TPM / Android-key / Apple)? For a private, first-party
+product there is no external relying party to satisfy, so attestation is
+probably **not required** — but that is a product decision to record, not
+assume.
+
+### Credential & account model
+
+- One passkey per user, or many (e.g. phone + laptop + security key)?
+- Is a passkey attached to the existing `User` row, or a separate
+  `WebauthnCredential` table keyed by user?
+- Resident (discoverable) keys only, or also non-resident credentials?
+
+### Registration flow
+
+- During signup, in-session (a logged-in user adds a key), or both?
+- Is registration itself protected by the existing password/login token, or
+  open?
+
+### Password as fallback
+
+- Does password login remain alongside passkeys, or do passkeys replace it?
+- Is there a "passkey-first, password for recovery" posture?
+
+### Device / platform policy
+
+- `authenticatorAttachment` (platform vs cross-platform) required or ignored?
+- Any `userVerification` requirement (preferred vs required)?
+
+### Library vs hand-rolled
+
+- Use a gem (e.g. `webauthn-ruby`) or implement the CBOR/COSE verification
+  directly? The verification is well-specified but fiddly; a gem is the
+  usual choice, but it is a dependency decision to make deliberately.
+
+## Explicitly separate
+
+**Devise is not part of this ADR.** The question of whether to drop Devise
+(currently only `database_authenticatable` / `registerable` / `validatable`,
+with password auth hand-rolled in `Api::SessionsController`) belongs to a
+separate *user authentication* decision. Passkeys neither require nor preclude
+keeping Devise; they attach to the same `User` model and mint the same token
+regardless.
+
+## Consequences (once decided)
+
+**Positive**
+
+- One more credential path that terminates in the existing login token, so
+  ADR-015/017/018 are untouched downstream.
+- Passkeys remove password-reuse and phishing as a control-plane login risk.
+
+**Negative / to resolve**
+
+- Credential + challenge storage is new durable state in the control DB.
+- Account recovery becomes the hard question once passwords are no longer the
+  only path (what happens when a user loses every registered device?).
+- RP id / origin handling must be correct across the dashboard's domains
+  (www vs docs vs workspace mounts) or assertions fail at the browser.
+
+## Open questions
+
+The decisions above (attestation, credential model, registration flow,
+password fallback, device policy, library choice) are all open. This ADR
+records the hard requirement and the shape of the remaining decisions; each
+deserves an explicit answer before the status moves past Exploratory.
