@@ -88,8 +88,15 @@ mint valid tokens for any workspace. Therefore:
   but never mint.
 
 The cost is real: this is a key-management surface (keypair generation,
-per-pod public-key distribution, rotation), not a shared string in an env var.
+public-key distribution, rotation), not a shared string in an env var.
 Without it, "workspaces verify but do not mint" is not actually true.
+
+Distribution is **JWKS** (RFC 7517): control publishes its public keys at
+`/.well-known/jwks.json`, each token's header carries a `kid` naming the key
+that signed it, and verifiers fetch + cache the set. Rotation is publish the
+new key, wait one cache TTL, start signing with it, retire the old key later —
+no per-pod distribution mechanism at all. An **unknown `kid`** is a refetch
+signal, not a rejection.
 
 ### Stable identity: control-plane UUIDs in the token, never pod-local ids
 
@@ -186,6 +193,14 @@ Renewal must re-key derived tokens in order: control login token → workspace
 token (re-exchange) → worker WS token (system/reauth). Cross-window renew is
 propagated via a `storage` event listener, because tokens live in shared
 `localStorage` and another window's renew must be noticed without a reload.
+
+**The reauth lead is an invariant over the TTL, not an independent knob.** The
+worker-socket re-auth is pre-emptive: the client attempts `system/reauth` a
+fixed lead time before `exp` (currently ~90s). That lead must stay **strictly
+below the token TTL**, with a floor on the remainder. Because the TTL is a
+configurable settings column, lowering it below the lead would make reauth
+fire continuously from connect. `lead < TTL` is stated, not emergent: the two
+values happen to be compatible today; nothing enforces it.
 
 ### TTL and ceiling are control-side settings columns, not env vars
 
@@ -295,8 +310,9 @@ from the server.
 
 1. **Audience separation** — is `workspace:http` vs `workspace:ws` worth it now,
    or does one `workspace:rw` token serve both?
-2. **Asymmetric key management details** — rotation cadence and how per-pod
-   public keys are distributed (RS256 is decided; the mechanics are open).
+2. **Key rotation cadence and cache TTL** — distribution itself is resolved by
+   JWKS (RFC 7517, see the asymmetric-signing section). Cadence and cache TTL
+   remain open.
 3. **Slug migration for the ingress prefix / `ws-<id>` naming** — **not now.**
    The `/w/<id>/` prefix and operator naming keep the integer for the time
    being. Their retirement is a separate, later change and will use **slugs**,

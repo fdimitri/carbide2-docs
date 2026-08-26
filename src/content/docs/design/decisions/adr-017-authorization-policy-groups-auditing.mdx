@@ -1,0 +1,730 @@
+---
+title: "ADR-017: Authorization Model, Policy Groups, and Audit/Accounting"
+description: Discrete permissions in a shared policy gem, policy-group templates assigned per workspace, JWT-carried effective permissions, one enforcement predicate across control/server/worker, and the decision-as-event seam for audit and accounting.
+sidebar:
+  order: 17
+  badge:
+    text: Exploratory
+    variant: note
+status: Exploratory
+date: "2026-08-24"
+extends:
+  label: ADR-015 (Authentication Token Ownership & Lifetime)
+  href: /design/decisions/adr-015-authentication-token-ownership/
+---
+
+import AdrHeader from '../../../../components/AdrHeader.astro';
+
+<AdrHeader {...frontmatter} />
+
+## Context
+
+There is no role concept and no shared authorization layer across the three
+Ruby surfaces — control (dashboard REST), server (workspace REST), and worker
+(EventMachine WebSocket). Authorization is implemented ad hoc at each call
+site:
+
+- **Server:** `find_project` authorizes by `current_user.projects.find(...)` —
+  an ActiveRecord association ("are you a member"), with no notion of what
+  the member may do.
+- **Worker:** each handler re-implements its own check. Agent
+  `load`/`subscribe`/`stop` call `AgentConversation#visible_to?` (a two-value
+  `project`-vs-`private` predicate hardcoded on the model); `set_visibility`
+  compares `convo.user_id == session.user_id`; chat `message`/`leave` check
+  `room.member?(session.ws)` (session join state, not policy).
+- **Control:** `authenticate_request` resolves the user and stops — there is
+  no authorization at all; membership and project rows exist but no
+  controller consults them for permissions.
+
+The worker and server share one Postgres database and one model tree
+(`ar_boot.rb` `require`s server models directly), but control is a separate
+app and database. That split is why this must be a shared *artifact* rather
+than a file in one repo: three consumers, two of which (server and worker)
+can share code today, but the third (control) cannot.
+
+ADR-015 already fixed the identity half of the contract (control mints,
+workspaces verify). This ADR is the authorization half, and it must land
+before the surface grows further — WebAuthn, SAML, OAuth, and invite-gated
+signup each multiply the call sites that would otherwise re-implement "may
+this principal do this." (Those are authentication mechanisms and are
+deliberately out of scope here.)
+
+**Current dispatch reality.** The worker has a command registry, but it is a
+command→method-name table only. `Command::Dispatcher` holds
+`register 'create', :create` — a string mapped to a symbol to `send` — with
+no atom, no resource loader, no policy metadata. The legacy server's
+`respond_to?("procMsg_#{cmd}")` convention dispatch is long gone (only
+duck-typing `respond_to?` remains). And `FsStore` deliberately opted out of
+the dispatcher entirely: `fs` is routed by a bare `case cmd when 'tree' ...`
+in `FsStore.handle`, not by a registry. So there is **no resource call table
+today** — the thing this ADR needs does not exist yet; it must be grown out of
+the registry that already sits between the wire command and the handler.
+
+## Decision
+
+### 1. Discrete permissions, frozen in a shared gem
+
+The vocabulary of capabilities — `files:read`, `files:write`,
+`files:delete`, `terminal:open`, `chat:send`, `agent:run`,
+`project:settings`, `project:members`, and so on — is a frozen list of
+**atoms**. It lives in a new pure-Ruby gem, `carbide2-policy`, with **no
+Rails or ActiveRecord dependency**.
+
+The vocabulary is code, not data, because the worker must map an action to
+its required atom at check time without a database round trip. If the
+vocabulary lived in a table, every gated WS command would pay a read and the
+worker would re-acquire the policy on every connection.
+
+> **Scale is undetermined, and it changes the design.** The vocabulary could
+> be a handful of atoms or several hundred; no assumption is made here.
+> Several hundred atoms has a concrete consequence for the JWT-carried
+> `perms` claim (§5) and for how the vocabulary is administered — see Open
+> Questions 1 and 7.
+
+### 2. Policy groups are named bundles of atoms; grants are additive
+
+A **policy group** (template) is a name → set of atoms: `developer`,
+`observer`, `admin`, and user-defined templates. Composition is **additive
+only** — the union of atoms, no precedence, no negative grants, no `deny`
+field. Default-deny does the enforcement: an atom not in the effective set is
+simply not granted.
+
+This is a schema discipline, not a mechanism. It is what keeps `flatten` a
+join rather than policy semantics. The moment a negative or overriding grant
+is required, `flatten` promotes from a control-side join into
+`Carbide::Policy.resolve(assignments)` with explicit precedence — a **gem API
+change**, not a vocabulary change (see §9).
+
+Templates are **appended to and retired, never deleted**. A template in use
+is made unassignable rather than removed, for the same reason atoms are never
+dropped from a live vocabulary: deleting a template orphans its assignments
+the way a dropped atom strands code that still checks it.
+
+### 3. Assignment is a template reference or a frozen set — never a delta
+
+A user's assignment in a workspace is one of two shapes, and both coexist:
+
+- **Referenced (A):** `{ user, workspace, template_ref }`. The template is
+  the source of truth; the effective set is re-resolved from it at each mint.
+  Editing the template reaches everyone already assigned, bounded by token
+  TTL.
+- **Detached (B):** `{ user, workspace, template_ref?, resolved_atoms, vocab_version }`. At
+  apply time the template was flattened to atoms and stored; `template_ref`
+  may be kept for provenance but is **not authoritative**. Template edits do
+  not touch detached assignments. The `vocab_version` records which vocabulary
+  the frozen atoms were resolved under — a detached set is only meaningful
+  relative to that version, exactly as a token's `perms` are.
+
+The rule that keeps this clean: **never both as an overlay.** A detached set
+is the result of a detach, not a delta on top of a template. A per-user
+"template plus these extra atoms" is rejected because the delta's meaning is
+relative to the template it was written against — any template edit silently
+reinterprets it, and the drift/rebase question never terminates. Granularity
+is achieved by composing a new template ("developer, but may restart the
+pod"), not by overlaying edits on an assignment.
+
+**Detach is an event, not a column state.** Detaching records who did it,
+when, and against which template version, and stamps the vocabulary version
+the atoms were resolved under. That provenance is the difference
+between an assignment that can be explained a year later and one that can
+only be observed. **Re-attach is refused** — going back means discarding the
+frozen set and adopting the template wholesale; it does not mean "re-attach
+and keep the extras," which is a delta by another name.
+
+### 4. Control owns the data; the gem owns the semantics
+
+The catalog, templates, and assignments are **rows in the control database**
+— mutable, per-workspace, administrative state that exists before and
+independently of any one project server. The gem owns the *meaning*: the
+vocabulary and the enforcement predicate. The boundary is:
+
+- Control answers "what may this user do" (data).
+- The gem answers "which action requires what" (code).
+
+### 5. Effective permissions ride in the JWT
+
+At login / workspace entry, control flattens `user → groups → atoms` into an
+effective set and stamps it into the workspace token:
+
+```json
+{
+  "iss": "carbide-control",
+  "sub": "user:<id>",
+  "aud": "workspace:<id>",
+  "user_id": <id>,
+  "project_id": <id>,
+  "user_uuid": "<uuid>",
+  "project_uuid": "<uuid>",
+  "scope": "workspace:rw",
+  "perms": ["files:read", "files:write", "agent:run"],
+  "vocab_version": 1,
+  "iat": <unix>,
+  "exp": <unix + 5m>
+}
+```
+
+(Shape follows ADR-015: integer `user_id`/`project_id` claims stay alongside
+`user_uuid`/`project_uuid`; `auth_time` is deliberately absent — the workspace
+token carries no `auth_time` per ADR-015. The additions here are `perms` and
+`vocab_version`.)
+
+Server and worker verify the token (the existing path) and authorize from
+`perms` **without a per-command database read and without a mirrored role
+table in the workspace DB**. Revocation stays "stop issuing + short TTL"
+(ADR-015's 5-minute window); a permission removal reaches the workspace the
+same way a membership removal does — next token.
+
+That claim is only true if the worker actually **re-adopts the perm set** when
+it sees a fresh token mid-connection — see §8. The current `Session#reauth`
+refreshes only `token_exp` and deliberately drops every other claim; under
+this ADR that must change or revocation silently misses every long-lived
+socket that keeps reauthing.
+
+**Canonicalization is part of the mint contract.** The `perms` list is sorted
+and deduped before it is stamped. Two mints of the same effective set produce
+the same bytes — which is what makes the connect-time hash a stable drift
+signal (§10).
+
+The worker never learns about group composition. It only ever sees resolved
+atoms, so templates can be redefined in control without touching worker code.
+
+### 6. One predicate, three inputs, a structured decision
+
+Enforcement is a single pure function over plain-data descriptors (never
+ActiveRecord objects, never `current_user`, never a `Session`):
+
+```ruby
+Carbide::Policy.check(principal:, action:, resource:, workspace:)
+  principal = { user_id:, project_id:, perms:, vocab_version: }
+  resource  = { kind:, owner_id:, visibility:, project_id: }
+  workspace = { read_only:, suspended: }   # grows with the model
+
+  # => { allowed:, reason:, principal:, resource:, action: }
+```
+
+- `resource` is a **plain descriptor the caller extracts**, not the model
+  row. This forces an enumeration of exactly which relationship facts policy
+  may consider (`owner_id`, `visibility`, `project_id`) instead of reaching
+  into whatever the model happens to expose — and it lets control call the
+  same code despite having no workspace-DB ActiveRecord models.
+- **Fail-closed relationship check.** `related?` returns `false` for an
+  unknown resource `kind` (never `true`), and a `resource_scoped` action
+  evaluated with no resolved resource **raises** rather than passing. The
+  predicate contract is fail-closed; a gap is "won't start", not "unprotected."
+- `workspace` carries the **workspace-state policy** — the third question
+  ("does the workspace permit this action", e.g. read-only / suspended) that
+  would otherwise be re-implemented beside every enforcement point.
+
+Three inputs, four distinct denial reasons:
+
+- `:not_granted` — the action maps to a known atom the principal does not
+  hold. Normal authorization outcome.
+- `:not_related` — the principal holds the capability but not the resource
+  relationship (not the owner of a private conversation, not a member).
+- `:workspace_denied` — the workspace state forbids the action regardless of
+  the principal's permissions.
+- `:unknown_permission` — the action or its atom is not in *this build's*
+  vocabulary. This is the skew signal (§9), not an ordinary lack of
+  permission; the wiring case is caught at boot (§7), so at runtime it is
+  only skew.
+
+The server and worker share the workspace DB and are the same trust boundary
+— both are downstream of the workspace token. So the server authorizes from
+`perms` **carried in the workspace token**, exactly as the worker does; it does
+not call control per request. Control is upstream of that token and authorizes
+from its own DB (see "Control-plane domain" below). Same resolved atoms,
+different carriers: control = identity token + own DB; server/worker =
+workspace token + `perms` claim.
+
+### 7. Enforcement points, and why the worker's is split
+
+The server and control are single-phase: the controller has the resource
+hand, so a `before_action` can run the whole `check` before the action body.
+
+- **Server (REST):** `Api::BaseController` `before_action` delegates to
+  `check` — capability, relationship, and workspace state in one call. The
+  controller remains the authorization point; it simply does not re-derive
+  the decision.
+- **Control (REST):** the same predicate against control-side descriptors and
+  control-level (workspace-lifecycle) actions, resolved per request (see
+  "Control-plane domain" below).
+
+On the REST surfaces the atom is declared at the enforcement call site — the
+controller names its action's atom as part of the action's contract
+(`authorize! 'files:read', ...`). There is no separate mapping table for REST
+because the controller action *is* the command. The worker alone needs a
+registry, because its wire-command names do not equal atom names (`fs/write`,
+`fs/mkdir`, `fs/rename` all require `files:write`).
+
+**The worker is two-phase, and that is a property of the data, not a defect.**
+`Command.dispatch` receives only `(cmd, session, payload)`. The resource
+descriptor requires the row, and the row is loaded inside the handler
+(`AgentConversation.find_by(uuid: ...)`, `find_entry!(...)`). So the capability
++ workspace-state half is checkable at dispatch, but the relationship half is
+not — it needs the loaded row. A single dispatch-time gate is therefore
+impossible without loading every resource twice.
+
+Two placements for the relationship half, with very different failure
+properties:
+
+- **In the handler (an `authorize!` helper each handler calls).** Restores the
+  exact forget-ability this ADR exists to remove: a handler that skips the
+  call is silently unprotected, a call with `resource: nil` degrades to a
+  capability-only check, and an unknown resource kind can fail open. Three
+  silent gaps in ~twenty lines — the `visible_to?` scatter reproduced.
+- **In the caller (the registry).** The command registry entry carries the
+  policy: atom, whether the action is resource-scoped, and a loader for the
+  resource. Dispatch runs capability + workspace state, then — for
+  resource-scoped commands — calls the loader, runs the relationship check,
+  and passes the loaded row to the handler so it is not fetched twice.
+  Handlers never call `authorize!`; an unregistered handler cannot run
+  authorized by construction.
+
+Direction: **checks in the caller, declared as data.** The registry is the
+policy; the handler is pure business logic. The current `register 'cmd',
+:method` entry becomes:
+
+```ruby
+register 'agent/load',
+  atom:            'agent:read',
+  resource_scoped: true,
+  load:            ->(session, payload) {
+    AgentConversation.find_by(uuid: payload['conversation_id'])
+  },
+  handler:         :load
+```
+
+This is the same registry that already routes wire commands; it simply gains
+policy metadata instead of being a bare string→symbol table. Two structural
+consequences are recorded, not resolved here:
+
+- `FsStore` opted out of the dispatcher (a `case` statement in `FsStore.handle`);
+  it predates the registry and was never migrated under it. It must be
+  migrated for the first time, or remain a special case with its own gate. The
+  former is the direction that does not leave a second enforcement path.
+- A uniform "the registry always loads the resource" does not survive contact
+  with every command, and the worker's real surface shows why: some commands
+  have no resource (`agent/tools`, `term/list`, `debug/subscribe` — capability
+  check only); some load one row (`agent/load` → the conversation); some
+  authorize against a *subtree*, where the relationship fact is the entry plus
+  its descendants (`fs/delete`); some authorize against a predicate over the
+  project, not a row (`fs/import_git` — no entry at all, only `git_url` + the
+  project-emptiness rule); and some authorize against in-memory state rather
+  than the DB (`term/join` → the `TERMINALS` hash). The registry shape must
+  express that variance (no resource / load row / load row + children / custom
+  predicate) rather than pretend every command fits the load-one-row mold.
+
+Regardless of placement, two defaults must be fail-closed:
+
+- `related?` returns `false` for an unknown resource `kind` (never `true`).
+- A `resource_scoped` command dispatched with no resolved resource **raises**,
+  not passes.
+
+These convert the remaining silent gap from "unprotected" into "won't start."
+
+**Boot-time wiring check makes `:unknown_permission` a pure skew signal.** With
+commands registered in the registry, the worker can enumerate
+`registered action → atom` against the vocabulary at startup and refuse to
+boot on a command whose atom is not in the vocabulary. That catches the wiring
+bug (a registered command whose atom is not in the vocabulary) before it can
+serve. What remains at runtime is therefore *only* the skew case — a token
+carrying an atom this build predates — which is exactly what
+`:unknown_permission` should mean, and what the once-per-connection mismatch
+log (§9) is tuned for.
+
+### 8. Reauth re-adopts perms; live subscriptions revalidate
+
+The worker holds its authorization input — `perms` and `vocab_version` — on
+`Session`, read from the token at connect. Two lifecycle rules keep that input
+from going stale relative to control:
+
+**`system/reauth` re-adopts `perms` + `vocab_version`, not just `exp`.**
+Identity (`user_id`) and `project_id` remain pinned — a reauth token that
+changes either is still rejected outright (the existing `same_identity`
+check). But the perm set and vocabulary version are *adopted* from the fresh
+token on every reauth. This is what makes "permission removal reaches the
+workspace on next token" true for a long-lived socket: a socket that reauths
+periodically picks up the new set at each reauth; a socket that never reauths
+hits the expiry sweep and reconnects with a fresh token. Either way the removal
+bites within one TTL. The current `Session#reauth` refreshes only
+`token_exp` — that is a change to the existing contract, not a continuation of
+it.
+
+**On a perm-set change, live subscriptions revalidate.** A socket admitted to
+conversations, files, rooms, terminals, and browser-session subscriptions
+under its *old* perm set must be re-checked against the *new* set, and any
+subscription the principal no longer holds must be pruned. This is the same
+`prune_unauthorized` operation ADR-011 specifies for a `project → private`
+visibility flip, now also triggered by reauth. Subscribe-time is
+policy-gated; reauth is the one moment an already-admitted subscription can
+become stale, so revalidation is the complement that closes the loop.
+
+Reauth is infrequent (one per token TTL), so re-validation cost is not on the
+per-command hot path — but it must run synchronously before `reauth_ok` is
+acknowledged, so the socket is never admitted to a surface under perms it no
+longer carries.
+
+**Reauth failure is not one thing; the response depends on why it failed.**
+
+- **Identity mismatch** (the refreshed token's `user_id`/`project_id` differs
+  from the pinned principal) is **terminal** — a bug or an attack, and no
+  retry fixes it. Close the socket.
+- **Signature / claims / unknown-`kid` failure** is **not** evidence of a dead
+  credential: a stale JWKS public key, clock skew on `exp`/`nbf`, or an
+  un-cached `kid` all reject a perfectly valid token. Refetch the key set once
+  and retry, then fall through to expiry. An **unknown `kid`** is specifically
+  the refetch signal (see ADR-015).
+- **Transport / fetch failure** is retryable to expiry — the existing
+  authentication is still valid until `exp`, and pre-emptive reauth exists
+  precisely so a transient failure can recover without a reconnect.
+- **Every reauth failure is auditable**, always recorded and never sampled — a
+  security event alongside grant changes, not a tier-2 decision event.
+
+A socket that fails to reauth is therefore not silently closed on the first
+failure, nor does it sit doing nothing: it retries within the lead window and
+falls through to the expiry sweep only when the credential actually lapses.
+
+### 9. Vocabulary versioning: skew is the steady state, not an edge case
+
+**Two versioning axes are kept separate.** The **vocabulary version**
+(`VOCAB_VERSION`) versions which atoms exist and their names; it rides the
+token and detached sets because the worker must know "can I interpret this
+atom." The **gem/API version** versions how `check`/`flatten`/`resolve`
+behave and their descriptor shapes; it lives in each component's Gemfile pin
+and never crosses the token boundary — control executes its own `check`, so
+the worker does not need to know control's gem API version, only the atom
+names. `flatten` promoting to `resolve` (or any change to how decisions are
+computed) is an **API** change released as a gem version bump, not a
+`VOCAB_VERSION` bump.
+
+**The two rules are load-bearing for each other.** API skew across the
+control→worker boundary is undetectable by the worker — it has no signal for
+it, and that is tolerable only because the boundary carries atom names and
+nothing else, and the vocabulary is append-only: atoms are never renamed and
+never reinterpreted. If an atom's meaning ever changes, the independence
+argument fails silently and both axes go wrong at once. "Append-only, never
+reinterpret" is therefore the invariant that makes API skew safe, not merely a
+housekeeping preference.
+
+Control and the workspace deploy on separate schedules and pin the gem
+independently, so control minting against vocabulary **A** while the worker
+enforces with **B** is the normal condition. The vocabulary is **append-only**
+and carries a `VOCAB_VERSION`; the token stamps `vocab_version` alongside
+`perms`.
+
+- **Deny-on-unknown** makes skew safe: an atom this build has never heard of
+  is not granted.
+- `:not_granted` ("known atom, absent from set") and `:unknown_permission`
+  ("atom/action not in this vocabulary") are **distinct reasons**, because
+  the second is the skew signal. Collapsing them makes a version mismatch
+  look like an ordinary lack of permission and forces debugging by diffing
+  two `Gemfile.lock`s.
+- A `vocab_version` mismatch between the token and the enforcing build is
+  **logged once per connection**, not once per command — it is a
+  connection-scoped signal and must not become a hot-path spam source.
+
+### 10. The decision is an event; audit and accounting consume it asynchronously
+
+The authorization *request/decision* is an event. The decision value is
+computed once, in memory, on the correctness path; audit and accounting are
+**subscribers** to it, both eventually-consistent, neither on the gate path.
+
+```
+request → decision
+            ├─ gate: allow/deny          (synchronous)
+            └─ event: audit + accounting  (asynchronous)
+```
+
+**Three tiers, not one stream.** Audit is not a single homogeneous stream; it
+is three tiers with different durability, volume, and retention:
+
+1. **Grant changes — durable, append-only, never sampled.** The accountability
+   record: who changed what grant/template/org membership, to whom, when. This
+   is low-volume and human-caused, and it is the *only* tier that cannot be
+   reconstructed from anything else. It is never subject to the sampling rule.
+2. **Authorization requests — the decision events at enforcement points.**
+   High-volume; this is where sampling applies. Denials are always recorded;
+   mutation allows are recorded; read allows are sampled.
+3. **Mints — nothing (or a debugging counter).** A mint reads the current-state
+   tables and carries no decision of its own, so it does not need a durable
+   record of its own.
+
+Provenance is therefore **a query, not a stored thing.** "Why does user U hold
+`files:delete`" is answered by reconstructing the grant/template/org history
+as-of the authorization record's `policy_seq` high-water mark — not by a
+snapshot taken at mint, and not by wall-clock timestamp (the same race the
+seq-ordered log exists to avoid). The authorization record must carry enough
+to join back: user, project, action, resource, outcome, reason,
+`vocab_version`, a `policy_seq` high-water mark (the latest `policy_events.seq`
+at decision time), and a wall-clock timestamp for display. It does not need to
+carry the perm set.
+
+**The causal record is a single event log, not three parallel histories.**
+Reconstruction only works if the histories are append-only and ordered against
+each other. Three per-history sequences do not order across histories (a
+template edit and an assignment change in the same instant), and a wall-clock
+ordering is racy — the same failure as the `file_changes` revision numbering
+ADR-003 already flagged. So the append-only causal record is **one
+`policy_events` table** with a single shared monotonic sequence and a `kind`
+discriminator (`assignment_change` / `template_change` / `org_change`):
+
+- The authoritative *current-state* tables (assignments, templates, orgs)
+  remain what minting reads.
+- `policy_events` is the audit projection of those tables — replay
+  `seq <= T` and there is no cross-history join to get wrong.
+- One caveat, accepted and documented: the shared sequence orders by insert,
+  not commit, so two concurrent transactions can be recorded out of commit
+  order. At this scale, and off the enforcement path, that imprecision is
+  tolerable.
+
+Reconstruction is **forensics-grade, not critical-path.** The worker never
+reconstructs and minting reads *current* state, so a wrong reconstruction
+misleads an investigation but never mis-grants or mis-denies access. That is a
+scoping instruction, not permission to be sloppy: the answer must be
+trustworthy, but it must not grow into a load-bearing subsystem.
+
+**Resolver observability is a log, not a tier of audit.** The one thing the
+three-tier cut otherwise loses is the flattening-bug case: nothing records
+what the resolver actually emitted. Close that with a **connect-time `perms`
+hash**, logged at connect and again on `system/reauth` when the hash changes
+— not per command. Log the hash by default, the full atom set only on
+mismatch. The atom list must be canonicalized (sorted, deduped — §5 makes this
+part of the mint contract) before hashing, or spurious mismatches make the
+drift signal useless. This is an **observability record of a computation**, retained and
+secured like a log, not an accountability record; calling it a fourth audit
+tier would drag it under retention rules it does not need.
+
+**Accounting is metering, not the same as auditing.** Audit records the
+decision and its outcome (who, what resource, what action, allowed/denied,
+and why). Accounting meters *quantities* — agent tokens, shell-pod time,
+disk, API calls. They share the decision as an input but are different data
+domains with different retention.
+
+**Hard quotas are reservations, not metering.** Accounting feeds quota, and
+quota can feed a denial reason — but a meter lagged by the async sink lets a
+burst overrun before it is seen. Soft quotas accept that; hard quotas need a
+synchronous reservation at resource-acquisition time (before shell-pod
+create, before an agent turn). That is a resource-manager mechanism, not a
+faster version of the event sink.
+
+### 11. Distribution
+
+**Future extension — an audit interface in the gem, not an audit implementation.**
+`carbide2-policy` may later gain a `Carbide::Audit` namespace: an `AuditEvent`
+shape and an `emit`/sink interface that every surface (policy decisions, authn
+failures, grant changes) calls through. The gem defines the contract; each
+consumer implements the sink; the predicate itself stays an emitter of
+decisions, not a handler of authn events.
+
+`carbide2-policy` is a new repository. Consumers:
+
+- **control** and **server**: `gem 'carbide2-policy', git: ..., ref: <sha>` —
+  pinned SHA, the same way gems are pinned today.
+- **worker**: nothing extra — it runs `bundle exec ruby worker/worker.rb` and
+  inherits the server's bundle.
+
+**Pin authority is per-component.** Control and server each pin the gem
+independently in their own Gemfile. Nothing forces the two pins to agree, and
+that is accepted rather than engineered away: cross-process skew is the
+steady-state §9 exists to handle, not a defect to remove by centralizing the
+pin. The meta repo does **not** fix a single policy ref and inject it into
+component builds; it may record which refs the components pin as part of its
+known-good manifest, but that is observation, not authority.
+
+Whether the meta repo also adds `carbide2-policy` as a submodule is therefore a
+convenience question, not a distribution one: no consumer reads the submodule
+path (they consume via Bundler), so a submodule only buys the meta repo the
+ability to walk/tag the gem alongside the components. It does not change who
+pins what.
+
+This is a cross-repo seam: the gem is the versioned interface between control
+(minting) and the workspace (enforcement). The pinned-SHA model stands on its
+own, independent of any documentation convention.
+
+## Control-plane domain and organizational scope (open)
+
+There are two authorization domains, not one. Everything above is the
+**workspace domain** — what a principal may do *inside* a running workspace
+(files, agents, terminals, chat), enforced by server + worker and carried in
+what the workspace token stamps. The **control domain** governs the workspace
+*lifecycle* and the organizational structure around it:
+
+- `workspace:create` / `destroy` / `stop` / `start` / `resize`
+- `membership:manage`, `template:manage`
+- `org:manage` and sub-org administration
+
+Control-domain actions are enforced only in control REST. They cannot ride the
+workspace token because they apply even when no workspace pod exists — create
+and destroy precede a pod, resize targets it. They are a separate vocabulary
+partition (`control:*`) in the same gem, sharing the same predicate and group
+mechanism.
+
+**The two domains do not share a distribution mechanism.** Workspace atoms are
+resolved at mint time and carried in the workspace token (§5), so workspace-
+domain revocation is TTL-bounded. Control-domain atoms are resolved **per
+request against control's own DB** — the control token carries identity only,
+and the effective set is computed at check time from local assignment rows.
+That gives the control domain instant revocation (no token to wait out) and no
+`perms` claim to size. It also means control-domain enforcement has no version-
+skew exposure (§9): resolver and enforcer are the same process on the same
+pinned gem, whereas the workspace domain crosses a process/deploy boundary.
+
+**The predicate stays scope-agnostic.** `check` never sees the org tree; it
+sees a resolved effective set plus a resource descriptor. Scope (workspace /
+org / sub-org) is resolved in control *before* the predicate runs. The
+workspace token's `perms` are therefore a projection: control resolves "who is
+this user within this workspace's org tree" into a flat set and stamps it.
+Control-level authorization is upstream of workspace-level authorization; the
+token is the seam.
+
+Open and undecided:
+
+- **Org / sub-org inheritance rule.** A workspace belongs to an org, possibly
+  a sub-org. Control resolution must merge grants down the tree. The flat case
+  (§2) chose additive union with no negative grants; the tree re-opens the
+  question — can a sub-org *restrict* a parent's grant? Pure union down the
+  tree stays additive-only but cannot tighten a child; scope-aware override
+  reintroduces the subtractive/precedence semantics deferred in §2.
+- **Org context under multi-org membership.** A user may belong to more than
+  one org, so org-scoped control actions (`workspace:create` in *which* org)
+  need an org identifier in the resource descriptor. Single-org makes it
+  implicit; many-to-many makes it a required input. Relatedly, the
+  `principal` descriptor's `project_id` is not always present for control-
+  domain checks — there is no project yet at create time — so the descriptor
+  shapes genuinely differ between the two domains rather than being one fixed
+  tuple.
+- **Org policy administration.** Whether org-level grants use the same
+  policy-group/template + assignment model as workspaces, or need a distinct
+  admin surface. Org policy re-raises the A/B detach question (§3) one level
+  up.
+- **Control-domain vocabulary.** The initial `control:*` atom list and its
+  action→atom mapping.
+
+## Consequences
+
+**Positive**
+
+- One vocabulary and one predicate replace four ad-hoc check patterns across
+  three surfaces.
+- Roles/templates are data in control, so administration (new group, new
+  template, per-user assignment) needs no worker or server redeploy.
+- The worker authorizes from JWT claims with no per-command DB read;
+  permission revocation is TTL-bounded by ADR-015's token lifetime, and §8's
+  reauth re-adoption + revalidation is what actually makes a removal bite
+  within that window.
+- The decision-event shape gives audit and accounting a contract now, without
+  coupling their delivery to the gate path.
+- Deny-on-unknown + version stamping makes vocabulary-version skew safe and
+  diagnosable instead of silent. API-version skew is handled differently (it is
+  undetectable across the boundary and is instead made safe by the
+  append-only-never-reinterpret rule — §9).
+
+**Negative / to resolve**
+
+- A new repo + pinned-gem plumbing across control and server (a meta-repo
+  submodule is optional and does not change pin authority — §11).
+- The vocabulary and the action→atom mapping are frozen in code, so adding a
+  capability is a gem release, not a row insert.
+- **The JWT `perms` claim grows with the vocabulary.** This is a real
+  constraint: the worker receives the token as a WS handshake query parameter
+  (`?token=`), so a large `perms` array pushes against URL and header length
+  limits well before it would matter in a body. A hundreds-of-atoms
+  vocabulary forces a compact encoding (bitmask, hashed set, or a mint-time
+  exchange that returns the perms over HTTP instead of the WS URL). Not a
+  problem at a handful of atoms; a real one at several hundred — see Open
+  Question 7.
+- The worker stops reading membership from the DB for authorization and trusts
+  the token's resolved `perms`; a bug in flattening at mint time is a silent
+  over-grant for one TTL.
+- `Session#reauth` and subscription revalidation (§8) are a real change to the
+  worker's connect/lifecycle contract: reauth stops being expiry-only, and a
+  perm-set change must synchronously prune stale subscriptions before the
+  socket is acknowledged.
+
+## Implementation sequence (first slice first)
+
+1. **The gem:** vocabulary + `check` signature + `VOCAB_VERSION`. This is the
+   contract the other codebases build against; nothing else waits on it.
+2. **Token claim first:** assignment storage + templates in control, `flatten`
+   at mint time, `perms` and `vocab_version` in the workspace token. This must
+   land before any enforcement, so the deployed pair emits the claim before
+   anything checks it — a fail-closed gate with no claim to read denies
+   everyone.
+3. **Enforcement hooks (server + control):** thin wrappers over `check`
+   (single-phase, the controller already has the resource in hand), shipped
+   after step 2 is live.
+4. **Worker registry + FsStore migration (one step):** enrich
+   `Command::Dispatcher` entries to the policy-carrying shape in §7 and migrate
+   `fs` off its `case` in the same slice. There must be no window where `fs/*`
+   still bypasses the registry while the rest of the surface enforces — if they
+   cannot land together, `FsStore.handle` gets a temporary default-deny gate
+   until it is migrated. The `fs/delete` subtree and `fs/import_git` predicate
+   cases are what stress the registry shape (§7).
+5. **The decision-event seam** (audit / accounting sinks) and hard-quota
+   reservation — last, and only where a concrete need appears.
+
+Assignment detach semantics (§3) are specified here but can land in step 2 or
+later; they do not block the first slice.
+
+## Open questions
+
+1. **Vocabulary size.** Is the atom count a handful or several hundred? This
+   is the load-bearing unknown: it decides the `perms` encoding (§5) and
+   whether the action→atom map is a hand-maintained table or generated.
+2. The initial **workspace** vocabulary contents and the action→atom mapping
+   table — the one thing the gem cannot ship without enumerating.
+3. Template versioning: are templates themselves versioned/append-only, or is
+   the `vocab_version` stamp on the token sufficient? (Template *edits* are
+   data; the version that matters for skew is the vocabulary version. Whether
+   templates need their own lineage is open.)
+4. **The `policy_events` event log:** whether the single shared sequence vs.
+   the insert-vs-commit ordering caveat needs tightening (cross-history
+   same-instant events are ordered by insert, not commit — forensics-grade is
+   the bar, not critical-path).
+5. **Detached-set vocabulary drift.** A detached assignment pins the
+   `vocab_version` its atoms were resolved under; as the vocabulary appends,
+   a stale detached set silently grants less. Is re-applying the template the
+   sanctioned remedy, or does a detached set need its own "re-resolve against
+   current vocab" path?
+6. The `workspace` input's full field set (read-only, suspended, quota
+   ceilings?) — the principle is settled, the enumeration is not.
+7. The `perms` claim form: atoms vs. group names vs. both, and the compact
+   encoding if the vocabulary is large. Atoms are the enforcing form; group
+   names would be diagnostics only.
+8. Hard-quota reservation mechanism: where the reservation lives and what
+   "before shell-pod create / before agent turn" actually gates.
+9. Audit sink storage and retention per surface (control mints, server REST
+   decisions, worker WS decisions) — and whether the three sinks share one
+   store or stay per-app.
+10. **Control-domain vocabulary** (`control:*`): the atom list for
+    `workspace:create`/`destroy`/`stop`/`start`/`resize`,
+    `membership:manage`, `template:manage`, `org:manage`, and their action→atom
+    map.
+11. **Org/sub-org inheritance rule:** additive union down the tree (consistent
+    with §2) vs. scope-aware override that lets a sub-org restrict a parent's
+    grant. This decides whether §2's additive-only choice survives the
+    hierarchy.
+
+## Alternatives considered
+
+- **Pundit / CanCanCan.** Policy-object frameworks live in the Rails
+  controller/`current_user` world; neither reaches the EventMachine worker's
+  `Command.dispatch` without contorting it. A plain predicate is callable
+  from both.
+- **A shared module in the server tree (no gem).** Works for server + worker
+  (which already share the model tree via `ar_boot.rb`), but control is a
+  separate app and DB and cannot `require_relative` into the server checkout.
+  The three-consumer shape forces a real dependency.
+- **Vocabulary in the database.** Control-authored and mutable without a gem
+  release, but the worker must read it at check time, reintroducing the
+  per-command read the JWT-carried `perms` claim exists to avoid.
+- **`allow?` returning a boolean.** Rejected in favor of a structured decision
+  because the decision is the event audit/accounting consume; a boolean
+  discards the payload and the reason vocabulary.
+- **Roles as a single string on membership (no discrete atoms).** A role
+  string has no stable meaning across surfaces; it is what the current ad-hoc
+  checks are already pretending to be. Discrete atoms + groups is the
+  decomposition that survives federation and future tools.
+- **Per-user deltas over a template.** Rejected (§3): relative meaning, drift
+  on template edit, no terminating rebase rule.
+- **Re-attach with kept extras.** Rejected (§3): a delta by another name.

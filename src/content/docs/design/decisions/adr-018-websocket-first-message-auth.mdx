@@ -1,0 +1,234 @@
+---
+title: "ADR-018: WebSocket First-Message Authentication"
+description: Move worker WebSocket auth off the URL query string and into an in-band first message, so tokens stop leaking into access logs and stop being URL-length-constrained.
+sidebar:
+  order: 18
+  badge:
+    text: Proposed
+    variant: note
+status: Proposed
+date: "2026-08-25"
+extends:
+  label: ADR-015 (Authentication Token Ownership & Lifetime)
+  href: /design/decisions/adr-015-authentication-token-ownership/
+related:
+  - label: ADR-017 (Authorization Model, Policy Groups, and Audit/Accounting)
+    href: /design/decisions/adr-017-authorization-policy-groups-auditing/
+  - label: ADR-019 (Commandset Capabilities & Versioning)
+    href: /design/decisions/adr-019-commandset-caps-versioning/
+---
+
+import AdrHeader from '../../../../components/AdrHeader.astro';
+
+<AdrHeader {...frontmatter} />
+
+## Context
+
+The worker's WebSocket handshake carries the JWT in the URL query string:
+
+```js
+// client
+new WebSocket(`${base}/ws/?token=${encodeURIComponent(token)}&proto=5&min_server=1`)
+```
+
+```ruby
+# worker
+params = URI.decode_www_form(handshake.query_string || '').to_h
+token  = params['token']
+```
+
+This is forced by two facts, but the result has two defects:
+
+- The browser `WebSocket` API cannot set headers — only a URL — and the
+  worker is a bare EventMachine server with no HTTP layer to read one anyway.
+  So the token goes in the query string.
+- **The token lands in access logs.** Traefik/nginx and anything else in
+  front log the full request line, query string included. A bearer credential
+  in the URL is therefore persisted by every proxy in the path.
+- **The token is URL-length-constrained.** ADR-017 stamps a `perms` claim in
+  the workspace token; a large vocabulary inflates the JWT and pushes against
+  URL/proxy limits before it would matter in a header or body.
+
+The worker already does in-band auth for *rotation* (`system/reauth` sends a
+fresh token over the live socket). First-auth in the URL is the only remaining
+credential that crosses in the clear-logged path.
+
+## Decision
+
+### The handshake: three phases
+
+1. **Socket open (`onopen`).** The worker sends one **unsolicited,
+   per-socket** wire-caps frame — transport capabilities only (auth formats,
+   frame version), never the command surface. It is addressed to this one
+   socket, not a broadcast to a set. The client now knows which auth carrier
+   the worker accepts (`wire.uriauth` vs `wire.anonauth`) and can choose how
+   to present its token before committing one.
+2. **Auth.** The client's first frame is `system/auth { token }` — nothing
+   else. The token travels in a WebSocket frame, never in the URL, never in a
+   header, never in an access log (logs capture the upgrade request line, not
+   frame payloads). `system/auth` carries the token only; caps do **not** ride
+   it (the client already holds the wire caps, so there is nothing left to
+   negotiate before auth).
+3. **Promotion.** On success the session upgrades to authenticated: identity,
+   project, and the ADR-017 `perms`/`vocab_version` are pinned, the session
+   joins `SESSIONS_BY_PROJECT`, `system/connected` is sent with the principal,
+   and **then** the normal full capset exchange happens as an authenticated
+   conversation. On failure the socket is closed — exactly as the current
+   bad-token path closes after a failed `?token=` validation.
+
+### Anonymous connects are supported; the URI path is deprecated, not removed
+
+There are two session states, not three: **unauthenticated** and
+**authenticated**. A token-less socket starts unauthenticated and stays that
+way until `system/auth` succeeds. An unauthenticated socket is, by definition,
+anonymous/unknown. If auth fails, the socket is closed. There is no anonymous
+*principal*, no anonymous *perm set*, and no other anonymous command surface.
+
+- **No `?token=` in the URI** → the socket starts unauthenticated; the only
+  meaningful actions are **disconnect** or **send a token that fits the
+  advertised wire caps**.
+- **`?token=` in the URI (legacy)** → establish from the URI token as today
+  (deprecated, below), instead of waiting for the `system/auth` frame.
+
+**Legacy `?token=` acceptance stays for a fixed deprecation window of 60
+days.** The worker keeps accepting a `?token=` in the URI so existing clients
+keep working, but it is marked deprecated and logs a warning on every such
+connect. The URI path is a compatibility shim on the way to removal; new
+clients never use it, and it is removed when the window expires.
+
+Both entry points share **one establishment path**. The session is created
+unconditionally — unauthenticated — at `onopen`, and the URI shim is an
+adapter over the same `establish!` the `system/auth` handler uses:
+
+```ruby
+# pure: token -> principal or nil (validation + pinning only)
+def establish!(token)
+  payload = validate_token(token)
+  return nil unless payload
+  { user_id: ..., project_id: ..., perms: ..., vocab_version: ..., exp: ... }
+end
+
+# session is ALWAYS created unauthenticated at onopen
+ws.onopen do |handshake|
+  token = query_string['token']
+  session = Session.unauthenticated(ws)          # nothing pinned, not in SESSIONS_BY_PROJECT
+  arm_auth_deadline(session)                      # max-time-to-auth timer starts here
+  send_wire_caps(session)                         # one unsolicited, per-socket frame
+
+  if token.present?
+    warn '[ws] token-in-uri is deprecated; use system/auth'
+    principal = establish!(token)
+    principal ? promote(session, principal) : ws.close_connection_after_writing
+  end
+  # no token: wait for system/auth (or the deadline)
+end
+
+# system/auth handler (new path) — the same call, from a frame instead of the URI
+def handle_auth(session, payload)
+  principal = establish!(payload['token'])
+  principal ? promote(session, principal) : ws.close_connection_after_writing
+end
+
+# the ONE promotion path: pin, join, cancel deadline, deliver post-auth state
+def promote(session, principal)
+  session.pin_principal(principal)                 # authed now
+  SESSIONS_BY_PROJECT[principal.project_id] << session
+  cancel_auth_deadline(session)
+  deliver_post_auth(session)                       # connected + term/list + replay
+end
+```
+
+Two paths collapse to one because the session exists from `onopen` and only its
+authed-ness changes; the URI branch is a five-line adapter over `establish!`,
+and removing the deprecation deletes the adapter, nothing else.
+
+**This also removes a latent edge case.** The current worker creates `session`
+only on successful validation and guards `onmessage`/`onclose` with `if
+session` — so a frame arriving before auth completes is silently dropped
+rather than handled. With an always-present session, that "not authed yet"
+case is handled by the dispatcher gate instead of by dropping the message.
+
+### One attempt, and a hard deadline
+
+- **The first frame on an unauthenticated session must be `system/auth`.** Any
+  other frame — well-formed or not — closes the socket. This is a structural
+  rule, not a counter: there is no retry budget to track and no question of
+  whether a malformed frame burns the attempt. A failed `system/auth` is
+  terminal; retry belongs to the client's reconnect loop, not to a
+  half-authenticated socket.
+- **Max-time-to-auth.** If the unauthenticated session has not authenticated
+  within a short window (default **10 seconds**), the worker disconnects it.
+  An unauthenticated session is inert and cannot be held open indefinitely.
+- **Max pending auth sessions.** A tunable cap bounds the number of
+  concurrently-unauthenticated sockets. Invalid commands and invalid auth both
+  disconnect immediately, so the only pile-up is genuinely anonymous pending
+  sockets, and the cap bounds that. Pathological connection floods are left to
+  upstream filtering, not handled here.
+
+### An unauthenticated session can do nothing
+
+Until `system/auth` succeeds, the client may send exactly one command —
+`system/auth` — and may receive exactly one frame — the on-open wire caps.
+No other command set routes, no subscription is possible, no broadcast is
+received, no terminal list or file tree is sent. The gate is **cmd-level
+within `system`**: only `auth` is allowed, not the rest of the `system` set.
+Authentication is the `unauthenticated → authenticated` transition; the same
+state-machine shape ADR-017 already needs for reauth revalidation, so this
+composes with it.
+
+### An authenticated session cannot re-authenticate
+
+`system/auth` is the edge of the `unauthenticated → authenticated` transition
+and does not exist on the far side of it. On an authenticated socket,
+`system/auth` is **refused** (an error, not a re-run of `establish!` and not a
+close): a second establishment would be a principal-change path — a live
+back door around the `same_identity` pin that `system/reauth` enforces.
+
+Post-auth, the only in-band credential operation is `system/reauth`, which is
+identity-pinned and never re-promotes. `auth` establishes; `reauth` refreshes;
+neither does the other's job.
+
+## Consequences
+
+**Positive**
+
+- The token no longer appears in any access log or proxy request line.
+- The URL-length ceiling on the token — and therefore on ADR-017's `perms`
+  claim — is removed. A large perm set can ride an in-band frame of any sane
+  size, or be fetched over the existing HTTP path and adopted in-band.
+- Reuses the `system/reauth` validation path; no second verification code path
+  is introduced.
+- The on-open wire caps tell the client which auth carrier the worker accepts
+  (`wire.uriauth` vs `wire.anonauth`) before it commits a token.
+
+**Negative / to resolve**
+
+- Two-phase handshake: the client must send `system/auth` as its first frame
+  before the socket is useful. This is a small client change (a wire-protocol
+  addition, not a `PROTOCOL` bump — ADR-019 removes that mechanism).
+- An `unauthenticated` session that is not provably inert is a hole: every
+  future command handler must be written against the "not authenticated yet"
+  case, or the dispatcher must gate it centrally (the cmd-level `auth`-only
+  gate does exactly that).
+- Legacy `?token=` acceptance keeps the access-log leak alive for its 60-day
+  deprecation window; it is a deliberate, bounded compromise, not a fix.
+- Debugging a bare socket (e.g. `wscat`) changes — you must send an auth frame
+  rather than paste a URL.
+
+## Alternatives considered
+
+- **Status quo (`?token=`).** Simplest, but leaks the credential to every
+  proxy log and permanently caps the token size at URL limits.
+- **Header auth via an HTTP upgrade layer.** A `fetch`/XHR pre-auth or a
+  `Sec-WebSocket-Protocol` token slot could move the token out of the query
+  string, but the worker has no HTTP auth layer to read headers, and it would
+  add machinery the in-band message already replaces. `system/reauth` proves
+  the in-band path works; extending it to first auth is strictly less new
+  surface.
+- **Retry auth on the same socket.** Rejected: a socket that failed auth is
+  not meaningfully "unauthenticated" anymore, and permissive retry widens the
+  window an unauthenticated connection can exist. One attempt, then close;
+  retry is the client's reconnect loop.
+- **Caps on `system/auth`.** Rejected: the client already holds the wire caps
+  from the on-open frame, so there is nothing left to negotiate before auth.
+  `system/auth` stays `{ token }` only, simple and stable.

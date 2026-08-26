@@ -1,0 +1,186 @@
+---
+title: "ADR-020: The Decider — Capability Resolution & Client Build Selection"
+description: "How the newest compatible client build is chosen from the capset, what the report shape is, and where the Decider runs."
+sidebar:
+  order: 20
+  badge:
+    text: Proposed
+    variant: note
+status: Proposed
+date: "2026-08-26"
+extends:
+  label: ADR-019 (Commandset Capabilities & Versioning)
+  href: /design/decisions/adr-019-commandset-caps-versioning/
+---
+
+import AdrHeader from '../../../../components/AdrHeader.astro';
+
+<AdrHeader {...frontmatter} />
+
+## Context
+
+ADR-019 defines the capset — per-function SemVer capabilities declared at the
+worker's dispatcher registry, advertised on the auth handshake, and mirrored
+into each client build's `manifest.json`. It deliberately stops at the socket:
+advertise, and let the consumer decide.
+
+The Decider is the other consumer. Its job is **build selection**: given a
+worker, serve the client build that actually works against it. Today the
+loader already exists (`SpaController` + `ClientRegistry`) but resolves
+**newest-of-family** — the newest build of the pod's own family, full stop.
+`ClientRegistry::Build#floors` already reads `manifest["floors"]`, but nothing
+consumes it: the "newest whose floor holds" math from the original Decider
+design is not wired in. The `floors` field is superseded by the `caps` field
+(ADR-019 §5) — same manifest slot, new shape.
+
+This ADR makes the Decider a real capability resolver instead of a static
+newest-first picker, and pins down what it must publish so the same facts
+serve three consumers (the loader, the client's own self-check, and a
+headless consumer) with one implementation.
+
+## Decision
+
+### 1. Containment over the published capset
+
+The Decider compares two capsets and answers **"does the candidate cover the
+worker?"** Containment, not equality, and per-function, not scalar:
+
+- A client is **compatible** with a worker when, for every function the
+  worker declares, the client declares the same function at the same major.
+  Minor/patch differences are compatible (per ADR-019 §1).
+- A client may declare **more** than the worker (it is newer). Extra
+  functions are not a mismatch; they are simply never exercised.
+- A client that is **missing** a function the worker declares, or declares
+  it at a different major, is **incompatible**.
+
+Containment is judged per direction (per ADR-019's command/event split):
+client-in must cover worker-in, and client-out must cover worker-out. The
+Decider never compares across direction.
+
+### 2. The report is a per-function mismatch list, not a distance
+
+The useful artifact is **which functions are missing or at the wrong major**,
+not a scalar compatibility score. A report looks like:
+
+```json
+{
+  "compatible": false,
+  "missing":   ["agent:ask_user:out"],
+  "mismatched": [
+    { "fn": "fs:set_contents:in", "worker": "2.1.0", "client": "1.4.0" }
+  ]
+}
+```
+
+A scalar distance is rejected: it cannot tell a user "you are missing
+`agent:ask_user`" from "`fs:set_contents` is one major behind," and those two
+situations have different remedies (rebuild vs. re-ship a feature).
+
+### 3. Two entry points, one comparison
+
+The Decider exposes the same computation through two queries:
+
+- `get_compat_client_list(worker_capset)` → the list of builds, newest first,
+  that are compatible with a given worker capset, with `newest` (the
+  highest compatible) and `exact_match` (same major set, no extras) marked.
+- `get_client_compat(client_capset, worker_capset)` → a full report for one
+  candidate, as in §2.
+
+The loader asks the first; the client's self-check and the headless bridge ask
+the second. One containment implementation, no per-consumer re-implementation
+— the client calls the Decider for its self-check rather than duplicating the
+comparison in another language.
+
+### 4. Inputs are artifacts, not a live socket
+
+Both inputs are already published facts:
+
+- **Worker capset** — enumerated from the dispatcher registry (ADR-019 §5),
+  available without a running connection.
+- **Client capset** — the `caps` field in each build's `manifest.json`,
+  already enumerated by `ClientRegistry`.
+
+The Decider never inspects a live WebSocket. It compares two artifacts, which
+is what lets the loader, the client self-check, and a headless consumer all
+call the same function at different times.
+
+### 5. The report distinguishes removed vs. never-had
+
+An absent key is ambiguous between "this client is too old to have it" and
+"the function was retired." The Decider disambiguates against the worker's
+own cap history (which functions were once declared and are no longer) so the
+report can say **retired** rather than **missing** when that is the truth.
+This is diagnostic provenance only — both cases behave identically at the
+socket (absent = ignore) — but it is what makes the report legible.
+
+## Where the Decider runs (open)
+
+The Decider is currently the workspace pod's `SpaController` (a per-pod Rails
+loader) — and the control plane has its own copy for the dashboard family.
+Whether it stays per-pod or becomes a shared service is open:
+
+- **Per-pod (status quo):** simplest, no cross-pod dependency, but each
+  workspace carries its own loader and there is no single place to reason
+  about the whole cluster's compatibility.
+- **A service in `-control`:** one authority for capability resolution,
+  callable by both the workspace loader and the dashboard, and the natural
+  home for the "which builds should this pod even see" cluster-level view.
+- **A dedicated kube pod/service:** separates the resolver from the Rails
+  request path entirely, at the cost of a new component to operate.
+
+The leaning is toward a `-control` service (or a pod it owns): the Decider is
+a cluster-level fact about builds and pods, not a per-workspace concern. But
+the per-pod loader is the proven first cut and does not need to move before
+the containment math exists.
+
+## Consequences
+
+**Positive**
+
+- "Serve the newest compatible client" becomes a real predicate instead of
+  newest-first.
+- The client's self-check, the loader, and a headless consumer share one
+  comparison with no cross-language duplication.
+- The report is actionable (missing vs. mismatched vs. retired) rather than a
+  scalar to interpret.
+
+**Negative / to resolve**
+
+- The worker capset must be enumerable without a live socket (it is — the
+  registry is boot-time enumerable — but the Decider needs a path to it).
+- `manifest.json` must gain the `caps` field and keep it in sync with the
+  client's actual runtime table (the same single-source-of-truth seam as
+  ADR-019's client mirror).
+- Where the Decider runs (per-pod vs. control service vs. dedicated pod) is
+  open and determines who can call it and when.
+
+## Open questions
+
+1. **Placement.** Per-pod loader, `-control` service, or a dedicated
+   pod/service? (Leaning: `-control` service or a pod it owns; per-pod loader
+   is the proven first cut.)
+2. **Worker capset access.** How does the Decider obtain a worker's capset
+   off-socket — a published artifact alongside the build manifests, an HTTP
+   endpoint on the worker, or a value in the Workspace CR/status?
+3. **Retirement provenance source.** Where does "once declared, now removed"
+   live — the worker's own git history, an emitted cap-history artifact, or a
+   registry-side record?
+4. **Exact-match semantics.** Does "exact match" mean identical major set
+   (no extras), or identical full `major.minor.patch` across every function?
+   The former is the useful selection signal; the latter is diagnostics.
+5. **`floors` → `caps` migration.** `ClientRegistry` and its
+   `Build#floors` / `as_json_h` still emit and read `manifest["floors"]`;
+   the switch to `caps` is a code change, not just a rename in these ADRs.
+
+## Alternatives considered
+
+- **Newest-first (status quo).** Simple, but serves an incompatible client
+  whenever the newest build outruns the worker — the exact failure the Decider
+  exists to prevent.
+- **Scalar compatibility distance.** Rejected: not actionable, and it
+  collapses distinct failure modes (missing vs. mismatched) into one number.
+- **Per-consumer re-implementation.** Rejected: three copies of the same
+  containment in three languages is exactly the drift ADR-019 removes.
+- **Capability negotiation at the socket.** Rejected: the Decider selects
+  builds from artifacts; the socket advertises. Negotiation (multi-version
+  convergence) was already rejected in ADR-019.
