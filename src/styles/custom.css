@@ -92,3 +92,30 @@
     max-width: 14rem !important;
   }
 }
+
+@media print {
+  @page {
+    margin: 20mm 20mm 20mm 25mm; /* Top, Right, Bottom, Left */
+    size: letter;
+  }
+
+  body {
+    font-size: 9.5pt; /* Sets the base font size for print */
+    line-height: 1.5;
+    color: #000;
+  }
+  
+  /* Hide elements you do not want to print */
+  nav, footer, .no-print {
+    display: none;
+  }
+  h2 { 
+    font-size: 1.25em;
+  }
+  h1 {
+    font-size: 1.5em;
+  }
+  h3 {
+    font-size: 1.1em;
+  }
+}
