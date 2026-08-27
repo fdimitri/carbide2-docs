@@ -1,0 +1,164 @@
+---
+title: "ADR-022: The Adversarial Agent Agenda"
+description: "A structured multi-agent forum that scrutinizes documents by forcing disagreement, with a serious mode and a disposable silly mode ('Dinner Party')."
+sidebar:
+  order: 22
+  badge:
+    text: Proposed
+    variant: note
+status: Proposed
+date: "2026-08-27"
+---
+
+import AdrHeader from '../../../../components/AdrHeader.astro';
+
+<AdrHeader {...frontmatter} />
+
+## Context
+
+Documents in this project — ADRs above all — are largely written by an LLM.
+That makes them over-confident, over-complete, and sometimes wrong about the
+most checkable facts (ADR-000 names this exact failure mode). One model
+reviewing its own or a sibling's prose tends to converge on agreement and
+politeness rather than finding the defect.
+
+The useful reviews so far have all been **adversarial**: a second model told
+to check the claims against source, with a quota of defects to find, caught
+real bugs the authoring pass missed. That was done by hand — one model, one
+prompt, one paste at a time.
+
+This ADR proposes making that a first-class, repeatable thing: a structured
+forum of agents with opposing incentives, over a document and read-only
+source, that ends in an adjudicated map of what survives scrutiny. And
+because the mechanic is fun and cheap, it gets a **silly mode** alongside the
+serious one. Silly mode is explicitly disposable.
+
+## The one shared engine
+
+Serious and silly modes are the same engine with different skins. The engine
+is:
+
+1. **Territory = claims.** A document is decomposed into individual claims
+   (a paragraph, a sentence, an invariant). Each agent owns some claims and
+   attacks others.
+2. **Power bar → forced punch.** Contributing (formalizing, clarifying,
+   defending) fills a power bar. When the bar crosses a threshold, the agent
+   **must punch** — name a target claim and give a reason. Agreement is not a
+   terminal state: earning power compels dissent.
+3. **A punch must land.** A valid punch cites read-only source (file:line) or
+   gives a concrete counterexample. Pure opinion whiffs.
+4. **Scoring is human.** The operator (or the community) adjudicates whether a
+   punch lands, and awards points. The bar resets either way.
+5. **The Resolver ends it.** A final agent reads all turns and emits the map:
+   **defended / contested / refuted**, plus the merged formalization.
+
+The forcing function is the power bar: because agreement earns power and
+power compels an attack, the system manufactures the disagreement that
+agreement-seeking models would otherwise suppress.
+
+## Limited, asymmetric toolsets
+
+Every participant is read-only and scoped. No agent can edit the document or
+the source. Crucially, **access is asymmetric and opaque**:
+
+- Each agent can read only a subset of files, granted by the operator.
+- An agent may **not directly request** a file outside its scope; it can only
+  observe that the document references something it cannot see.
+- This is deliberate: it forces claims about "the code says X" to be
+  backed by what the agent can actually reach, or flagged as unverifiable.
+
+The limited toolset is not a restriction to work around; it is part of the
+game — provenance becomes visible in who could and could not have checked a
+claim.
+
+## Serious mode
+
+The engine as-is, aimed at decision quality:
+
+- **Formalizer** — restate claims as testable invariants.
+- **Contrarian** — quota-forced to find `N` defects, each with a reason that
+  must land.
+- **Source-auditor** — indifferent to the prose's truth; only verifies
+  checkable claims against read-only source.
+- **Resolver** — reads the other three, adjudicates, emits the map.
+
+These are not fixed identities so much as objectives the operator assigns per
+run. Models can differ per role, because models have different failure
+profiles and that variance is the point.
+
+## Silly mode — "Dinner Party"
+
+Same engine, party hat. It is **explicitly disposable**: if it stops being
+fun or useful, it gets ripped out and the serious mode is unaffected. The
+gimmicks are the draw:
+
+- **Seats as territory.** You can only punch across the table; changing seats
+  costs power ("spill the wine").
+- **Silenced for turns.** At threshold someone else may mute you; you can
+  watch but not speak.
+- **Riddle turns.** You must state a claim or punch as a riddle; the Resolver
+  has to parse it, and opacity whiffs.
+- **Forced toasts.** Before punching, praise the thing you are about to
+  attack — "with all due respect" as a mechanical prerequisite.
+- **The Resolver is the host.** It keeps the table moving, enforces the
+  gimmicks, and at the end declares who had the best evening — which is
+  secretly the formalization map with a scoreboard on top.
+
+The silly constraints still do work: a riddle forces compression to essence,
+and muting forces turn-taking. It is not throwaway; it is the same engine
+wearing a costume.
+
+## Humans are participants
+
+The forum is not a closed agent loop. Users can watch the live punches, throw
+their own, and — most importantly — be the scorer. The thing that makes this
+worth building over a dry "formalization panel" is that it is legible and
+participatory: a room the team reads and jumps into, not a black box that
+emits a verdict.
+
+## Consequences
+
+**Positive**
+
+- Divergence is structural, not aspirational: the power bar forces dissent
+  instead of hoping models disagree.
+- Verification is grounded: limited read-only toolsets make provenance of a
+  claim visible (who could have checked it).
+- The Resolver's map (defended/contested/refuted) is a better artifact than
+  another agree-y summary.
+- Users participate, which makes design review a shared, legible act instead
+  of an LLM-only ritual.
+
+**Negative / to resolve**
+
+- Turn-based and operator-scored: there is no multi-agent orchestration in the
+  IDE today, so a human relays turns and adjudicates. That is the real cost.
+- Silly mode is a toy that can distract; it must remain deletable without
+  touching the serious engine.
+- Score inflation/gaming is real: if a punch's validity is not enforced
+  (source or counterexample), the game degenerates into noise.
+
+## Open questions
+
+- **Where does it run?** A GitHub issue thread (the existing append-only
+  record) is the low-effort first cut; a pane in the IDE is the eventual
+  home. Does this start as a manual workflow or a product feature?
+- **Claim decomposition.** Who cuts the document into claims — the operator,
+  a seeding agent, or the participants themselves?
+- **Toolset scoping mechanics.** How is per-agent file access expressed and
+  enforced (a declared allowlist, per-run)?
+- **Punch validity.** Source-citation and counterexample are proposed as the
+  only landing punches; is that the right bar, or too strict for prose-heavy
+  docs?
+- **Silly-mode longevity.** Is Dinner Party a permanent fixture or a
+  throwaway that ships once and gets retired?
+
+## Alternatives considered
+
+- **Single-model review (status quo).** Converges on agreement; the power bar
+  exists precisely because this does not surface defects reliably.
+- **Dry role-prompting without a game.** Works but does not force divergence;
+  the game is what turns politeness into a resource that triggers dissent.
+- **A fully automated multi-agent orchestrator.** The eventual shape, but it
+  is premature machinery before the turn/scoring loop has proven itself
+  manually.

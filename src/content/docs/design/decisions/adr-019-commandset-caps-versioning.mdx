@@ -252,8 +252,8 @@ read as precedent for carrying multiple contracts at runtime.
 
 The Decider does containment over the published capset: it serves the newest
 client whose capabilities cover the worker's, and reports the specific missing
-or mismatched caps. Its behavior — `get_compat_client_list` /
-`get_client_compat` report shapes, "newest exact match" vs "newest
+or mismatched caps. Its behavior — `get_compat_list_for_worker(clientSha, workerSha)` /
+`get_compat(clientSha, workerSha)` report shapes, "newest exact match" vs "newest
 compatible", the no-eligible-build case, and how the report exposes
 removed-vs-never-had — is ADR-020, not this one. 019 only obligates itself to
 publish the capset in a form the Decider can consume.
