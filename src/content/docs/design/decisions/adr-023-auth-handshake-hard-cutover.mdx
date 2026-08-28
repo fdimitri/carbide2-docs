@@ -1,0 +1,189 @@
+---
+title: "ADR-023: Auth Handshake Hard Cutover & Control-Plane-Only JWT Minting"
+description: "Drop the ?token= URI path and the legacy server-minted JWT in one hard cutover. First-message system/auth is the only handshake; only -control mints, the worker accepts only control-format tokens, and the client asks only -control. No dual path, no deprecation window."
+sidebar:
+  order: 23
+  badge:
+    text: Proposed
+    variant: note
+status: Proposed
+date: "2026-08-27"
+supersedes:
+  - label: ADR-018 (WebSocket First-Message Authentication)
+    href: /design/decisions/adr-018-websocket-first-message-auth/
+related:
+  - label: ADR-015 (Authentication Token Ownership & Lifetime)
+    href: /design/decisions/adr-015-authentication-token-ownership/
+  - label: ADR-019 (Commandset Capabilities & Versioning)
+    href: /design/decisions/adr-019-commandset-caps-versioning/
+---
+
+import AdrHeader from '../../../../components/AdrHeader.astro';
+
+<AdrHeader {...frontmatter} />
+
+## Context
+
+ADR-018 proposed moving the worker WebSocket token out of the `?token=` URI and
+into an in-band `system/auth` first message, gated behind a 60-day dual path: a
+legacy `?token=` shim alongside the anonymous connect, and both the legacy
+(server-minted) and control-minted JWT formats accepted in parallel.
+
+The dual path is what fails. The on-open wire-caps frame it relied on to "choose
+an auth carrier" arrives after the upgrade URI is already composed, so it cannot
+inform the one choice it existed for; the `?token=` shim keeps the token in the
+access-log path for the entire window; and accepting both JWT formats keeps a
+vestigial minting path (`WorkerTokenIssuer` / `POST /api/projects/:id/ws_token`)
+alive with no consumer benefit.
+
+None of that protects anything real. The client store is ours, the deployment is
+ours, and there is no third-party or installed base outside the MinIO client
+tier. A compatibility window is buying time for a population that does not exist.
+The correct shape is therefore a **hard cutover**: both breakages land at once,
+and anything from before the cutover is deleted rather than carried.
+
+## Decision
+
+### 1. No dual auth path — hard switchover
+
+`?token=` URI auth is removed outright. There is no deprecation window, no legacy
+shim, and no acceptance of a token in the upgrade URI. The worker accepts
+`system/auth` and nothing else as a first credential.
+
+Pre-cutover clients are deleted from the MinIO client tier as part of the
+cutover. There is no installed base to serve and nothing to keep around for
+compatibility. The client store after the cutover contains only builds that speak
+the single-path handshake.
+
+### 2. First-message auth is the only handshake
+
+Every socket starts unauthenticated. The client's first frame must be
+`system/auth { token }`; anything else — well-formed or not — closes the socket.
+On success the worker promotes the session and sends `system/connected` (with the
+full capset; ADR-019 §6). On failure it closes.
+
+ADR-018's on-open wire-caps frame is removed. Under a single-path handshake there
+is no pre-auth carrier decision to inform, so the frame has no job. Caps are
+exchanged post-auth on `system/connected`; the Decider reads the capset off-socket
+over the authenticated HTTPS endpoint (ADR-019 §5).
+
+### 3. The session model and security posture carried forward from ADR-018
+
+The hard cutover changes the transition, not the session mechanics. These
+survive unchanged and are restated because they are load-bearing:
+
+- **Two session states, no third.** `unauthenticated` and `authenticated` only.
+  A token-less socket is anonymous/unknown until `system/auth` succeeds. There is
+  no anonymous *principal*, no anonymous *perm set*, and no anonymous command
+  surface.
+- **One establishment path.** The session is always created unauthenticated at
+  `onopen`, and `establish!` + `promote` are the single establishment path. The
+  URI shim was an adapter over the same call; removing it deletes the adapter,
+  nothing else.
+- **The latent edge case is gone.** Because the session exists from `onopen`,
+  a frame that arrives before auth completes is handled by the dispatcher gate
+  ("not authed yet"), not silently dropped.
+- **One attempt, terminal failure.** A failed `system/auth` is terminal; retry
+  belongs to the client's reconnect loop, not to a half-authenticated socket.
+  There is no retry budget.
+- **Hard deadline.** An unauthenticated session must authenticate within a short
+  window (default **10 seconds**) or the worker disconnects it. A tunable cap
+  bounds the number of concurrently-pending unauthenticated sockets.
+- **`system/auth` is refused post-auth** — as an error, not a re-run of
+  `establish!` and not a close. A second establishment would be a
+  principal-change back door around the identity pin.
+- **`system/reauth` is the only in-band credential operation post-auth.** It is
+  identity-pinned (`same user`, `same project`) and never re-promotes. `auth`
+  establishes; `reauth` refreshes; neither does the other's job.
+
+### 4. Control-plane-only JWT minting
+
+- **Control** is the sole JWT minter.
+- **Worker** accepts only the control format (`iss: "carbide-control"`, with
+  `aud` / `project_id` / `scope` enforced) and rejects the legacy format.
+- **Client** obtains its worker token only from control.
+
+The server-minted path is removed in full: `WorkerTokenIssuer` and
+`POST /api/projects/:id/ws_token` from the workspace server, the legacy claim
+names from the client, and the legacy format from `JWT_CLAIMS.md`.
+`validate_token` loses its "no `iss` = legacy" branch.
+
+This couples the token-format cutover to the handshake cutover. That is
+deliberate: both break the same pre-cutover clients, and neither is worth doing
+in a window that serves a population that does not exist.
+
+#### How the workspace client mints
+
+The workspace client calls control directly — same origin, no CORS, no server
+proxy — and the pieces already exist in the client today:
+
+- The client holds a control bearer in localStorage (`control_auth_token`),
+  written at login before the workspace exchange.
+- It derives the workspace id from the page's own URL: the workspace is mounted
+  at `/w/<id>/`, the loader injects `<base href="/w/<id>/">` from
+  `X-Forwarded-Prefix`, and the id is the path segment after `/w/`.
+- It calls `POST /api/workspaces/<workspace_id>/token` (the existing
+  `workspaceService.getWorkspaceToken`), which control authenticates with the
+  control bearer and answers with a control-format worker JWT.
+
+**`workspace_id` is the control-plane workspace id, not the local canonical
+project id.** The value in `WORKSPACE_PROJECT_ID` (set by the operator from the
+Workspace CR's `projectId`, e.g. `2`) is the control-plane id. Control stamps
+`project_id: <id>` and `aud: "workspace:<id>"`, and the worker rejects any token
+whose `project_id`/`aud` do not match `WORKSPACE_PROJECT_ID`. The workspace pod's
+local `Project.canonical` id is `1` and is unrelated; minting against `1` would
+produce `workspace:1`, which the worker (`WORKSPACE_PROJECT_ID=2`) rejects.
+The client must therefore read the id from its own URL, never from local project
+state.
+
+## Consequences
+
+**Positive**
+
+- One handshake, one token format, one minting authority. The "which carrier /
+  which format / which issuer" matrix disappears from the worker, the client, and
+  the docs.
+- The token never appears in a URL or access log again — immediately, not after a
+  60-day window.
+- `validate_token` shrinks to a single format; `JWT_CLAIMS.md` loses the legacy
+  table; the workspace server loses `ws_token` and `WorkerTokenIssuer`.
+- The worker's capset endpoint (Decider live-refresh) gets a single, clean auth
+  story: control-format only, no legacy branch.
+- The Decider's client store is pre-filtered: every build in MinIO speaks the
+  single handshake, so the "old client" case cannot arise from the store.
+
+**Negative / to resolve**
+
+- A hard cutover has no fallback. If the new handshake has a defect, the answer is
+  a revert-and-redeploy, not "fall back to `?token=`." That is the price of
+  deleting the shim.
+- Both breakages are one atomic cutover. They cannot be rolled back independently
+  after the fact without reinstating the dual path that this ADR removes.
+- The cutover is fleet-wide: the workspace pod (Rails + worker) is the redeploy
+  unit, and the client store is shared across all pods. There is no per-pod
+  gradual rollout; ordering and coordination are mandatory.
+- Deleting the old clients from MinIO is destructive and must be an explicit,
+  approved operation at cutover time.
+
+## Open questions
+
+1. **Cutover ordering.** What is the exact sequence — control minting enabled,
+   workers redeployed, MinIO store swapped and old builds deleted — and what is
+   the acceptable mid-cutover failure mode for a client caught in the window?
+2. **ADR-018 branch state.** The `system/auth` / `wirecaps` / legacy-shim code
+   exists on the ADR-019 branch off ADR-018. Is that branch shipped or throwaway?
+   The answer determines `implementation_exists` on ADR-018 and whether the
+   cutover is "delete code" or "migrate code."
+
+## Alternatives considered
+
+- **ADR-018's dual path (60-day `?token=` shim).** Rejected: the transition's
+  discovery mechanism (on-open wire caps) cannot choose the carrier it exists to
+  choose, and the shim keeps the token leak alive for a window that protects no
+  installed base.
+- **Dual-format JWT acceptance (keep the legacy branch).** Rejected: two formats
+  and two minting authorities exist only to serve pre-cutover clients, which this
+  ADR deletes.
+- **Keep the on-open wire-caps frame.** Rejected: with one auth path there is no
+  pre-auth choice left for it to inform; caps move to `system/connected` and the
+  authenticated HTTPS endpoint.
