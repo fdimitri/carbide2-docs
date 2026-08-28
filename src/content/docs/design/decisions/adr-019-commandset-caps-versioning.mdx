@@ -1,18 +1,20 @@
 ---
 title: "ADR-019: Commandset Capabilities & Versioning"
-description: "Per-function SemVer capabilities declared at the registry and advertised across the handshake (wire caps on open, full capset post-auth). All gating is client-side; the worker advertises only."
+description: "Per-function SemVer capabilities declared at the registry and advertised after authentication. Major is the only gate; minor and patch are recorded, never compared. All gating is client-side; the worker advertises only."
 sidebar:
   order: 19
   badge:
     text: Proposed
     variant: note
 status: Proposed
-date: "2026-08-26"
+date: "2026-08-27"
 related:
   - label: ADR-017 (Authorization Model, Policy Groups, and Audit/Accounting)
     href: /design/decisions/adr-017-authorization-policy-groups-auditing/
-  - label: ADR-018 (WebSocket First-Message Authentication)
-    href: /design/decisions/adr-018-websocket-first-message-auth/
+  - label: ADR-023 (Auth Handshake Hard Cutover & Control-Plane-Only JWT Minting)
+    href: /design/decisions/adr-023-auth-handshake-hard-cutover/
+  - label: ADR-020 (The Decider — Capability Resolution & Client Build Selection)
+    href: /design/decisions/adr-020-decider-capability-resolution/
 ---
 
 import AdrHeader from '../../../../components/AdrHeader.astro';
@@ -41,11 +43,9 @@ either bumps for the whole surface (false-invalidating every unaffected
 consumer) or does not bump (under-stating the one command that did change).
 
 The Decider is a **consumer** of the capset, but its behavior is its own ADR
-(ADR-020). It serves the newest client whose capabilities cover the worker's,
-and reports the specific missing or mismatched caps. This ADR's only
-obligation to it is to publish the capset in a shape it can read. Socket
-negotiation and build selection are two different mechanisms over the same
-facts; this ADR specifies the socket side.
+(ADR-020). This ADR's only obligation to it is to publish the capset in a shape
+it can read. Socket negotiation and build selection are two different
+mechanisms over the same facts; this ADR specifies the socket side.
 
 ## Decision
 
@@ -75,21 +75,57 @@ the two directions are different contracts. `fs:set_contents:in` ("you may
 write", `{path, content}`) and `fs:set_contents:out` ("a peer wrote",
 `{path, content, revision, user_id}`) change independently. A name that flows
 one way has one cap; a request/reply pair is the **same** `:in` cap (the reply
-is correlated to its request and cannot break separately). A peer omits a
-direction it does not implement, and absence means ignore.
+is correlated to its request and cannot break separately). Note that a command
+and its resulting broadcast are not always the same name — `fs/write` (`:in`)
+produces `fs/change` (`:out`), while `fs/set_contents` produces a broadcast of
+the same name. Both are normal; the key is per direction, not per pair.
 
 Compatibility compares same-direction only: `in↔in`, `out↔out`, never across.
 
-- **Major** is the compatibility generation. A major bump means the contract
-  changed in a way an old peer must not assume (a field's meaning changes, a
-  required field is added, a reply changes shape). Different majors are
-  **incompatible**.
-- **Minor** is additive and backward-compatible: a new command, a new optional
-  field with a safe default, a reply field an old reader ignores. Same major,
-  different minor is **compatible**.
-- **Patch** is fully compatible: an implementation fix with no contract
-  change. It does not gate, but it is carried on the wire so a version dump of
-  both ends is immediately comparable.
+- **Major** is the compatibility generation, and **the only component that is
+  compared**. A major bump means the contract changed in a way an old peer must
+  not assume (a field's meaning changes, a required field is added, a reply
+  changes shape). Different majors are **incompatible**.
+- **Minor** is additive and backward-compatible: a new optional field with a
+  safe default, a reply field an old reader ignores. It is **recorded and never
+  compared**.
+- **Patch** is an implementation fix with no contract change. It is
+  **recorded and never compared**, and exists so a version dump of both ends is
+  immediately comparable.
+
+A **new command is a new key**, not a minor bump. It bumps nothing, because
+there is no aggregate version for it to increment. Adding a key is how the
+surface grows; what a peer does about a key it lacks is §2 and ADR-020's
+business, not a version comparison.
+
+#### 1a. What makes minor inert (normative)
+
+Minor is safe to ignore only because both ends are required to tolerate the
+difference. These are requirements, not conventions:
+
+- **Unknown fields are ignored.** A receiver that encounters a field it does
+  not know discards it and processes the rest of the payload. It does not
+  error, and it does not reject the frame.
+- **Absent fields take their declared default.** A receiver that expects a
+  field the sender did not send uses the default from its own declaration. Any
+  field introduced by a minor bump must have a safe default, or it is not a
+  minor bump.
+
+Without these two rules a minor difference is a break in both directions: a
+newer client sends fields an older worker does not know, and expects `:out`
+fields an older worker will never send. With them, neither case is observable.
+
+#### 1b. Patch versus major (normative)
+
+A **patch changes an implementation to match its declared contract.** The
+declared behavior was always what the patch now does; the old build got it
+wrong, and nothing that was actually promised changes.
+
+If the contract itself has to change to describe the fix, it is a **major**.
+There is no middle category. Behavior that was wrong against the declaration
+was never something a peer was entitled to, so restoring it fires no gate.
+
+#### 1c. One supported version
 
 **There is exactly one supported version per function.** No multi-major
 handlers, no ranges, no negotiation to the highest common major. A major bump
@@ -97,18 +133,25 @@ retires the old contract in place: the worker speaks only the new major, and
 an old client loses the function until it runs a newer build.
 
 The reason is not conservative; it is principled. One supported version means
-**one schema** per function. Multi-version support would drag in per-version
-DB/state dependencies and a "which schema goes with which major" matrix — the
-dependency bookkeeping this design exists to avoid, one level down.
+**one schema** per function (§5a). Multi-version support would drag in
+per-version DB/state dependencies and a "which schema goes with which major"
+matrix — the dependency bookkeeping this design exists to avoid, one level
+down.
 
-### 2. Versioning lives on both sides; all gating lives in the client
+### 2. Versioning lives on both sides; all capability gating lives in the client
 
-Both ends declare and advertise a capset. The worker adds **no** enforcement
-on top of advertisement: it does not refuse, suppress, filter, or substitute.
-It serves frames to whoever is connected and assumes well-behaved adult
-clients. Worker-side gating is out of scope for now (see Future direction).
+Both ends declare and advertise a capset. The worker adds **no capability
+enforcement** on top of advertisement: it does not refuse, suppress, filter, or
+substitute *on the basis of caps*. It serves frames to whoever is connected and
+assumes well-behaved adult clients. Worker-side capability gating is out of
+scope for now (see Future direction).
 
-The client does all of the gating, in **both directions**:
+This scoping is deliberate and narrow. **Authorization enforcement is
+unchanged**: the worker still refuses on atoms and filters on resource scope
+exactly as ADR-017 specifies. "The worker does not gate" means it does not gate
+on capabilities, not that it serves anything to anyone.
+
+The client does all of the capability gating, in **both directions**:
 
 - **Outbound — the client must not send a mismatched-major frame.** When a
   function's major differs from the worker's, the client gates its own
@@ -124,15 +167,35 @@ The client does all of the gating, in **both directions**:
 The two gates are one invariant: **a client neither sends nor applies a frame
 whose function's major it does not share.**
 
-### 3. Headless consumers refuse
+A key the client declares and the worker does not is the same gate from the
+other side: the client disables its own affordance, because there is nothing
+to talk to. A key the worker declares and the client lacks needs no gate at
+all — the client has no code for it.
 
-A headless consumer has no UI to grey out. `carbide2-bridge` must **not
-work** on a mismatch — a hard stop at connect. Same rule, different actor:
-the UI client disables; the headless client refuses.
+### 3. The client's declared set is what it needs
 
-Older client against newer worker is not a supported case. The answer to a
-client that does not support the worker's caps is a newer client (the
-Decider's job), not worker logic that contorts to serve it.
+A client declares the caps it intends to talk about, and that declaration is
+its requirement. There is no separate `required` flag: **what a client
+declares is what it needs.**
+
+This convention holds in one direction only, and the asymmetry matters:
+
+- A key the client **does not declare** is out of scope for that client. It
+  does not need it and is not degraded by its absence.
+- A key the client **does declare** is not thereby a requirement on the
+  worker. A client declares a function because it implements it, not because
+  it demands a worker that has it. A declared key the worker lacks is
+  "client is ahead," not "unmet requirement."
+
+`carbide2-bridge` is a client under exactly this rule. It declares its own
+small set (`fs` plus transport) and compares **major on its own declared caps
+only**, ignoring everything else in the worker's capset. It is not a special
+actor with its own refusal semantics; it is a client with a small declaration.
+
+Older client against newer worker is a supported, ordinary state — the worker
+deploys first and clients catch up on their next build. What is *not* supported
+is a major mismatch on a shared key, which is a hard cutover shipped as a meta
+release.
 
 ### 4. Transport features are named caps in `wire`; there is no wire version
 
@@ -141,40 +204,50 @@ of which can be added or removed independently:
 
 ```
 wire.frame: 1.0.0
-wire.uriauth: 1.0.0
 wire.anonauth: 1.0.0
 ```
 
-- `wire.frame` — the envelope (`cs` / `cmd` / `payload`).
-- `wire.uriauth` — auth by `?token=` in the upgrade URI.
+- `wire.frame` — the envelope (`cs` / `cmd` / `payload`). Descriptive rather
+  than gating: parsing the frame that advertises it presupposes agreement on
+  it.
 - `wire.anonauth` — anonymous connect followed by in-band `system/auth`
-  (ADR-018's first-message auth).
+  (ADR-023's first-message auth).
+
+There is no `wire.uriauth` cap: `?token=` URI auth is removed outright
+(ADR-023), so there is nothing to name.
 
 Transport caps live **outside the call table**: they gate *before* a command
 is ever routed, so they are declared alongside the dispatcher rather than as
 registered commands.
 
-The only connect-level gate is **absence of a required transport cap** — two
-peers that share no transport feature for the connection cannot talk — and
-that is expressed as a missing key, not a version comparison. This is the one
-hard break a transport change can cause, and it is the same vocabulary as
-everything else: a cap is present or it is not.
+Two rules govern them, and both apply:
 
-Retirement is removal. When `?token=` auth is retired, the worker simply
-drops `wire.uriauth` from its caps. A client that only speaks `uriauth` then
-fails to connect the same way it fails any missing capability — no wire
-version bump, no special migration path.
+1. **Absence fails the connect.** Two peers that share no transport feature
+   for the connection cannot talk. This is expressed as a missing key, not a
+   version comparison.
+2. **A major mismatch fails the connect.** Transport caps version like
+   functions: `wire.anonauth: 2.0.0` against `1.0.0` is incompatible, the same
+   as any other cap.
+
+Retirement is removal, and removal is a hard cutover (ADR-023): the old key is
+dropped and pre-cutover clients are deleted, so there is no window where the
+worker carries two transport caps for the same purpose. No wire version bump,
+no special migration path.
 
 ### 5. Where the capset lives on each side
 
-**Worker — the dispatcher registry is the cap table.** The
-`Command::Dispatcher` entry carries the cap. This is the same registry
+**Worker — the registries are the cap table.**
+
+The `Command::Dispatcher` entry carries the cap. This is the same registry
 ADR-017 §7 enriches with `atom` / `resource_scoped` / `load` / `handler`; the
-cap is one more field on the same declaration:
+cap is one more field on the same declaration. `set`, `cmd`, and `dir` are all
+derivable — from the registered name, and from the fact that registry entries
+are inbound — so only the version is written:
 
 ```ruby
 register 'agent/load',
-  cap:             { set: 'agent', cmd: 'load', dir: :in, ver: '1.0.0' },
+  cap:             '1.0.0',
+  schema:          { conversation_id: :string },
   atom:            'agent:read',
   resource_scoped: true,
   load:            ->(session, payload) {
@@ -183,80 +256,153 @@ register 'agent/load',
   handler:         :load
 ```
 
-The registry declares the `:in` half (commands). The `:out` half (events) is
-declared at the emitters — the `broadcast`/`send_msg` call sites — because
-events are not routed commands and have no registry entry. Both halves use the
-same `{set, cmd, dir, ver}` shape so one vocabulary covers the full wire.
-Enumerating `registered command → version` at boot gives the `:in` half; the
-`wire.*` transport caps are declared alongside the dispatcher (they gate before
-routing). There is no separate worker-side caps module.
+Writing `set` / `cmd` / `dir` out longhand would reintroduce the drift the
+single declaration site exists to prevent — `register 'agent/load'` with
+`cmd: 'stop'` would be accepted and wrong.
+
+**Worker — emitters get their own registry, on the call path.**
+
+Events are not routed commands and have no dispatcher entry, so the `:out` half
+is not currently enumerable. It gets a registry of its own, and emission goes
+*through* it rather than the registry being a lookup beside it:
+
+```ruby
+emit :fs_change, session, { path:, delta:, revision:, user_id: }
+```
+
+The emitter registry holds the cap and schema for each `:out` key and performs
+the broadcast. A lookup-only registry would leave the same drift on the `:out`
+side that the dispatcher removes on the `:in` side — nothing would force an
+emitter to have an entry. Routing through it makes the entry mandatory by
+construction, which is also what makes `:out` enumerable at boot.
+
+This is a migration, and it is the prerequisite for a complete capset.
 
 **Client — one caps store, three consumers.** The client holds a single
-declared capset, reads the worker's capset from the handshake, and computes
-the disabled set. That one result drives the outbound dispatch gate, the
+declared capset, reads the worker's capset from the handshake, and computes the
+per-key comparison. That one result drives the outbound dispatch gate, the
 inbound handler gate, and the UI affordance — three consumers of one
 computation, not three scattered constants (the current `workerSocket.js`
 scattering of `PROTOCOL` / `MIN_SERVER` is exactly the drift this removes).
 
 **Build artifacts.** The capset is a published, consumable fact on both sides:
 
-- The worker's capset is generated from the registry (enumerated at boot or
-  emitted at build time) and shipped in the handshake blob.
+- The worker's capset is generated from the two registries (enumerated at boot
+  or emitted at build time) and shipped in the handshake.
 - The client's declared capset rides in the `manifest.json` that
   `ClientRegistry` already emits per build (`<family>/<sha>/manifest.json`).
   It is a field in the existing manifest, not a new artifact. It **replaces**
   the existing `floors` field (a leftover of the coarse "server ≥ X, worker ≥
   Y, wire ≥ Z" model this design supersedes).
-- The Decider consumes the worker capset plus client manifests; it never needs
-  a running socket — both inputs are artifacts.
+- The Decider consumes the worker capset plus client manifests; it never
+  inspects a WebSocket. Where the worker capset comes from is ADR-020's concern.
+
+**Publication.** The capset is boot-constant: it is enumerated from the two
+registries when the worker starts and does not change for the process lifetime
+(the worker cannot be hot-patched). It is announced to control on launch, so
+control can compare what is running against what it deployed — a pod that booted
+the wrong image announces the wrong capset. The announcement mechanism is
+unspecified; the Decider-side direction is ADR-020's concern. The client-side
+channel remains `system/connected` (§6).
 
 The client's runtime self-check (against the live worker's handshake caps) and
 the Decider's selection-time check (against the worker capset + client
 manifests) use the same facts in the same shape, obtained at different times.
 One vocabulary, three consumers (client, Decider, headless bridge).
 
-### 6. Exchanged across the handshake in two places
+#### 5a. The schema is part of the declaration
 
-Caps move in two places, and `system/auth` is deliberately **not** one of
-them:
+§1c says one supported version means one schema. That schema is a real field on
+the cap declaration, not a concept:
 
-1. **`onopen`** — the worker sends one unsolicited, per-socket frame carrying
-   **wire caps only** (transport capabilities: auth formats, frame version).
-   This tells the client which auth carrier the worker accepts
-   (`wire.uriauth` vs `wire.anonauth`) so it can choose how to present its
-   token.
-2. **`system/auth { token }`** — carries the token only. Caps do not ride it:
-   the client already holds the wire caps, and auth is simple, stable, and
-   unversioned (ADR-018).
-3. **Post-auth** — after promotion, `system/connected` is sent with the
-   principal, and the normal full capset exchange (functions + wire) happens as
-   an authenticated conversation.
+- **Shape only.** Field names and types. That is enough to adjudicate
+  patch-versus-major (a required field added, a type changed, a field removed)
+  and enough to validate a payload. Nested validation, formats, and
+  constraints are out of scope.
+- **It validates.** The dispatcher checks an inbound payload against the schema
+  before calling the handler; the emitter registry checks an outbound payload
+  before broadcasting. An unenforced schema drifts from its handler within a
+  month and is then worse than no schema, because it looks authoritative.
+- **`:in` now, `:out` with the emitter registry.** The dispatcher already sits
+  in the call path, so `:in` schemas are nearly free. `:out` schemas land with
+  the emitter registry migration.
 
-There is no caps negotiation before auth; there is only advertisement. The
-on-open wire caps front-load the one thing a client must know to decide
-whether to send a token at all.
+The cost curve is why this ships now rather than later: writing the shape while
+writing the handler is a line, and retrofitting shapes across a grown capset
+means reverse-engineering contracts from code — which is exactly the judgment
+§1b would otherwise leave to a per-fix human call with no artifact behind it.
 
-### 7. The shim and the dual path
+### 6. Exchanged after authentication
+
+An anonymous socket can do exactly one thing: `system/auth`. There is no
+unsolicited on-open frame and no pre-auth advertisement.
+
+1. **Connect.** The client opens the socket anonymously — no token in the
+   upgrade URI (ADR-023 hard cutover; `?token=` no longer exists).
+2. **`system/auth { token }`** — carries the token only. Auth is simple,
+   stable, and unversioned (ADR-023), and is never gated by a capset the
+   client has not received yet.
+3. **`system/connected`** — sent on promotion, carrying the principal **and the
+   worker's full capset in a `caps` field**. This is the capset exchange; it is
+   not a separate command, so there is no bootstrap command that would need its
+   own cap.
+
+There is no caps negotiation at any point, before or after auth. There is only
+advertisement.
+
+**Selection-time versus gate-time caps.** The Decider selects a build against
+the worker capset off-socket (ADR-020 §4), and the loader may hand the selected
+client that capset at page load. That copy exists for selection and for the
+client's own self-check. **`system/connected` is authoritative for gating.** A
+client must gate against the caps it received on the socket, never against the
+injected copy.
+
+The two can disagree — the worker can redeploy between page load and connect.
+Behavior in that case is undefined beyond surfacing it: the client shows the
+warning indicator it should have anyway. Whether it reloads, degrades, or
+ignores the difference is not decided here.
+
+### 7. The legacy wire scalar is removed
 
 `PROTOCOL` / `MIN_CLIENT` / `MIN_SERVER` are removed from both sides. There is
 no installed base and the check is advisory, so nothing is lost by deleting
-them.
-
-ADR-018's dual-auth path (`wire.uriauth` alongside `wire.anonauth`) is a
-temporary scaffold for testing older clients during the rollout. It is not a
-versioning mechanism: it exists only until `?token=` auth is retired, at which
-point `wire.uriauth` is dropped and the scaffold is deleted. It must not be
-read as precedent for carrying multiple contracts at runtime.
+them. Transport compatibility is expressed by the named `wire.*` caps (§4),
+never by a scalar.
 
 ### 8. The Decider is a separate ADR and a consumer
 
-The Decider does containment over the published capset: it serves the newest
-client whose capabilities cover the worker's, and reports the specific missing
-or mismatched caps. Its behavior — `get_compat_list_for_worker(clientSha, workerSha)` /
-`get_compat(clientSha, workerSha)` report shapes, "newest exact match" vs "newest
-compatible", the no-eligible-build case, and how the report exposes
-removed-vs-never-had — is ADR-020, not this one. 019 only obligates itself to
-publish the capset in a form the Decider can consume.
+The Decider compares a client build's capset against a worker's, grades the
+result, and selects a build. Its behavior — the comparison arrays, the derived
+flags, the grade model, `get_compat` / `diff_capsets` / `grades_for_worker` /
+`resolve`, the fallback order, and the picker's default-versus-override — is
+ADR-020, not this one. 019 obligates itself only to publish the capset in a
+form the Decider can consume.
+
+## Implementation phases
+
+The decision is one; the implementation lands in dependency-ordered slices.
+The only architecturally new slice is Phase 2 — the emitter registry — because
+the dispatcher already exists and the emitter registry does not. Everything
+downstream of Phase 2 (the Decider's `:out` grades, the client's inbound gate)
+stays `:in`-only until it lands.
+
+- **Phase 0 — dispatcher normalization (prerequisite, no caps).** Migrate `fs`
+  off its own `case` bypass into the dispatcher registry. This is ADR-017 §7's
+  existing requirement; it is what makes the `:in` half enumerable at all.
+  No cap fields yet.
+- **Phase 1 — `:in` caps + wire-scalar removal.** Add `cap:` to dispatcher
+  entries, enumerate `:in` at boot, ship it on `system/connected`, delete
+  `PROTOCOL` / `MIN_CLIENT` / `MIN_SERVER`. Mechanical once Phase 0 lands.
+- **Phase 2 — the emitter registry (`:out`).** Route `broadcast` / `send_msg`
+  *through* the registry (§5), the `emit` DSL, `:out` caps and outbound schema.
+  The long pole: it is new surface, and it unblocks the complete capset.
+- **Phase 3 — client mirror + gating.** Mirror table, outbound dispatch gate,
+  inbound handler gate, UI grey-out. The outbound half is independent of
+  Phase 2; the inbound half needs it.
+- **Phase 4 — transport caps + handshake.** `wire.frame` / `wire.anonauth`,
+  the anon-only handshake. Lands with ADR-023's hard cutover.
+- **Phase 5 — publication to control.** On-launch announcement (§5), mechanism
+  unspecified (see ADR-020 §6).
 
 ## Consequences
 
@@ -264,29 +410,35 @@ publish the capset in a form the Decider can consume.
 
 - A breaking change moves exactly one major number, for exactly the function
   that changed.
-- Additive work is a minor bump — compatible, and visibly recorded.
-- The worker carries no gating logic: it advertises and serves. The only new
-  surface is the capset itself.
-- The registry is a single declaration site for command → cap → policy →
-  handler, so the version table cannot drift from the code that implements it.
-- The client enforces both directions of compatibility with one computed
-  disabled set.
+- Adding a command adds a key and invalidates nothing.
+- Additive field work is a minor bump — compatible by construction (§1a), and
+  visibly recorded.
+- The worker carries no capability gating: it advertises and serves.
+- The registries are a single declaration site for command → cap → schema →
+  policy → handler, so the version table cannot drift from the code that
+  implements it.
+- The client enforces both directions of compatibility from one computation.
 - Transport changes are additive or subtractive by named cap, with no wire
-  scalar to bump and no migration path to invent.
+  scalar to bump and a hard-cutover rule for carrying a transition.
+- The on-launch capset announcement makes deploy drift observable.
 
 **Negative / to resolve**
 
-- Every function handler must be registered (and versioned) to be reachable.
-  The `fs` commandset, which currently bypasses the dispatcher with its own
-  `case` statement, must be migrated into the registry first — the same
+- Every function must be registered (and versioned) to be reachable or
+  emittable. The `fs` commandset, which currently bypasses the dispatcher with
+  its own `case` statement, must be migrated into the registry — the same
   migration ADR-017 §7 already requires.
-- The client needs a mirror of the version table; keeping the two sides'
-  tables in sync is a new seam (mitigated by deriving both from one
-  declaration).
+- Emitters have no registry today. The `:out` half of the capset is not
+  enumerable until that migration lands, and the capset is incomplete until it
+  does.
+- Schemas are new surface. They are cheap per-declaration and enforced in the
+  call path, but they are a real addition to every registration.
+- The client needs a mirror of the version table; keeping the two sides' tables
+  in sync is a new seam (mitigated by deriving both from one declaration).
 - No range support means a major bump is a hard cutover for every client that
-  hasn't adopted it — acceptable only because breaking changes ship as a meta
+  has not adopted it — acceptable because breaking changes ship as a meta
   release (both repos at once), so there is no window where the two sides
-  disagree.
+  disagree on a shared key.
 
 ## Future direction (deferred, not decided)
 
@@ -297,26 +449,34 @@ capset), not new mechanisms, and none reopen the one-version decision:
 1. **The worker gates.** Reject a mismatched-major inbound frame (a
    misbehaving client) rather than serving its one contract to it.
 2. **The worker suppresses.** Stop broadcasting a function's frames to clients
-   that do not share its cap — no frivolous messages.
+   that do not share its cap — no frivolous messages. This is the first thing
+   that requires the worker to know what the client wants to talk about.
 3. **Both sides settle on the active intersection.** Advertisement plus
    self-modification: each end's live surface is exactly what the intersection
    allows, so the worker stops being mean and becomes well-behaved.
+4. **A client declares optional caps.** If a client ever needs to say "I
+   implement X but do not require it," the declared-set-is-required-set
+   convention in §3 gains an explicit flag. Not needed while the convention
+   holds.
 
 None of these is multi-version negotiation. The intersection is over *which
-functions are live*, never over which major to converge on — there is only
-ever one major to offer.
+functions are live*, never over which major to converge on — there is only ever
+one major to offer.
 
 ## Open questions
 
-1. **Wire shape of the caps blob.** Nested (`{agent:{load:{in:"1.0.0"}}}`), flat
-   (`{"agent:load:in":"1.0.0"}`), or an array? Nested matches the commandset
-   structure; flat is simpler to diff.
-2. **Transport cap enumeration.** Is `wire.frame` / `wire.uriauth` /
-   `wire.anonauth` the right starting set, and does the session-state machine
-   need further splitting?
+1. **Wire shape of the caps blob.** Nested (`{agent:{load:{in:"1.0.0"}}}`),
+   flat (`{"agent:load:in":"1.0.0"}`), or an array? Nested matches the
+   commandset structure; flat is simpler to diff.
+2. **Transport cap enumeration.** Is `wire.frame` / `wire.anonauth` the right
+   starting set, and does the session-state machine need further splitting?
 3. **Client mirror mechanics.** Is the client's cap table generated from the
-   same registry (a shared serialized manifest) or hand-maintained in
+   same registries (a shared serialized manifest) or hand-maintained in
    `workerSocket.js`?
+4. **Injected-versus-handshake divergence.** §6 leaves the behavior undefined
+   past the warning indicator. Reload, degrade, or ignore?
+5. **Schema representation.** A plain hash of field → type on the declaration,
+   or a small DSL? Shape-only is settled; the notation is not.
 
 ## Alternatives considered
 
@@ -329,16 +489,22 @@ ever one major to offer.
 - **Multi-version support (accept-both / version sets / SSH-style
   negotiation).** Rejected: one supported version means one schema.
   Multi-version drags in per-version DB/state dependencies and permanent
-  handler multiplicity, and the case it serves (old client against new worker)
-  is the one the Decider exists to prevent.
+  handler multiplicity.
+- **A `required` flag on every cap.** Rejected for now: the client's declared
+  set is its required set (§3), which covers the bridge and the GUI with no
+  extra dimension. Revisit only if a client needs to declare something it
+  implements but does not need.
 - **Commandset-level version (`terminal.v2`).** Rejected: stable primitives
   don't version together; a full remodel is a new namespace, not a bump.
-- **Worker-side gating now.** Deferred, not rejected: it is additive to
-  advertisement and becomes worthwhile when the worker stops assuming
+- **Worker-side capability gating now.** Deferred, not rejected: it is additive
+  to advertisement and becomes worthwhile when the worker stops assuming
   well-behaved clients. See Future direction.
 - **A wire version scalar.** Rejected: named `wire.*` caps express the same
-  facts and can be added or retired independently, so the scalar has no job
-  left.
+  facts and can be added or retired independently.
+- **An unsolicited on-open caps frame.** Rejected: an anonymous socket does
+  `system/auth` and nothing else, and with a single auth path there is no
+  pre-auth carrier choice left for it to inform.
+- **A schema kept as a separate wire document.** Rejected: it reintroduces the
+  drift problem. The schema lives where the cap lives.
 - **Let the Decider do socket negotiation.** Rejected: the Decider picks
-  builds and reports missing caps; it is a consumer of the capset, not the
-  socket gate.
+  builds from artifacts; the socket advertises.

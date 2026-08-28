@@ -1,13 +1,13 @@
 ---
 title: "ADR-020: The Decider — Capability Resolution & Client Build Selection"
-description: "How the newest compatible client build is chosen from the capset, what the report shape is, and where the Decider runs."
+description: "Per-key comparison of two capsets, the grades derived from it, and how the picker selects a grade by default and a sha by override."
 sidebar:
   order: 20
   badge:
     text: Proposed
     variant: note
 status: Proposed
-date: "2026-08-26"
+date: "2026-08-27"
 extends:
   label: ADR-019 (Commandset Capabilities & Versioning)
   href: /design/decisions/adr-019-commandset-caps-versioning/
@@ -20,98 +20,217 @@ import AdrHeader from '../../../../components/AdrHeader.astro';
 ## Context
 
 ADR-019 defines the capset — per-function SemVer capabilities declared at the
-worker's dispatcher registry, advertised on the auth handshake, and mirrored
-into each client build's `manifest.json`. It deliberately stops at the socket:
-advertise, and let the consumer decide.
+worker's dispatcher and emitter registries, advertised on `system/connected`,
+and mirrored into each client build's `manifest.json`. It deliberately stops at
+the socket: advertise, and let the consumer decide.
 
 The Decider is the other consumer. Its job is **build selection**: given a
-worker, serve the client build that actually works against it. Today the
-loader already exists (`SpaController` + `ClientRegistry`) but resolves
+worker, serve the client build that actually works against it. Today the loader
+already exists (`SpaController` + `ClientRegistry`) but resolves
 **newest-of-family** — the newest build of the pod's own family, full stop.
 `ClientRegistry::Build#floors` already reads `manifest["floors"]`, but nothing
 consumes it: the "newest whose floor holds" math from the original Decider
 design is not wired in. The `floors` field is superseded by the `caps` field
-(ADR-019 §5) — same manifest slot, new shape.
+(ADR-019 §5).
 
-This ADR makes the Decider a real capability resolver instead of a static
-newest-first picker, and pins down what it must publish so the same facts
-serve three consumers (the loader, the client's own self-check, and a
-headless consumer) with one implementation.
+The first draft of this ADR asked whether a build was `compatible: true|false`.
+That single bit was doing four jobs at once, and it is why 019 and 020 read as
+contradicting each other — 019 §1 says adding a key invalidates nothing, while
+a boolean has to call the resulting client incompatible. The comparison is
+per-key; the summary is a **grade**, not a bit.
 
 ## Decision
 
-### 1. Containment over the published capset
+### 1. The comparison is three arrays
 
-The Decider compares two capsets and answers **"does the candidate cover the
-worker?"** Containment, not equality, and per-function, not scalar:
+The Decider compares a client capset against a worker capset, per direction
+(`in↔in`, `out↔out`, never across), and produces three lists:
 
-- A client is **compatible** with a worker when, for every function the
-  worker declares, the client declares the same function at the same major.
-  Minor/patch differences are compatible (per ADR-019 §1).
-- A client may declare **more** than the worker (it is newer). Extra
-  functions are not a mismatch; they are simply never exercised.
-- A client that is **missing** a function the worker declares, or declares
-  it at a different major, is **incompatible**.
+- **`missing`** — keys the worker declares that the client does not. The
+  client has no code for these. It runs without them.
+- **`extra`** — keys the client declares that the worker does not. The client
+  is ahead; it disables its own affordances for these.
+- **`mismatched`** — keys both declare, at different **majors**. These are the
+  only real incompatibility.
 
-Containment is judged per direction (per ADR-019's command/event split):
-client-in must cover worker-in, and client-out must cover worker-out. The
-Decider never compares across direction.
+Minor and patch never enter the comparison (ADR-019 §1). Two builds whose
+majors and key sets are identical are compatible regardless of minor or patch,
+which is what makes small build increments cheap: the compatibility-relevant
+projection of a capset is the set of `(key, major)` pairs, and most builds
+collapse onto a handful of distinct projections. Index by that projection, not
+by sha.
 
-### 2. The report is a per-function mismatch list, not a distance
+`missing` and `extra` are opposite facts and must never be collapsed into one
+"keys differ" signal. `extra` is the ordinary state of a client that is ahead
+of its worker; `missing` is the ordinary state of a client that has not caught
+up yet. Treating them as one condition is the same error as the boolean, one
+level up.
 
-The useful artifact is **which functions are missing or at the wrong major**,
-not a scalar compatibility score. A report looks like:
+### 2. The flags are derived; the arrays are the facts
+
+Two flags fall out, and both are conveniences over the arrays:
+
+- `majver_match` = `mismatched.empty?`
+- `key_match` = `missing.empty? && extra.empty?`
+
+There is no `compatible` field. A consumer that only needs "can this talk at
+all" reads `majver_match`; a consumer that needs to explain itself reads the
+arrays. There is also no separate `exact_match` field: with minor and patch
+inert, exact is exactly `majver_match && key_match`, which the grade already
+names.
+
+A report:
 
 ```json
 {
-  "compatible": false,
-  "missing":   ["agent:ask_user:out"],
-  "mismatched": [
-    { "fn": "fs:set_contents:in", "worker": "2.1.0", "client": "1.4.0" }
-  ]
+  "majver_match": true,
+  "key_match":    false,
+  "missing":      ["agent:ask_user:out"],
+  "extra":        [],
+  "mismatched":   []
 }
 ```
 
 A scalar distance is rejected: it cannot tell a user "you are missing
 `agent:ask_user`" from "`fs:set_contents` is one major behind," and those two
-situations have different remedies (rebuild vs. re-ship a feature).
+situations have different remedies.
 
-### 3. Two entry points, one comparison
+### 3. Four grades
 
-The Decider exposes the same computation through two queries:
+The grades are groupings over the arrays. They read `missing` and `extra`
+separately, not through `key_match`:
 
-- `get_compat_client_list(worker_capset)` → the list of builds, newest first,
-  that are compatible with a given worker capset, with `newest` (the
-  highest compatible) and `exact_match` (same major set, no extras) marked.
-- `get_client_compat(client_capset, worker_capset)` → a full report for one
-  candidate, as in §2.
+| Grade | Condition | Meaning |
+| --- | --- | --- |
+| `exact` | no missing, no extra, no mismatched | client and worker declare the same keys at the same majors |
+| `ahead` | extra only | client implements more than the worker offers; it disables those affordances and everything it needs is present |
+| `degraded` | missing present, no mismatched | client lacks keys the worker declares; it runs without them, best-effort |
+| `incompatible` | any mismatched | a shared key at different majors; gates fire |
 
-The loader asks the first; the client's self-check and the headless bridge ask
-the second. One containment implementation, no per-consumer re-implementation
-— the client calls the Decider for its self-check rather than duplicating the
-comparison in another language.
+`degraded` is not a pathological state. It is the ordinary condition of the
+store between a worker deploy that adds a key and the next client build — the
+worker deploys first, clients catch up. Invalidating degraded builds as serve
+targets would mean adding one command makes every existing build unservable
+until a rebuild lands, which is the global-invalidation failure the per-function
+scheme exists to avoid. **Degraded builds are servable.**
 
-### 4. Inputs are artifacts, not a live socket
+`incompatible` is the hard case, and it only arises from a major bump on a
+shared key — which ships as a meta release (ADR-019), so both sides move at
+once and the state is not supposed to be reachable in a healthy deployment.
 
-Both inputs are already published facts:
+### 4. Selection: grade by default, sha by override
 
-- **Worker capset** — enumerated from the dispatcher registry (ADR-019 §5),
-  available without a running connection.
+The picker does not present a pile of shas. It presents grades.
+
+- **Default** — the caller selects a **grade**; the Decider resolves it to the
+  newest build in that grade. "Give me the newest thing that definitely works"
+  is one choice, not a compatibility judgment.
+- **Override** — a specific sha, for testing, reproducing, or deliberately
+  running an older build. This is the existing `?client=family@sha` pin path,
+  unchanged. Default is the grade; the pin is the escape hatch.
+
+This upgrades the current default from "newest of family" to "newest in the
+selected grade" without touching the override path.
+
+**Re-resolution is the point.** A grade preference is a standing instruction to
+keep tracking: it re-resolves when builds land in the store and when the worker
+capset changes, and getting a different sha after a deploy is the Decider
+working, not drift. A sha pin is stable by construction; a grade is not, and is
+not meant to be.
+
+**Fallback.** When the selected grade is empty, selection walks down:
+
+```
+exact → ahead → degraded
+```
+
+`ahead` is the first fallback because nothing the worker declares is unmet
+there — falling to it costs the caller nothing they asked for. `degraded` is
+below it because the client is genuinely missing something the worker offers.
+`incompatible` is **never** a fallback target and is never resolved to a
+default; running one is a deliberate sha override.
+
+**Ordering within a grade is newest-first.** "Closest compatible" means the
+next grade down, not a distance metric — there is no ordering over "three extra
+`:out` keys" versus "one extra `:in` key," and inventing one would be the
+scalar distance this ADR rejects.
+
+**The served grade is reported.** When selection falls back, the result carries
+both the requested grade and the served grade. Silently serving `ahead` to a
+caller who asked for `exact` makes a satisfied preference indistinguishable
+from a fallback.
+
+### 5. The function surface
+
+```
+diff_capsets(a, b)        → { missing, extra, mismatched }   symmetric, raw
+get_compat(worker, client) → diff + { majver_match, key_match, grade }
+grades_for_worker(worker)  → { exact: sha|nil, ahead: sha|nil, degraded: sha|nil }
+resolve(grade, worker)     → { sha, requested_grade, served_grade }
+unservable_builds(worker)  → builds that are incompatible
+```
+
+`get_compat` is a wrapper over `diff_capsets` — the diff is directionless, and
+`get_compat` assigns meaning to each residue by direction. `grades_for_worker`
+is what the picker binds to. `resolve` is the default selection path including
+fallback.
+
+`grades_for_worker` returns no entry for `incompatible`: it is not a grade you
+resolve into, it is the set of builds that fail, with no useful ordering.
+
+**GC.** `unservable_builds` bounds to **incompatible only** — builds with a
+major mismatch against the worker. Degraded builds are runnable and must not be
+collected; a deliberate pin to one is a choice, and GC'ing it silently upgrades
+the user out of a build they chose. Pins self-heal when a build genuinely does
+not exist (the loader falls back to the default grade), which is the correct
+recovery for a dead build and the wrong outcome for a live degraded one.
+
+Because the build store is per-deployment rather than global, "unservable"
+is a per-deployment question and has no project-wide answer.
+
+### 6. Inputs: client manifests and the worker capset
+
 - **Client capset** — the `caps` field in each build's `manifest.json`,
   already enumerated by `ClientRegistry`.
+- **Worker capset** — must be available to the Decider in the same known shape.
+  Where it comes from is not decided here; it is deferred with the placement
+  question and is the Decider's own problem.
 
-The Decider never inspects a live WebSocket. It compares two artifacts, which
-is what lets the loader, the client self-check, and a headless consumer all
-call the same function at different times.
+The Decider never inspects a live WebSocket. The client input is the manifest
+store; the worker input is a capset in the same shape, obtained at selection
+time.
 
-### 5. The report distinguishes removed vs. never-had
+**Potential direction (worker push on launch).** The worker's capset is
+boot-constant (ADR-019 §5) and cannot be hot-patched, so the worker can announce
+it to control once at launch rather than being polled. Control launched the pod
+and already knows what it deployed; the announcement lets it compare the
+*actual* capset against the *configured* one, detecting a wrong-image boot. This
+resolves the worker-input question without a per-worker polling loop and without
+the Decider minting a workspace-scoped credential per pod on every refresh. It
+is a direction, not a decision — the mechanism is unspecified.
 
-An absent key is ambiguous between "this client is too old to have it" and
-"the function was retired." The Decider disambiguates against the worker's
-own cap history (which functions were once declared and are no longer) so the
-report can say **retired** rather than **missing** when that is the truth.
-This is diagnostic provenance only — both cases behave identically at the
-socket (absent = ignore) — but it is what makes the report legible.
+The loader may hand the selected client the worker capset it used for
+selection. That copy is for selection and self-check only — **`system/connected`
+is authoritative for gating** (ADR-019 §6), and the two can disagree if the
+worker redeploys between page load and connect.
+
+### 7. No retirement provenance
+
+An earlier draft had the Decider distinguish "retired" from "never had it"
+against the worker's cap history. That section is removed: the ambiguity only
+exists when looking at one capset alone. With both capsets in hand the
+direction is unambiguous — a key the client declares and the worker does not is
+`extra`, and the report already says so.
+
+Storing history would also be the only backward-looking artifact in a design
+where everything else is a snapshot of what is true now, and a `dropped_at`
+field would need writing at exactly the moment someone is deleting a line —
+the least likely moment for bookkeeping to happen. Per-deployment stores leave
+no way to bound retention either.
+
+What this gives up is a client-side diagnostic ("was this dropped, or did I
+never have a worker with it?"), which no client can answer without history
+wherever that history lives.
 
 ## Where the Decider runs (open)
 
@@ -120,67 +239,80 @@ loader) — and the control plane has its own copy for the dashboard family.
 Whether it stays per-pod or becomes a shared service is open:
 
 - **Per-pod (status quo):** simplest, no cross-pod dependency, but each
-  workspace carries its own loader and there is no single place to reason
-  about the whole cluster's compatibility.
+  workspace carries its own loader and there is no single place to reason about
+  the whole cluster's compatibility.
 - **A service in `-control`:** one authority for capability resolution,
-  callable by both the workspace loader and the dashboard, and the natural
-  home for the "which builds should this pod even see" cluster-level view.
+  callable by both the workspace loader and the dashboard.
 - **A dedicated kube pod/service:** separates the resolver from the Rails
   request path entirely, at the cost of a new component to operate.
 
-The leaning is toward a `-control` service (or a pod it owns): the Decider is
-a cluster-level fact about builds and pods, not a per-workspace concern. But
-the per-pod loader is the proven first cut and does not need to move before
-the containment math exists.
+The leaning is toward a `-control` service (or a pod it owns): the Decider is a
+cluster-level fact about builds and pods. But the per-pod loader is the proven
+first cut and does not need to move before the comparison exists.
 
 ## Consequences
 
 **Positive**
 
-- "Serve the newest compatible client" becomes a real predicate instead of
-  newest-first.
-- The client's self-check, the loader, and a headless consumer share one
-  comparison with no cross-language duplication.
-- The report is actionable (missing vs. mismatched vs. retired) rather than a
-  scalar to interpret.
+- "Serve the newest compatible client" becomes a real predicate — and it turns
+  out to be four predicates, which is why it never resolved as one.
+- Adding a key to the worker does not invalidate the store; those builds grade
+  `degraded` and stay servable.
+- The picker's choice is coarse (a grade) instead of a pile of shas, and the
+  sha path survives as the override.
+- The report is actionable (missing vs. extra vs. mismatched) rather than a
+  scalar or a bit.
+- The client's self-check and the loader share one comparison with no
+  cross-language duplication.
 
 **Negative / to resolve**
 
-- The worker capset must be enumerable without a live socket (it is — the
-  registry is boot-time enumerable — but the Decider needs a path to it).
-- `manifest.json` must gain the `caps` field and keep it in sync with the
-  client's actual runtime table (the same single-source-of-truth seam as
-  ADR-019's client mirror).
-- Where the Decider runs (per-pod vs. control service vs. dedicated pod) is
-  open and determines who can call it and when.
+- The worker capset is only as complete as ADR-019's registries. Until the
+  emitter registry migration lands, the `:out` half of every comparison is
+  empty and grades are computed on `:in` only.
+- `manifest.json` must gain the `caps` field; `ClientRegistry` and its
+  `Build#floors` / `as_json_h` still emit and read `manifest["floors"]`. The
+  switch is a code change, not a rename in these ADRs.
+- A grade preference is state the sha pin never needed. Where it lives, and
+  whether it is per-user or per-pod, is undecided.
+- Where the Decider runs is open and determines who can call it and when.
 
 ## Open questions
 
 1. **Placement.** Per-pod loader, `-control` service, or a dedicated
-   pod/service? (Leaning: `-control` service or a pod it owns; per-pod loader
-   is the proven first cut.)
-2. **Worker capset access.** How does the Decider obtain a worker's capset
-   off-socket — a published artifact alongside the build manifests, an HTTP
-   endpoint on the worker, or a value in the Workspace CR/status?
-3. **Retirement provenance source.** Where does "once declared, now removed"
-   live — the worker's own git history, an emitted cap-history artifact, or a
-   registry-side record?
-4. **Exact-match semantics.** Does "exact match" mean identical major set
-   (no extras), or identical full `major.minor.patch` across every function?
-   The former is the useful selection signal; the latter is diagnostics.
-5. **`floors` → `caps` migration.** `ClientRegistry` and its
-   `Build#floors` / `as_json_h` still emit and read `manifest["floors"]`;
-   the switch to `caps` is a code change, not just a rename in these ADRs.
+   pod/service? (Leaning: `-control` service or a pod it owns.)
+2. **Grade preference storage.** Cookie like the sha pin, user setting, or pod
+   config? It differs from the pin in that it re-resolves, so it is a policy,
+   not a bookmark.
+3. **Default grade.** Is the out-of-the-box default `exact` (falling back as
+   needed), or `degraded` (take the newest thing that runs)? The fallback chain
+   makes these converge in most states but they differ in what the report says.
 
 ## Alternatives considered
 
 - **Newest-first (status quo).** Simple, but serves an incompatible client
-  whenever the newest build outruns the worker — the exact failure the Decider
-  exists to prevent.
-- **Scalar compatibility distance.** Rejected: not actionable, and it
-  collapses distinct failure modes (missing vs. mismatched) into one number.
-- **Per-consumer re-implementation.** Rejected: three copies of the same
-  containment in three languages is exactly the drift ADR-019 removes.
+  whenever the newest build outruns the worker.
+- **A `compatible` boolean.** Rejected: it collapses four distinct states
+  (exact, ahead, degraded, incompatible) into one bit, and is the direct cause
+  of the apparent contradiction between ADR-019 §1 and this ADR's first draft.
+- **`exact_match` / `majverandkeymatch` / `majvermatch` as three stored
+  flags.** Rejected as stored fields: they are nested (each implies the next),
+  one is redundant once patch is inert, and a single `key_match` collapses
+  `missing` with `extra`. Kept as *derived* flags over the arrays.
+- **Scalar compatibility distance.** Rejected: not actionable, and there is no
+  meaningful ordering between different kinds of key difference.
+- **Client ⊇ worker containment.** Rejected: it makes adding one key invalidate
+  every existing build, which is the global-invalidation defect of the
+  `PROTOCOL` scalar wearing a new shape.
+- **Invalidating degraded builds as serve targets.** Rejected for the same
+  reason: degraded is the normal post-deploy state of the store.
+- **Fleet-level selection (fold many workers into one effective capset).**
+  Not pursued: the union has no answer when two workers declare the same key at
+  different majors, and per-deployment stores make the fleet question narrower
+  than it first appeared.
+- **Pin-aware GC.** Unnecessary: pins self-heal to the default grade when a
+  build is absent, and the GC bound is now narrow enough (incompatible only)
+  that it does not reach builds anyone would deliberately pin.
+- **Retirement provenance / tombstones.** Rejected: see §7.
 - **Capability negotiation at the socket.** Rejected: the Decider selects
-  builds from artifacts; the socket advertises. Negotiation (multi-version
-  convergence) was already rejected in ADR-019.
+  builds from artifacts; the socket advertises.

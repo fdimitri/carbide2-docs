@@ -50,10 +50,11 @@ and anything from before the cutover is deleted rather than carried.
 shim, and no acceptance of a token in the upgrade URI. The worker accepts
 `system/auth` and nothing else as a first credential.
 
-Pre-cutover clients are deleted from the MinIO client tier as part of the
-cutover. There is no installed base to serve and nothing to keep around for
-compatibility. The client store after the cutover contains only builds that speak
-the single-path handshake.
+A client that does not speak this handshake cannot connect to such a worker.
+Whether old client builds linger in the store is an operational cleanup concern,
+not an architectural decision: they are simply unusable against a new worker.
+Old server/worker pairs and old clients can coexist in the store as long as a
+client is not paired with a worker that does not speak its handshake.
 
 ### 2. First-message auth is the only handshake
 
@@ -64,8 +65,7 @@ full capset; ADR-019 §6). On failure it closes.
 
 ADR-018's on-open wire-caps frame is removed. Under a single-path handshake there
 is no pre-auth carrier decision to inform, so the frame has no job. Caps are
-exchanged post-auth on `system/connected`; the Decider reads the capset off-socket
-over the authenticated HTTPS endpoint (ADR-019 §5).
+exchanged post-auth on `system/connected` (ADR-019 §6).
 
 ### 3. The session model and security posture carried forward from ADR-018
 
@@ -147,10 +147,9 @@ state.
   60-day window.
 - `validate_token` shrinks to a single format; `JWT_CLAIMS.md` loses the legacy
   table; the workspace server loses `ws_token` and `WorkerTokenIssuer`.
-- The worker's capset endpoint (Decider live-refresh) gets a single, clean auth
-  story: control-format only, no legacy branch.
-- The Decider's client store is pre-filtered: every build in MinIO speaks the
-  single handshake, so the "old client" case cannot arise from the store.
+- The client store is pre-filtered: every build in MinIO speaks the single
+  handshake after the cutover, so the "old client" case cannot arise from the
+  store.
 
 **Negative / to resolve**
 
@@ -159,21 +158,13 @@ state.
   deleting the shim.
 - Both breakages are one atomic cutover. They cannot be rolled back independently
   after the fact without reinstating the dual path that this ADR removes.
-- The cutover is fleet-wide: the workspace pod (Rails + worker) is the redeploy
-  unit, and the client store is shared across all pods. There is no per-pod
-  gradual rollout; ordering and coordination are mandatory.
+- The cutover is not required to be fleet-wide. Old server/worker pairs and old
+  clients can coexist in the store — compatibility is preserved as long as a
+  client is not paired with a worker that does not speak its handshake. The
+  hard cutover is validated on a separate small k3d deploy before reaching the
+  k3s fleet.
 - Deleting the old clients from MinIO is destructive and must be an explicit,
   approved operation at cutover time.
-
-## Open questions
-
-1. **Cutover ordering.** What is the exact sequence — control minting enabled,
-   workers redeployed, MinIO store swapped and old builds deleted — and what is
-   the acceptable mid-cutover failure mode for a client caught in the window?
-2. **ADR-018 branch state.** The `system/auth` / `wirecaps` / legacy-shim code
-   exists on the ADR-019 branch off ADR-018. Is that branch shipped or throwaway?
-   The answer determines `implementation_exists` on ADR-018 and whether the
-   cutover is "delete code" or "migrate code."
 
 ## Alternatives considered
 
@@ -185,5 +176,4 @@ state.
   and two minting authorities exist only to serve pre-cutover clients, which this
   ADR deletes.
 - **Keep the on-open wire-caps frame.** Rejected: with one auth path there is no
-  pre-auth choice left for it to inform; caps move to `system/connected` and the
-  authenticated HTTPS endpoint.
+  pre-auth choice left for it to inform; caps move to `system/connected`.
