@@ -106,13 +106,20 @@ cluster-wide token must therefore not carry a pod-local integer.
 
 - **Users get a `uuid`** in the control DB, unique and backfilled. This is the
   stable identity used in `sub` / `user_uuid` across all tokens.
-- **Control projects (workspaces) also get a `uuid`**, now rather than later:
-  since the token is being touched anyway, it should carry `project_uuid` from
-  the start instead of baking in the integer and re-migrating later. This is
-  for the **token claim** only — it does not change routing or naming.
-- **Workspace-local `Project` rows do NOT get a cluster uuid.** Their identity
-  is the control-plane `workspace:<uuid>`; a local integer is an
-  implementation detail of one pod.
+- **Workspaces get a `uuid`** in the control DB (the `control_projects` table).
+  Control owns the workspace; the pod only mirrors it.
+- **Projects also get a `uuid`**, because control owns projects, not just
+  workspaces. In practice Project:Workspace is 1:1 today, so the project uuid
+  **is** the workspace uuid for now; when a pod hosts multiple projects the
+  token names a project by its own uuid and the pod resolves it to its local
+  integer PK. Either way the token carries identity by uuid, never a
+  pod-local integer.
+
+Under 1:1, control hands the pod its project uuid at launch through an ENV var
+(the operator already provisions the pod with its workspace identity). When a
+pod can host more than one project, control owns project creation/listing and
+pushes project records to the pod, which mirrors them by uuid. The ENV
+bootstrap is the 1:1 placeholder for that push-down interface.
 
 The migration is additive and non-breaking: add `uuid`, backfill existing rows,
 add a unique index; leave existing integer PKs and FKs in place. The token gains
@@ -126,12 +133,13 @@ The control-minted `JwtIssuer` format becomes the single workspace token:
 
 ```
 iss: carbide-control
-aud: workspace:<id>        # kept (staged removal)
-sub: user:<id>             # kept (staged removal)
-user_id: <id>              # kept (staged removal)
-project_id: <id>           # kept (staged removal)
-user_uuid: <uuid>          # added now (future plumbing)
-project_uuid: <uuid>       # added now (future plumbing)
+aud: workspace:<id>        # integer, staged legacy (workspace identity is now workspace_uuid)
+sub: user:<id>             # integer, staged legacy
+user_id: <id>              # integer, staged legacy
+project_id: <id>           # integer, staged legacy
+user_uuid: <uuid>          # stable user identity (control-owned)
+workspace_uuid: <uuid>     # stable workspace identity (control-owned)
+project_uuid: <uuid>       # stable project identity (control-owned; == workspace_uuid under 1:1)
 scope: workspace:rw
 iat, exp (5m)
 ```
@@ -140,10 +148,9 @@ The integer claims (`sub`/`aud`/`user_id`/`project_id`) stay for now to **stage*
 the change, not for backward compatibility. There is no installed base to
 protect: pre-alpha, one deployment, three repos shipped together — so the
 integer claims are only retained so the change lands in pieces, not because a
-running consumer depends on them. The uuid claims are laid alongside them as
-future plumbing; the integer claims are removed in a later refinement once every
-consumer (worker, workspace REST, mirrored User) has migrated to uuid
-resolution.
+running consumer depends on them. The uuid claims are the stable identities and
+are laid alongside them; the integer claims are removed once every consumer
+(worker, workspace REST, mirrored User) has migrated to uuid resolution.
 
 Signed asymmetrically (see above): the public key is sufficient to verify, so
 pods cannot mint.
@@ -155,8 +162,8 @@ accidental split — server `issue_user_token` + `WorkerTokenIssuer` — is remo
 
 Consumers keep resolving by the integer ids for now (the uuid claims are not
 yet authoritative). Later, once the workspace pod's mirrored `User` table gains
-a `control_uuid` column and project resolution moves to `project_uuid` → `aud`,
-the integer claims are dropped from the token.
+a `control_uuid` column and project resolution moves to `project_uuid`, the
+integer claims are dropped from the token.
 
 The integer/uuid mismatch rule belongs at **that mirror step**, not in the
 token. Control's own `uuid` backfill cannot assign a "wrong" uuid — each row
@@ -239,6 +246,7 @@ aud: workspace:<id>
 user_id: <id>
 project_id: <id>
 user_uuid: <uuid>
+workspace_uuid: <uuid>
 project_uuid: <uuid>
 scope: workspace:rw
 iat, exp (5m)
