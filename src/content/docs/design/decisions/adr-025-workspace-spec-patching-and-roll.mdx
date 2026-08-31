@@ -54,7 +54,7 @@ Patchable fields are exactly ADR-016's patch class:
 surface — storage size is a migration (ADR-016 §2), storage class is
 deployment-level.
 
-### 1a. Template assignment is DB-authoritative, drift is a two-writer signal
+### 1a. Template assignment is DB-authoritative; drift is notice-before-overwrite
 
 `ControlProject.template_name` records control's *intent*: "this workspace
 tracks preset X." The CR `spec.resources` records the *live* desired state, and
@@ -62,22 +62,32 @@ the CR is writable by things that are not control — `kubectl patch`, the
 operator, a future endpoint. Neither side is the sole owner; the two records
 disagree whenever one is written without the other.
 
-Drift is that disagreement, and the cause is underdetermined: a template edited
-since assignment and an out-of-band CR write look identical from control's side.
-This is the same two-writer shape as DBFS/VFS, one level up. The reconciliation
-direction is different:
+This is the same two-writer shape as DBFS/VFS, one level up, and the direction
+inverts for a reason. DBFS absorbs the external write wholesale because
+`setContents` is a keyframe — self-contained, replace-whole, idempotent from any
+base — so the disk side can always win and still land in a legal state. A
+workspace `resources` change is a delta against a base, and control holds a
+*pointer* (`template_name`), not a value: there is no assignment meaning "these
+particular custom resources." So the external write can't be absorbed as
+"intent"; it can only be noticed and then overwritten.
 
-- **DBFS/VFS** adopts the external change by default, because file content has no
-  recoverable intent or chronology — the disk *is* the file.
-- **Workspace shape** keeps the assignment by default. The external change is
-  ignored on the next config change, drift is held and surfaced, and the user
-  converges on the next `PATCH` — re-apply the template (discard the external
-  change) or clear the assignment (accept it as custom).
+The policy is therefore **intent-wins, apply-and-overwrite**.
 
-Precedence on `PATCH` itself: raw `resources` is an explicit override and always
-clears `template_name`, even if `template_name` is also sent. Sending both means
-"go custom with these values," never "track the preset but pretend" — so
-control's own writes cannot produce the both-sent ambiguity.
+- Drift is computed on read: `workspace_json` compares the CR's current
+  `spec.resources` against the assigned template's current definition. It is not
+  a watcher and not a diagnosis — the cause is underdetermined (template edited,
+  or an out-of-band CR write).
+- Drift does not block. The next **configure** (`PATCH`) always applies the
+  requested template/resources/image and overwrites whatever external value is
+  there. The flag is notice that a change happened and is about to be discarded,
+  not a hold.
+- No auditable change log. An append-only applied-resources history would recover
+  the chronology that keyframes destroy, but it is deliberately deferred — for
+  now the current disagreement is surfaced and then overwritten.
+
+On `PATCH`, raw `resources` clears `template_name` (an explicit override is
+"go custom"), and sending both `template_name` and raw `resources` means custom
+wins — control's own writes never produce a both-sent ambiguity.
 
 ### 1b. The workspaces resource relocates under `/api/v1/control`
 The existing top-level `ControlProject`-backed resource (`/api/workspaces`)
@@ -172,6 +182,10 @@ build is the Decider's question (ADR-020), not something a tag list can answer.
    `carbide2` and `carbide2-shell`, or the full catalog?
 4. **Client UI.** The dashboard surface for patch + roll + tag picker is
    explicitly deferred (a later slice); this ADR records only the API/operator.
+5. **Image-tag drift is not yet flagged.** `template_drift?` compares only
+   `spec.resources`; an out-of-band `workspaceImageTag` change is invisible and
+   gets discarded on the next configure with no notice. The drift disclosure
+   should cover it before it silently clobbers a deliberate tag pin.
 
 ## Alternatives considered
 
