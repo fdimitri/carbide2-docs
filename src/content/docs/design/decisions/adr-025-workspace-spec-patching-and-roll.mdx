@@ -54,8 +54,32 @@ Patchable fields are exactly ADR-016's patch class:
 surface — storage size is a migration (ADR-016 §2), storage class is
 deployment-level.
 
-### 1a. The workspaces resource relocates under `/api/v1/control`
+### 1a. Template assignment is DB-authoritative, drift is a two-writer signal
 
+`ControlProject.template_name` records control's *intent*: "this workspace
+tracks preset X." The CR `spec.resources` records the *live* desired state, and
+the CR is writable by things that are not control — `kubectl patch`, the
+operator, a future endpoint. Neither side is the sole owner; the two records
+disagree whenever one is written without the other.
+
+Drift is that disagreement, and the cause is underdetermined: a template edited
+since assignment and an out-of-band CR write look identical from control's side.
+This is the same two-writer shape as DBFS/VFS, one level up. The reconciliation
+direction is different:
+
+- **DBFS/VFS** adopts the external change by default, because file content has no
+  recoverable intent or chronology — the disk *is* the file.
+- **Workspace shape** keeps the assignment by default. The external change is
+  ignored on the next config change, drift is held and surfaced, and the user
+  converges on the next `PATCH` — re-apply the template (discard the external
+  change) or clear the assignment (accept it as custom).
+
+Precedence on `PATCH` itself: raw `resources` is an explicit override and always
+clears `template_name`, even if `template_name` is also sent. Sending both means
+"go custom with these values," never "track the preset but pretend" — so
+control's own writes cannot produce the both-sent ambiguity.
+
+### 1b. The workspaces resource relocates under `/api/v1/control`
 The existing top-level `ControlProject`-backed resource (`/api/workspaces`)
 moves to `/api/v1/control/workspaces`. The `v1` is a live-sketch prefix, not an
 active versioning scheme — it becomes meaningful when the project reaches v1.
