@@ -247,10 +247,16 @@ authenticate to Kubernetes for it. The PTY stream stays worker↔shell — it do
 from control:
 
 - Control creates the shell pod and mints a **pod-scoped exec grant** — a
-  short-lived, single-pod token bound to exactly that shell pod's `pods/exec`
-  subresource (`resourceNames: [shell-pod-X]`, `verbs: [create]`, short TTL).
+  single-pod token bound to exactly that shell pod's `pods/exec` subresource
+  (`resourceNames: [shell-pod-X]`, `verbs: [create]`), with a **session-lifetime
+  TTL**. A terminal stream is long-lived by design (a shell stays open for
+  hours); the grant lives as long as the session and is revoked when the
+  terminal closes. The security win is the **scope** — one pod's exec, nothing
+  else — not a short expiry.
 - The worker uses that grant only for the exec/attach connection that streams
-  the PTY. It holds no cluster exec authority of its own.
+  the PTY. It holds no cluster exec authority of its own, and the grant is
+  single-pod + session-scoped, so a leaked token can reach nothing but that
+  one shell's stream.
 - The worker's own ServiceAccount loses `pods/exec` (and any lingering pod
   create/delete for shells); it only ever presents control-issued, per-shell,
   expiring grants.
