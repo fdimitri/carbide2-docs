@@ -1,0 +1,160 @@
+---
+title: "ADR-024: Multi-stream worker — per-domain socket routers"
+description: "Split the single multiplexed worker socket into a control socket plus per-domain data sockets, so a blocked domain cannot stall its siblings. Each domain is a socket router object that owns its own ordering, backpressure, and blocking boundary."
+sidebar:
+  order: 24
+  badge:
+    text: Proposed
+    variant: note
+status: Proposed
+date: "2026-08-30"
+related:
+  - label: ADR-019 (Commandset Capabilities & Versioning)
+    href: /design/decisions/adr-019-commandset-caps-versioning/
+  - label: ADR-023 (Auth Handshake Hard Cutover & Control-Plane-Only JWT Minting)
+    href: /design/decisions/adr-023-auth-handshake-hard-cutover/
+---
+
+import AdrHeader from '../../../../components/AdrHeader.astro';
+
+<AdrHeader {...frontmatter} />
+
+## Context
+
+The worker is a single EventMachine reactor: one WebSocket per client, every
+command set multiplexed over it. Blocking work — ActiveRecord, PTY I/O, file
+I/O, model HTTP, kubectl — can stall the reactor, and therefore every other
+command set on that client. Because handlers run on the shared reactor, a stall
+in one domain (e.g. an agent conversation doing a slow model call or a slow DB
+query) can block terminals, chat, and fs for every connected client.
+
+Two escape routes were considered and rejected as *the* answer:
+
+- **Blanket `EM.defer` around AR.** Turns every handler into defer-then-
+  `next_tick`, and reintroduces the consistency problem for shared mutable
+  state (`TERMINALS`, `OPEN_DOCUMENTS`, `SESSIONS_BY_PROJECT`, the in-memory
+  `Document` cache). Frequency ≠ cost: most AR calls are cheap indexed
+  `find_by`s that are not worth the thread-pool + reactor-hop overhead, so a
+  blanket defer is both insufficient for the long poles and overkill for the
+  common case.
+- **One thread pool with locks.** Works, but makes every shared map a lock
+  discipline, and the ordering/fanout invariants (terminal output ordered,
+  broadcast fanout) become the hard part.
+
+The structural fix is to stop multiplexing everything over one socket and give
+each domain its own socket with its own blocking boundary.
+
+## Goal
+
+A blocked domain must not stall its siblings. An agent conversation that hangs
+on a slow model call, or an fs command stuck on a slow DB query, must not stop
+terminal output, chat, or session state. The failure domain becomes one command
+set, not the whole socket, and not the whole worker.
+
+## Decision
+
+### 1. The worker is a socket-router factory
+
+`ROUTES` today maps `cs → handler module`. It becomes a factory: the worker
+accepts a control connection, authenticates it, and tells the client which
+domain sockets to open. Each domain socket is owned by a router object that
+handles exactly that domain's frames.
+
+The reactor still runs. Routers that need to defer do their own blocking on the
+thread pool and return to their own socket. A stalled router cannot stall
+another router because each owns a different socket.
+
+### 2. Control socket vs data sockets
+
+- **Control socket** — auth (`system/auth`), session state, capset, and the
+  stream map (which domains to open, with per-domain handshake).
+- **Data sockets** — one per domain (see §3), each carrying only that domain's
+  frames, each with its own ordering and backpressure.
+
+`system/connected` (control) returns the stream map. Data sockets authenticate
+with a short-lived stream token minted from the control socket, so a data socket
+is cheap to open and cheap to reject.
+
+### 3. Domain granularity
+
+| Granularity | Sockets per client | Blocking isolation | Client cost |
+|---|---|---|---|
+| per command-set | ~5 (term, chat, fs, agent, session) | a stuck domain cannot stall others | low — StreamManager routes by `cs` |
+| per object-instance | N+1 (one per terminal, conversation, file) | a stuck object cannot stall siblings | high — dynamic socket lifecycle |
+
+**Decided: per command-set.** Per-object isolation is the wrong granularity:
+object count is unbounded, browser WS limits bite (~6 per origin), and the
+dominant stalls are already domain-scoped. Per-object can be layered later
+inside a domain if a domain proves to need it.
+
+### 4. Ordering is per-domain, not global
+
+Each data socket is FIFO, so ordering *within* a domain is free. Ordering
+*across* domains is explicitly not guaranteed (chat order vs terminal order is
+irrelevant). No global sequencer.
+
+### 5. Shared state gets an owner
+
+Some state is legitimately cross-domain. Each shared map has exactly one owning
+router; other routers call into the owner via a reactor hop, never touch it
+directly from a deferred thread.
+
+- `SESSIONS_BY_PROJECT` — control socket owns it.
+- `TERMINALS`, `CHAT_ROOMS` — owned by their domain router.
+- `OPEN_DOCUMENTS` / `Document` cache — **the dangerous one**: `fs/*` and the
+  VFS flusher/watcher both touch it. It gets an explicit owner (the fs router),
+  and every other writer goes through it.
+- `VFS_FLUSHERS` / `VFS_WATCHERS` — fs-router-owned, exposed read-only elsewhere.
+
+## Hurdles / open questions
+
+1. **Client rewrite** — `workerSocket` singleton becomes a `StreamManager`
+   owning N sockets: per-stream reconnect/resume, partial-failure handling
+   (one domain drops, others live), and routing `cs → socket`. This is the real
+   cost.
+2. **Browser WS limits** — ~6 concurrent WS per origin. per-command-set (~5) is
+   fine; per-object would exceed it.
+3. **Stream token mechanism** — minted by control (`workspace:stream` scope,
+   per-domain audience) vs an in-band grant from the control socket. Determines
+   how much client auth code survives.
+4. **Reconnect semantics** — does dropping one data socket reconnect just that
+   stream, or the whole session?
+5. **The `Document` cache owner** — does the fs router own it outright, and do
+   the flusher/watcher become fs-router-internal, or peers calling in?
+6. **Capset interaction** — ADR-019 caps are per-domain now; does
+   `system/connected` advertise one capset per stream, or one global capset with
+   a domain field?
+7. **Migration** — this is a wire-protocol change. With ADR-023's hard-cutover
+   precedent, it is a flag-day, not a gradual rollout (no dual-socket mode).
+
+## Consequences
+
+**Positive**
+
+- A blocked domain stops blocking its siblings; the failure domain is one
+  command set, not the whole socket.
+- Ordering becomes per-domain FIFO by construction, no locks.
+- Backpressure is per-domain: a flooded terminal stream does not back up chat.
+- The client change is contained: one `StreamManager` routing `cs → socket`.
+
+**Negative / to resolve**
+
+- Client rewrite (see hurdles) is the real cost.
+- Stream tokens are a new auth surface.
+- The few genuinely shared maps need owners and reactor-hop call rules; the
+  `Document` cache is the sharpest edge.
+- Flag-day migration, no gradual rollout.
+
+## Alternatives considered
+
+- **Status quo (single socket + defer the long poles).** Cheapest; gets common
+  stalls without a protocol change. Rejected as the decision only because it
+  leaves cross-domain backpressure and the shared-state problem unaddressed —
+  but it is the right interim step before this lands.
+- **Thread pool with locks.** Rejected: consistency discipline everywhere,
+  ordering/fanout become manual.
+- **Per-object sockets.** Rejected: unbounded sockets, browser limit, high
+  client cost for no gain over per-command-set at current scale.
+- **Separate worker processes per domain.** Rejected for now: the worker and
+  Rails already share one pod; splitting into per-domain processes is a deploy/
+  scaling change that does not match the single-pod model yet.

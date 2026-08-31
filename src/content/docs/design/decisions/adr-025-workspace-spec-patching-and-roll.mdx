@@ -1,0 +1,154 @@
+---
+title: "ADR-025: Workspace Spec Patching, Roll, and Image Tag Listing"
+description: "A control-side surface to patch a live Workspace CR spec (resources, image, env) without restarting the pod, an explicit separate roll action, and how control lists available image tags from the registry."
+sidebar:
+  order: 25
+  badge:
+    text: Proposed
+    variant: note
+status: Proposed
+date: "2026-08-30"
+extends:
+  label: ADR-016 (Workspace Shape Transitions, Templates, and the Control Plane Boundary)
+  href: /design/decisions/adr-016-workspace-shape-transitions/
+---
+
+import AdrHeader from '../../../../components/AdrHeader.astro';
+
+<AdrHeader {...frontmatter} />
+
+## Context
+
+ADR-016 settled the *semantics* of workspace change: a change is either a
+**patch** (resources, image, shell image, ingress — no data movement) or a
+**migration** (storage size — data movement), and the operator reconciles
+toward `spec`. It did not settle the *surface*: how the control plane expresses
+"change this workspace" and whether that expression also rolls the pod.
+
+Today the only way to change a live workspace is to edit the CR by hand. The
+memory OOM on a real workspace exposed why that is not enough: the operator
+reads nothing that is not already in the CR, so raising a memory limit requires
+a human to hand-patch the CR, and nothing surfaces that the live pod is still on
+the old limit.
+
+This ADR is the user path over ADR-016's patch class. Migration (storage) stays
+in ADR-016's state machine; this ADR only covers patchable fields and the act of
+applying them.
+
+## Decision
+
+### 1. Control gains a patch surface over the CR spec
+
+`PATCH /api/v1/control/workspaces/:id` merge-patches the Workspace CR `spec`.
+Control writes nothing but the CR (ADR-016's invariant); the operator
+reconciles the Deployment toward the new spec on its next watch event.
+
+Patchable fields are exactly ADR-016's patch class:
+
+- `resources.requests` / `resources.limits`
+- `workspaceImage` / `workspaceImageTag` / `workspaceImagePullPolicy`
+- the workspace shell image/tag
+- ingress fields
+
+`storageSize` and `storageClassName` are **not** patchable through this
+surface — storage size is a migration (ADR-016 §2), storage class is
+deployment-level.
+
+### 1a. The workspaces resource relocates under `/api/v1/control`
+
+The existing top-level `ControlProject`-backed resource (`/api/workspaces`)
+moves to `/api/v1/control/workspaces`. The `v1` is a live-sketch prefix, not an
+active versioning scheme — it becomes meaningful when the project reaches v1.
+The `control` segment is the cardinality signal: this is a control-plane
+resource, read as `/api/v1/<backend>/<resource>`, matching the existing
+`control/me`, `control/renew`, `control/version` pattern.
+
+There is **no** shim. The client is already broken against earlier builds, so
+nothing is preserved by keeping `/api/workspaces` alive; the old route is
+deleted rather than delegated.
+
+### 2. Patch is not roll
+
+A spec patch updates the CR and therefore the desired state. It does **not**
+restart the running pod. Changes take effect the next time the pod is recreated
+for any reason (a later reconcile, a rollout, a deletion).
+
+The reason is operational: a patch is a cheap, non-disruptive statement of
+intent, and several patches may be stacked before any restart is wanted. A
+restart drops live terminals and shell pods, so it must be a conscious action,
+not a side effect of editing a field.
+
+### 3. Roll is a separate, explicit action
+
+`POST /api/v1/control/workspaces/:id/roll` bumps a `spec.rollRequestedAt` field
+on the CR. The operator observes the change and restarts the workspace
+Deployment.
+
+Roll is idempotent and observable: the field is a monotonic value, the operator
+acts when it changes, and the CR status records the last applied roll. There is
+no direct `kubectl rollout restart` from Rails — the operator stays the only
+component that mutates Deployments.
+
+### 4. Image tags are listed from the registry
+
+The image-tag choices in the patch surface are not a free-text field. Control
+reads the registry's catalog/tags endpoints:
+
+- `GET /v2/_catalog` — repository names
+- `GET /v2/<repo>/tags/list` — tags for a repository
+
+The registry is read **unauthenticated** today. Control holds the registry
+coordinates and its CA in two new env values:
+
+- `REGISTRY_URL` — the registry base, e.g. `https://registry.example:5000`
+- `REGISTRY_CA` — the CA PEM to trust that registry's self-signed cert
+
+Control exposes the result as
+`GET /api/v1/control/registry/tags?repo=<name>`. This is "what exists," not
+"what is compatible": compatibility with the control-plane image or the client
+build is the Decider's question (ADR-020), not something a tag list can answer.
+
+## Consequences
+
+**Positive**
+
+- The patch class becomes a CR edit reachable from the API/dashboard instead of
+  a hand-rolled `kubectl patch`.
+- Patch and roll are separated, so an operator can change several fields and
+  choose when to pay the restart cost.
+- The registry read gives the surface real choices instead of a typed tag.
+
+**Negative / to resolve**
+
+- The operator must now read `resources` and image fields from `spec` into the
+  Deployment template; today those are hardcoded in `deployment.rb`. This is a
+  required change, not an optional one, for §1 to mean anything.
+- The registry read adds a new outbound dependency from control to the registry,
+  plus CA trust management.
+- No authz is added (consistent with the rest of control today); who may patch or
+  roll a workspace is deferred.
+
+## Open questions
+
+1. **Exact patchable-field allowlist.** The patch class is listed, but the
+   operator-side enforcement of "storage fields are not patchable" is not
+   specified — should `PATCH` reject those fields, or silently ignore them?
+2. **Roll mechanism detail.** `rollRequestedAt` vs `restartAt` vs a generation
+   bump; and whether the operator does a `rollout restart` or a pod delete.
+   The field is proposed as `rollRequestedAt`, the operator action is open.
+3. **Registry repository set.** Which repositories control lists — only
+   `carbide2` and `carbide2-shell`, or the full catalog?
+4. **Client UI.** The dashboard surface for patch + roll + tag picker is
+   explicitly deferred (a later slice); this ADR records only the API/operator.
+
+## Alternatives considered
+
+- **Direct `kubectl` writes from Rails.** Rejected: violates ADR-016's "Rails
+  writes nothing but Workspace CRs" invariant.
+- **Patch implicitly rolls.** Rejected: couples a non-disruptive intent
+  statement with a disruptive restart; several patches would each drop the pod.
+- **Free-text image tag in the patch surface.** Rejected: a tag that does not
+  exist in the registry produces an ImagePullBackOff; the list is the guard.
+- **Registry listing from the operator instead of control.** Rejected: the
+  operator is DB-free and cluster-focused; the registry read is a user-path
+  concern and belongs with the API that offers the choice.
