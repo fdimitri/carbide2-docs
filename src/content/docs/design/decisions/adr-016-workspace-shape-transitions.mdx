@@ -240,23 +240,23 @@ resource**, owned by `-control`'s operator path:
   and streaming `bash`) stays in the shell pod, but the pod itself is
   provisioned by `-control`, not by the worker reaching into k8s.
 
-**Shell exec is authorized, not trusted.** The worker does not hold `pods/exec`
-(or any pod-mutating RBAC) for shell access, and does not know how to
-authenticate to Kubernetes for it. The PTY stream stays worker↔shell — it does
-**not** route through control — but the authorization to reach the shell comes
-from control:
+**Shell exec is authorized, not trusted.** The worker does not hold blanket
+`pods/exec` (or any pod-mutating RBAC) that could reach arbitrary pods, and
+does not know how to authenticate to Kubernetes for it. The PTY stream stays
+worker↔shell — it does **not** route through control — but the authorization to
+reach the shell comes from control, and it is **bounded, not forbidden**: the
+worker may exec into *its own workspace's* shell pod(s), and nothing else.
 
-- Control creates the shell pod and mints a **pod-scoped exec grant** — a
-  single-pod token bound to exactly that shell pod's `pods/exec` subresource
-  (`resourceNames: [shell-pod-X]`, `verbs: [create]`), with a **session-lifetime
-  TTL**. A terminal stream is long-lived by design (a shell stays open for
-  hours); the grant lives as long as the session and is revoked when the
-  terminal closes. The security win is the **scope** — one pod's exec, nothing
-  else — not a short expiry.
+- Control creates the shell pod and mints a **pod-scoped exec grant** bound to
+  exactly that shell pod's `pods/exec` subresource (`resourceNames:
+  [shell-pod-X]`, `verbs: [create]`). The grant may be session-lifetime (issued
+  at stream start) or workspace-shell-lifetime (valid for that workspace's
+  shell pods generally); either way it names a specific pod, never "any pod."
+  Revoking on terminal close is an optional further tightening, not the
+  mechanism — the mechanism is the single-pod bound.
 - The worker uses that grant only for the exec/attach connection that streams
-  the PTY. It holds no cluster exec authority of its own, and the grant is
-  single-pod + session-scoped, so a leaked token can reach nothing but that
-  one shell's stream.
+  the PTY. It holds no cluster-wide exec authority of its own, and the grant is
+  pod-scoped, so a leaked token can reach nothing but that shell's stream.
 - The worker's own ServiceAccount loses `pods/exec` (and any lingering pod
   create/delete for shells); it only ever presents control-issued, per-shell,
   expiring grants.
