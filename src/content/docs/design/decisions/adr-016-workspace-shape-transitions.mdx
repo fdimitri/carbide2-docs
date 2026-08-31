@@ -264,6 +264,38 @@ worker may exec into *its own workspace's* shell pod(s), and nothing else.
 This keeps the shell reachable without routing the stream through control, and
 without giving the worker a standing credential that could exec into any pod.
 
+**The worker gets a handle, not a pod.** Shell lifecycle is hidden behind one
+idempotent endpoint:
+
+```
+POST /api/v1/control/workspaces/:id/shell
+  → { shell_pod: "ws-N-shell", exec_token: "<pod-scoped grant>", keep_warm: true }
+```
+
+The worker does not know whether the shell is a Deployment or a bare pod, and
+does not create or delete pods itself. It asks for a handle; control returns the
+current shell pod name plus a fresh exec grant, **creating the shell if it does
+not already exist**. A missing shell is transparently re-created on the next
+request, which is the fix for the old auto-die behavior (a bare `restartPolicy:
+Never` pod that died and stayed dead).
+
+**Keep-warm is a per-workspace policy, not a global architecture choice.**
+`spec.shell.keepWarm` (default `true`) selects between two lifecycle modes that
+share the same handle endpoint:
+
+- `keepWarm: true` — the shell is a Deployment with one replica; an idle shell
+  stays alive (cheap — an idle `bash` is a few MiB, though the pod reserves its
+  `requests` from the node). `POST .../shell` is then a no-op after first
+  creation: the Deployment always exists and self-heals, so there is always one
+  handle to return.
+- `keepWarm: false` — the shell is a bare pod created on first request and
+  deleted when the last terminal closes. Zero idle footprint at the cost of
+  control tracking existence and recreating on death (the auto-die bookkeeping).
+
+The toggle is settable from the workspace settings (the same `PATCH` surface as
+resources) and is carried in the CR `spec.shell.keepWarm`. Both modes return the
+same handle shape; only the lifecycle behind it differs.
+
 ## Consequences
 
 **Positive**
@@ -301,8 +333,11 @@ without giving the worker a standing credential that could exec into any pod.
    "usage" means — DBFS text + binary PVC bytes, or PVC bytes only) is open.
 3. **Template storage.** Resolved: DB-backed (`workspace_templates` table) as
    implemented in ADR-025, not a ConfigMap. The shell-pod half of the template
-   (shell CPU/RAM columns) is added with §7's shell-pod move; until then the
-   template only carries workspace-pod resources.
+   (shell CPU/RAM columns) is added with §7's shell-pod move.
+4. **Exec-grant mechanism.** §7 says the worker streams with a pod-scoped,
+   control-issued exec grant; the concrete form is open — a Kubernetes
+   `TokenRequest` with `boundObjectRef` targeting the shell pod, or a
+   control-minted short-lived token for the `pods/exec` subresource.
 
 ## Alternatives considered
 
