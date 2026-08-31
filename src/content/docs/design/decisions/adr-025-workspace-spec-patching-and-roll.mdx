@@ -67,16 +67,24 @@ There is **no** shim. The client is already broken against earlier builds, so
 nothing is preserved by keeping `/api/workspaces` alive; the old route is
 deleted rather than delegated.
 
-### 2. Patch is not roll
+### 2. Patch is not a *forced* roll, but template changes roll inherently
 
-A spec patch updates the CR and therefore the desired state. It does **not**
-restart the running pod. Changes take effect the next time the pod is recreated
-for any reason (a later reconcile, a rollout, a deletion).
+A spec patch updates the CR and therefore the desired state. It does not run
+`rollout restart`; whether the pod restarts depends on what changed:
 
-The reason is operational: a patch is a cheap, non-disruptive statement of
-intent, and several patches may be stacked before any restart is wanted. A
-restart drops live terminals and shell pods, so it must be a conscious action,
-not a side effect of editing a field.
+- **`resources` changes restart the pod inherently.** CPU/memory limits are
+  part of the Deployment's pod template, so the operator writing new resources
+  into the template triggers a Kubernetes rollout. There is no way to change a
+  running container's cgroup limits without recreating it.
+- **Image tag changes restart the pod** (a tag change is a pod-template image
+  change).
+- **Same-tag image *content* changes do not** restart the pod (identical
+  template), which is why the explicit `roll` action exists.
+
+So "patch is not roll" means: control does not force a restart; it only changes
+spec. A restart happens when the changed field is itself part of the pod
+spec. The UI must say so ("applying a template restarts the pod") rather than
+implying a separate restart click is always needed.
 
 ### 3. Roll is a separate, explicit action
 
