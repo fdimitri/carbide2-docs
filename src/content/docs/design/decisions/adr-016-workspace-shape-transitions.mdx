@@ -111,10 +111,12 @@ blindly.
 ### 3. Templates are named presets of CR spec fragments
 
 A **WorkspaceTemplate** is a name → partial `spec`. It is not a new CRD and
-does not carry lifecycle of its own; short-term storage is a ConfigMap in
-`carbide-system`. The Workspace CR remains the single source of truth — a
-template is only how the resolved fields get filled at creation, and how
-"retemplate this workspace" knows its target.
+does not carry lifecycle of its own. **Storage is a control-side DB table
+(`workspace_templates`), not a ConfigMap** — this changed at implementation
+(ADR-025): control owns and edits its own template values, and the resolved
+fields are written into the CR spec at apply time. The Workspace CR remains the
+single source of truth the operator reads — a template is only how the resolved
+fields get filled, and how "retemplate this workspace" knows its target.
 
 A template carries exactly the fields that are legitimate per-workspace
 **shape**:
@@ -238,6 +240,24 @@ resource**, owned by `-control`'s operator path:
   and streaming `bash`) stays in the shell pod, but the pod itself is
   provisioned by `-control`, not by the worker reaching into k8s.
 
+**Shell exec is authorized, not trusted.** The worker does not hold `pods/exec`
+(or any pod-mutating RBAC) for shell access, and does not know how to
+authenticate to Kubernetes for it. The PTY stream stays worker↔shell — it does
+**not** route through control — but the authorization to reach the shell comes
+from control:
+
+- Control creates the shell pod and mints a **pod-scoped exec grant** — a
+  short-lived, single-pod token bound to exactly that shell pod's `pods/exec`
+  subresource (`resourceNames: [shell-pod-X]`, `verbs: [create]`, short TTL).
+- The worker uses that grant only for the exec/attach connection that streams
+  the PTY. It holds no cluster exec authority of its own.
+- The worker's own ServiceAccount loses `pods/exec` (and any lingering pod
+  create/delete for shells); it only ever presents control-issued, per-shell,
+  expiring grants.
+
+This keeps the shell reachable without routing the stream through control, and
+without giving the worker a standing credential that could exec into any pod.
+
 ## Consequences
 
 **Positive**
@@ -273,9 +293,10 @@ resource**, owned by `-control`'s operator path:
 2. **Disk-usage query shape.** Section 2 requires a `-server` endpoint for
    project-disk usage before a shrink is authorized. Its exact contract (what
    "usage" means — DBFS text + binary PVC bytes, or PVC bytes only) is open.
-3. **Template storage.** ConfigMap now is the proposal; a CRD becomes worth it
-   only when templates need versioning or their own lifecycle. Revisit if the
-   catalog grows past a handful of static presets.
+3. **Template storage.** Resolved: DB-backed (`workspace_templates` table) as
+   implemented in ADR-025, not a ConfigMap. The shell-pod half of the template
+   (shell CPU/RAM columns) is added with §7's shell-pod move; until then the
+   template only carries workspace-pod resources.
 
 ## Alternatives considered
 
