@@ -85,6 +85,14 @@ The policy is therefore **intent-wins, apply-and-overwrite**.
   the chronology that keyframes destroy, but it is deliberately deferred — for
   now the current disagreement is surfaced and then overwritten.
 
+Drift is a composite with a per-field breakdown. `spec_drift?` is the coarse
+"it drifted" signal; `resources_drift?` compares `spec.resources` against the
+assigned template's current definition, and `image_tag_drift?` compares
+`spec.workspaceImageTag` against the intended tag stored on the control row
+(`ControlProject.workspace_image_tag`, written on the last control `PATCH`).
+Both intended values live on the control side, which is what gives the out-of-band
+write a second side to be detected against.
+
 On `PATCH`, raw `resources` clears `template_name` (an explicit override is
 "go custom"), and sending both `template_name` and raw `resources` means custom
 wins — control's own writes never produce a both-sent ambiguity.
@@ -182,10 +190,6 @@ build is the Decider's question (ADR-020), not something a tag list can answer.
    `carbide2` and `carbide2-shell`, or the full catalog?
 4. **Client UI.** The dashboard surface for patch + roll + tag picker is
    explicitly deferred (a later slice); this ADR records only the API/operator.
-5. **Image-tag drift is not yet flagged.** `template_drift?` compares only
-   `spec.resources`; an out-of-band `workspaceImageTag` change is invisible and
-   gets discarded on the next configure with no notice. The drift disclosure
-   should cover it before it silently clobbers a deliberate tag pin.
 
 ## Alternatives considered
 
