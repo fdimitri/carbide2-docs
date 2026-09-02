@@ -296,6 +296,43 @@ The toggle is settable from the workspace settings (the same `PATCH` surface as
 resources) and is carried in the CR `spec.shell.keepWarm`. Both modes return the
 same handle shape; only the lifecycle behind it differs.
 
+### 8. Exec transport: the worker streams, it does not manage pods (#50)
+
+§7 moves shell **lifecycle** to `-control` and narrows the worker to a
+pod-scoped exec grant. This section settles what the worker **does with that
+grant** to stream the PTY — the residual surface #50 raised. The two
+candidates are:
+
+1. **`kubectl exec` with the scoped grant.** The worker still forks `kubectl`,
+   but now presents only the pod-scoped grant (KUBECONFIG / in-cluster token
+   bound to that one shell pod), never a standing cluster credential. This is
+   the current transport with the authorization model swapped underneath it.
+2. **Direct WebSocket exec.** The worker POSTs
+   `/api/v1/namespaces/{ns}/pods/{pod}/exec?command=bash&...&tty=true` and
+   upgrades to the `v5.channel.k8s.io` subprotocol, writing stdin / reading
+   stdout/stderr / sending resize frames itself. No `kubectl`, no local PTY
+   bridge, no shell-string.
+
+**The decision is a transport choice, not an ownership choice.** Ownership is
+§7 and is settled. Whether the exec bytes ride `kubectl` or a direct WebSocket
+is an implementation detail with one real discriminator: **terminal resize.**
+
+- `kubectl exec` gives resize "for free" today — the local `PTY.spawn` master
+  receives `TIOCSWINSZ` and `kubectl` forwards it; nothing new to prove.
+- Direct WebSocket exec requires a resize story over the WS channel-4 frame.
+  This has historically been the least-proven part of the exec subresource and
+  **must be spiked before this path is chosen** (does a channel-4 frame actually
+  change the remote PTY on the target cluster version?).
+
+**Default lean:** keep `kubectl exec` under the *narrowed* pod-scoped grant as
+the interim transport, because the PTY stream is the most failure-intolerant
+path in the worker and direct-WS resize is unproven. Direct WebSocket exec is
+the preferred end-state **only if** the resize spike succeeds, at which point
+`kubectl` leaves the image as a *consequence*, not a goal. "Drop `kubectl`" is
+not itself the objective; the objective is: the worker owns no pod lifecycle
+and holds no standing cluster exec authority. The transport it streams over is
+secondary.
+
 ## Consequences
 
 **Positive**
@@ -338,6 +375,11 @@ same handle shape; only the lifecycle behind it differs.
    control-issued exec grant; the concrete form is open — a Kubernetes
    `TokenRequest` with `boundObjectRef` targeting the shell pod, or a
    control-minted short-lived token for the `pods/exec` subresource.
+5. **Exec transport resize spike.** §8 defers direct WebSocket exec on the
+   unproven resize-over-WS path. The spike: establish a raw WS exec connection,
+   send a channel-4 resize frame, and verify `stty size` reflects it on the
+   target cluster version. This is the entry gate for the direct-WS transport;
+   until it passes, `kubectl exec` under the scoped grant remains.
 
 ## Alternatives considered
 
