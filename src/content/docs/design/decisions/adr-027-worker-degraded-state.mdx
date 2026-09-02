@@ -1,0 +1,81 @@
+---
+title: "ADR-027: Worker degraded-state signaling for live FS sync"
+description: "How a degraded DBFS live-sync state is surfaced to clients and control, without polling."
+sidebar:
+  order: 27
+  badge:
+    text: Exploratory
+    variant: note
+status: Exploratory
+date: "2026-09-02"
+extends:
+  label: ADR-001 (Database-backed Filesystem)
+  href: /design/decisions/adr-001-db-vfs/
+---
+
+import AdrHeader from '../../../../components/AdrHeader.astro';
+
+<AdrHeader {...frontmatter} />
+
+## Context
+
+The worker keeps a live disk→DB sync path (inotify `VfsWatcher` plus a debounced
+`FsLoader` reconcile) and a DB→disk path (`VfsFlusher`). That live sync can
+degrade independently of the worker:
+
+- **Boot:** `VfsWatcher#start!` fails (ENOSPC/EMFILE/ENFILE, unreadable root) —
+  the worker runs but live disk→DB sync is off (#101).
+- **Runtime:** watch exhaustion or fd exhaustion on a later directory creation
+  (the more probable case — watches accumulate); the watcher keeps running
+  partially-watched with no signal (#101).
+- **Initial load:** the boot-time `FsLoader` load fails, so the DBFS tree is
+  stale from the start.
+
+Today a boot failure logs one line; a runtime failure logs a generic
+`handle_event` error; a load failure logs once. Nothing tells a connected client
+or the control plane that the tree is degraded, so DBFS tools keep operating on
+a silently stale tree.
+
+## Decision
+
+Model a single worker-side **degraded state** for live FS sync and push it rather
+than make clients poll for it.
+
+- The worker tracks a per-project (or pod-wide) `fs_sync_degraded` flag with a
+  `reason` (watcher_init_failed | watch_exhausted | load_failed | ...).
+- **Push to clients:** on entering or clearing the degraded state, the worker
+  broadcasts a `system`/`fs_status`-style frame to connected sessions.
+- **Send on connect:** the current degraded state is included in
+  `system/connected` so a late-joining client sees it immediately — no separate
+  round-trip.
+- **Probe query (control plane):** the `?probe=true` connection gets a small
+  read-only query (first member of `PROBE_ALLOWED_COMMANDS`, added in #99) so
+  control can read the degraded flag without a real authenticated session.
+
+Degradation does **not** by itself disable DBFS tools; it marks the tree as
+untrusted-stale. Whether DBFS read/write tools should refuse to operate while
+degraded is a separate product decision and is deliberately out of scope here.
+
+## Consequences
+
+**Positive**
+- Clients and control learn of a stale tree immediately, no polling.
+- One flag covers boot, runtime, and load failures instead of three ad-hoc logs.
+- Reuses the extensible probe allowlist from #99 rather than inventing a new
+  transport.
+
+**Negative / open**
+- Adds a wire surface (`system/fs_status`, `system/connected` field, probe query)
+  that must go through ADR-019 caps/versioning.
+- The degraded flag is per-worker/pod memory, not yet persisted to control — a
+  pod restart clears it until the next failed start. Persisting to control is a
+  follow-up.
+- "Refuse vs warn" for DBFS tools while degraded remains undecided (separate
+  issue from #101's escalation note).
+
+## Alternatives considered
+
+- **Client polling** — rejected: latency and chatter; push is already the
+  established pattern for `debug/event`.
+- **Only log** — rejected: the failure is invisible to the people the stale tree
+  hurts, which is exactly the silent-divergence failure this ADR addresses.

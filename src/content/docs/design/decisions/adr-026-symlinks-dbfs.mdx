@@ -1,0 +1,295 @@
+---
+title: "ADR-026: Symlinks in DBFS — representation, bounds, and traversal"
+description: "How symlinks are recorded and traversed in the DBFS, and why the target type stays file/folder."
+sidebar:
+  order: 26
+  badge:
+    text: Exploratory
+    variant: note
+status: Exploratory
+date: "2026-09-02"
+extends:
+  label: ADR-001 (Database-backed Filesystem)
+  href: /design/decisions/adr-001-db-vfs/
+---
+
+import AdrHeader from '../../../../components/AdrHeader.astro';
+
+<AdrHeader {...frontmatter} />
+
+## Context
+
+The project root is a conventional filesystem, so it can contain symlinks
+(e.g. `carbide2-server/worker -> ../carbide2-worker`). Today the two DBFS
+ingress paths disagree, and neither records that a path is a link:
+
+- `FsLoader` uses `File.directory?` / `File.file?`, which **follow** symlinks, so
+  a symlink is silently imported as the *resolved target* — a folder is recursed,
+  a file gets its content imported — and the fact that it is a link is lost.
+- `VfsWatcher` (since #77) detects `File.symlink?` and **skips** symlinks.
+
+So the same tree materializes differently depending on which component walked it,
+and a symlink's DBFS entry is indistinguishable from a real file/folder.
+
+## Decision
+
+Represent a symlink as a **resolved-type entry carrying a target pathspec**, not
+as a new `ftype`.
+
+- `DirectoryEntry.ftype` stays `file` | `folder` (the *resolved* target type —
+  this is what already drives `setContents`, `insertData`, `calc_current`,
+  tree building, and stat/display).
+- Add nullable `DirectoryEntry.symlink_target` (string). Non-nil means "this
+  entry is a symlink."
+- `FsLoader` and `VfsWatcher` both detect links with `File.lstat` /
+  `File.symlink?` **before** the `File.directory?` / `File.file?` checks, and set
+  `ftype` from the resolved type plus `symlink_target`.
+
+### Target normalization
+
+`symlink_target` is **not** the raw `readlink` string — it is a normalized DBFS
+pathspec (leading slash, relative to the VFS root), so an OS path never leaks
+into the column:
+
+- **Absolute** target → strip the VFS root prefix (`/workspace/.carbide/foo` →
+  `/.carbide/foo`).
+- **Relative** target → resolve **lexically** against the link's own parent
+  directory using `File.expand_path` (handles `..` without following any
+  intermediate symlink), then normalize to leading-slash form. Do **not** use
+  `File.realpath` — it follows every symlink in the intermediate path and can
+  loop if a parent directory is itself a symlink.
+- Out-of-root absolute targets are ignored before normalization (see Bounds).
+
+Because it is always a DBFS pathspec, there is no separate "absolute vs relative"
+field, and no raw OS path is ever stored.
+
+**Materialization** (writing a symlink back to disk during DB→local sync) emits link
+text **relative to the link's own parent**, computed from the pathspec — never an
+absolute root path, which would break the moment the tree moves.
+
+### Symlink check first (the one rule that matters)
+
+In **both** the loader and the watcher, `File.symlink?` (or `File.lstat`) is
+checked **before** any `File.directory?` / `File.file?` — always. Every `if` that
+decides how to treat a path begins by asking "is this a symlink?", and a
+symlink is handled by the symlink path, never by the file or directory path.
+
+### Operation order (pinned)
+
+Every path decision follows this sequence, in order:
+
+1. `lstat` — is this path a symlink? (never `File.directory?` / `File.file?` first)
+2. `readlink` — the **immediate** target text.
+3. **normalize** lexically (`File.expand_path`) to a root-relative pathspec.
+4. **bounds check** — in root, or out-of-root → ignore.
+5. **classify** — bounded `lstat` chain walk (below) to the final in-root target type.
+
+Step 4 must run **before** step 5: `File.stat` follows the whole chain, so invoking it
+before the bounds check follows the link out of the pod — into a stale mount, an autofs
+trigger, or a hang.
+
+### Classification: bounded chain walk, not a single stat
+
+`File.stat` follows the **entire** symlink chain, not one hop, and does so unbounded: an
+in-root link → in-root link → out-of-root file would be classified from a path DBFS has no
+authority over, and a chain over the kernel link limit fails `ELOOP`. Classification walks
+the chain with `lstat` instead, applying the bounds check at each hop:
+
+- `lstat` the path; if it is not a symlink, it is a real entry and its type is `ftype`.
+- If it is a symlink, `readlink` + normalize + bounds-check the immediate target, then
+  `lstat` again; repeat until a real entry or a bounds/dangling/ELOOP failure.
+- `ftype` is the **final in-root target's** type; `symlink_target` is the **immediate**
+  target pathspec — they can legitimately differ in a chain.
+
+### No FileChanges on a symlink entry
+
+A `DirectoryEntry` with `symlink_target != nil` owns **no `FileChange` rows**.
+
+- The link's only "content" is the pathspec in `symlink_target`, not a
+  `setContents` log.
+- Writes must resolve to the target: `VfsFlusher` writes *through* the link's
+  `srcpath` to the target, and the target (a real `file` entry) owns the content
+  and its own `FileChange` history. Allowing the link row to also accumulate
+  changes would create two `DirectoryEntry` rows and two divergent histories for
+  the same underlying bytes.
+- Retargeting a link is a metadata change on `symlink_target`, not an append to
+  `file_changes`.
+
+Content-bearing entries are exactly `symlink_target IS NULL`; symlink entries are
+metadata-only.
+
+### Watcher event contract (three distinct code changes)
+
+The watcher must record symlink create/retarget/delete; writes **through** a
+symlink need no new handling (a write-through fires inotify on the **target's**
+parent directory, so `handle_event` already resolves to the real target row).
+The changes are:
+
+1. **`create` (non-dir) symlink** — add a branch before the `close_write ||
+   moved_to` gate; `create` is currently dropped at that gate. `File.symlink?`
+   first → record the link entry.
+2. **`moved_to` (non-dir) symlink** — reorder the existing branch:
+   `File.symlink?` **before** `File.file?` / `File.directory?` (which follow),
+   so a link arriving via `mv` is recorded as a link, not materialized as its
+   target's content.
+3. **`isdir` guard** — `File.symlink?` before `File.directory?` at the top of the
+   `isdir` branch. A symlink-to-directory arrives with `isdir=false` (lstat
+   semantics), so it would otherwise skip the `isdir` branch and fall through to
+   the file path; it must be caught by the symlink check instead.
+
+`mv` of a symlink is an unlink + relink (`moved_from` + `moved_to`, `isdir=false`
+for links), not a content operation; `ln -sfn` (retarget) is `delete` + `create`.
+The delete/moved-from half is already handled; the create half is change 1.
+
+### Bounds and traversal
+
+A symlink is a **pathspec**; DBFS only cares about it when its resolved target is
+inside the project root (`/workspace`):
+
+- **Target within root** → record the entry (`ftype` = resolved type,
+  `symlink_target` = normalized target).
+- **Target outside root** → **ignore for DBFS** — a policy choice: DBFS has no
+  authority over paths outside the project root; they may be pod/container
+  implementation details.
+- **Dangling at scan** is a **timing artifact, not a policy choice**. A link
+  created before its target is common (`ln -s` ahead of build output, or a link's
+  `moved_to` arriving before the target's). It is resolved by re-import until the
+  rewrite (see Out of scope), not tracked by a reverse index.
+
+**Record the link entry, but do not recurse through it.** A directory symlink's
+target subtree is reached by its **own canonical path** — every non-pruned in-root
+target is walked independently, so recursing through the link would materialize
+the subtree twice (two `DirectoryEntry` rows and two `FileChange` histories for
+the same bytes). A link whose in-root target is *only* reachable through the link
+is exactly the case of a target inside a pruned subtree (`.git`, `node_modules`,
+`.bundle`); there the link resolves to nothing DBFS knows, and that is correct —
+the prune intent applies.
+
+This means the loader and the watcher must both do the same bounds check, both
+record (not follow) in-root links, and both skip out-of-root links, giving them
+parity again.
+
+### Loader must not follow or stat a link
+
+`FsLoader#walk` currently uses `File.directory?` / `File.file?` (which follow
+links), and `import_file`/`import_dir` call `refresh_disk_stat!` (which uses
+`File.stat`, also following). Under this ADR the loader must `File.lstat` (or
+`File.symlink?`) **before** those checks, set `ftype` from the *resolved* target
+type plus `symlink_target`, and **never** `refresh_disk_stat!` or read content on
+the link row.
+
+Symlink rows are **metadata-only**: `binary`, `posix_mode`/`owner`/`group`,
+`last_size`, and `mtime` are all meaningless on a link row and must not be read
+from it — consumers resolve to the target and read them there. (This matters
+because `File.stat` would silently stamp the *target's* stat onto the link row.)
+
+### Resolution at access time (transitive, bounded)
+
+No target identity is persisted — only the pathspec. When an op must follow the
+link (read, flush, write-through), resolution walks the symlink chain **like a
+linked list**: resolve the pathspec → find its `DirectoryEntry` → if that entry
+is itself a symlink, resolve again, until a real `file`/`folder` entry or a
+failure. This is trivial — it is a list walk, not a traversal problem.
+
+- Target renamed/moved/deleted since scan → resolution returns ENOENT → treat as
+  dangling and ignore, matching POSIX (`ln -s a b; mv a c; cat b` → "No such
+  file"). No reverse-index fixup, no stale FK.
+- Target moved out of root after scan → the bounds check runs again at access and
+  the link is ignored then.
+- A cycle (`a → b → a`) or a chain that never lands on a real entry → "dangling"
+  (bounded by the visited-set of the list walk; it terminates).
+
+## Trade-offs
+
+The decision is not free. Known costs, accepted for v1:
+
+1. **Link-ness is a discipline, not a type.** With `symlink_target` as a column,
+   "is a symlink" is enforced by call-site discipline: a consumer that forgets
+   to resolve reads a plausible-but-wrong value (the `binary`/stat trap). A third
+   `ftype` would make it impossible to miss, but breaks every existing
+   `file`/`folder` branch. We accept the discipline cost.
+
+2. **The link is a second-class viewer of its target's content.** Writes through
+   a link are attributed to the *target* path; the link row owns no history and
+   its revision cursor is meaningless. No duplicate history (good), but the link
+   path can't accumulate its own edit log or be a first-class edit surface.
+
+3. **Transitive resolution is POSIX-faithful but non-atomic.** Following
+   a→b→c per access self-heals on rename/dangle, but costs a chain walk + DB
+   lookups per op and has a TOCTOU window (the chain can change between
+   lookups). A stored resolved id would be one lookup and atomic, but goes stale.
+
+4. **Record-link-don't-recurse leaves directory symlinks empty in the tree.** A
+   symlink-to-dir shows as a folder with no children (they live at the canonical
+   path), so it is "openable" but not a live view into the subtree. A real UX
+   tradeoff, and it can silently confuse.
+
+5. **Out-of-root / dangling links are invisible.** They are ignored, not recorded
+   as a broken-link placeholder, so `ln -s /external/tool` yields *nothing* in
+   the tree. Silence over noise.
+
+6. **Lexical normalization (`expand_path`) can disagree with kernel resolution**
+   when a parent directory is itself a symlink — `symlink_target` may not match
+   where the OS actually lands. `realpath` would match the kernel but can loop.
+
+7. **Wipe/re-import resolves existing rows but destroys FileChange history** —
+   the same history #74 is about. Clean correctness now, audit/history lost.
+
+8. **Pathspec-not-id re-introduces path-identity churn (#90).** The target is a
+   path string, so a target rename silently re-points rather than being a stable
+   reference.
+
+## Consequences
+
+**Positive**
+- Loader/watcher parity; symlinks stop being silently materialized as their target.
+- The link is first-class (a badge can be rendered from `symlink_target`).
+- No change to content/edit/read semantics for real files and folders, because
+  `ftype` is unchanged.
+
+**Negative / open**
+- **Operation semantics:** a DBFS op must not append to a symlink entry's
+  `file_changes`. Writes resolve to the target (transparent shell behavior); a
+  write to a dangling or out-of-root target is refused.
+- **Flusher write-through is a requirement, not an OS guarantee.** `VfsFlusher`
+  currently uses `File.write` (follows the link and truncates the target, which
+  is correct), but it must never unlink/recreate or write-temp-then-rename on a
+  symlink `srcpath`, or it would replace the link with a regular file and the
+  link is gone.
+- **Watcher write-through already works.** A write through a symlink fires inotify
+  on the **target's** parent directory, so `handle_event` sees the real target
+  path and no new `close_write` handling is needed for it. Only link
+  create/retarget/delete needs new watcher handling.
+- **Existing rows:** out of scope. Existing materialized copies (e.g.
+  `/carbide2-server/worker/*`) are resolved by wiping DBFS and re-importing the
+  VFS from scratch — a separate change-group, not migration logic here.
+- **`binary` + `symlink_target`:** a symlink-to-binary resolves to a binary file;
+  `binary` is meaningless on the link row itself (metadata-only) and is read from
+  the resolved target.
+
+## Out of scope
+
+**Hardlinks** are not modeled. A hardlink is an inode alias, not a pathspec: it
+*is* the file, so there is no target string to record, and `mv`/unlink semantics
+differ. They are not used in practice here and can be revisited separately.
+
+Symlink handling here is **best-effort structural representation, not
+POSIX-faithful link semantics**. Retarget mechanics (`ln -sfn` can temp-and-rename
+rather than delete+create) and create-before-target ordering are known-unhandled
+and resolved by re-import until the rewrite. Access-time chain resolution is a
+bounded list walk (see Resolution), not kernel-equivalent `realpath`/ELOOP behavior.
+
+## Alternatives considered
+
+- **Third `ftype: 'symlink'`** — *unresolved, exploratory.* Rejected for v1 only:
+  it loses the resolved-type distinction between a file symlink and a directory
+  symlink and breaks every existing `file`/`folder` branch. A first-class
+  symlink type (with target resolved separately) may be the better end-state if
+  symlinks become a real editing/collaboration surface rather than "survive
+  contact with the shell."
+- **Self-referential `symlink_id` FK / target-entry id** — rejected: a target is
+  a path string, and an in-root target may not be imported yet; no `DirectoryEntry`
+  row is guaranteed to exist. Storing a target row id also creates stale-FK
+  bookkeeping on every rename/move/delete of the target.
+- **Skip symlinks everywhere** — rejected: loses real in-root workspace paths and
+  still leaves the loader/watcher divergence.
