@@ -7,7 +7,10 @@ sidebar:
     text: Proposed
     variant: note
 status: Proposed
-date: "2026-09-03"
+date: "2026-08-24"
+supersedes:
+  - label: ADR-007 Shell Pod Resource Limits
+    href: /design/decisions/adr-007-shell-pod-resource-limits/
 ---
 
 import AdrHeader from '../../../../components/AdrHeader.astro';
@@ -51,8 +54,7 @@ live cluster state — and routes to one of the two paths.
 
 - `resources.requests` / `resources.limits` (CPU/memory)
 - `workspaceImage` / `workspaceImageTag` / `workspaceImagePullPolicy`
-- the workspace **shell** image/tag (a patch transition — roll the shell pod, no
-  data movement; lifecycle ownership is ADR-029)
+- the workspace **shell** image/tag (the `carbide2-shell` image the shell pod runs)
 - ingress fields
 
 **Migration transitions** (data movement; new object + copy + cutover):
@@ -133,7 +135,7 @@ Start with four, chosen to prove the mechanism rather than to model a real
 tier catalog:
 
 | Template | Shell-CPU | Shell-RAM | Workspace-CPU | Workspace-RAM | storageSize |
-| --- | --- | --- | --- | --- | --- |
+|---|---|---|---|---|
 | `tiny` | 200m/1C | 128MB/1GB | 200m/1C | 512MiB/1GB | 1GB |
 | `small` | 1000m/2C | 256MB/2GB | 500m/2C | 512MiB/2GB | 4GB |
 | `medium` | 2000m/4C | 512MB/4GB | 1000m/2C | 512MiB/3GB | 16GB |
@@ -153,16 +155,14 @@ the Deployment is ever pointed at it.** A cutover to a new volume that is
 empty or partial is the one failure this sequence exists to make impossible.
 
 1. Provision the new PVC at the target size (same StorageClass).
-2. Scale the workspace Deployment **and the shell Deployment** (ADR-029) to 0.
-   Both mount the same PVC; a live eager shell would keep writing during the
-   copy and break the byte-for-byte guarantee.
+2. Scale the workspace Deployment to 0 (Recreate strategy, single replica —
+   already the shape).
 3. Copy old → new (a one-shot copy job in the workspace namespace) such that
    the new volume is a byte-for-byte replica of the old.
 4. Verify the copy — file count and, for text files under a size threshold,
    content — before touching the Deployment.
 5. Patch the Deployment's volume to reference the new PVC.
-6. Restore the workspace to 1 and verify Ready; restore the shell to its
-   mode-appropriate replica count (lazy restores to 0, eager to 1).
+6. Scale back to 1 and verify the workspace is Ready.
 7. Update the CR `spec.storageSize` (it is already the desired value; this is
    convergence bookkeeping) and only then delete the old PVC.
 
@@ -196,25 +196,142 @@ contract:
 
 1. **The operator stays DB-free.** The moment it reads a `Project` row to get
    a field, the CR stops being the complete contract and the split requires
-   giving the operator a DB connection. Defaults (e.g. `spec.shell.mode`) are
-   therefore resolved by Rails and stamped into `spec` before the operator
-   ever sees the CR — never resolved by the operator from the DB.
-2. **Rails directly mutates nothing but the Workspace CR; cluster state changes
-   only through the operator.** Rails never creates, patches, or deletes a
-   Kubernetes object (Deployment, PVC, Service, Namespace, Secret, Role…). It
-   mutates cluster state **indirectly** — by writing the CR, which the operator
-   reconciles into objects — because *something* must mutate objects directly,
-   and that something is the operator, never Rails. A direct `kubectl patch pvc`
-   would re-couple the two halves; the storage resize is expressed as a CR
-   `spec` change, never as a direct object write. Reading cluster state and
-   minting subresource tokens (e.g. `serviceaccounts/token` for the shell exec
-   grant, ADR-029) are the only direct k8s touches beyond the CR, and they
-   mutate no object.
+   giving the operator a DB connection.
+2. **Rails writes nothing but Workspace CRs.** A single `kubectl patch pvc`
+   from Rails re-couples the two halves; the storage resize is expressed as a
+   CR `spec` change, never as a direct k8s write.
 3. **The CR stays the complete desired-state contract.** Every field the
    operator needs to build or migrate lives in `spec`. Resize state that is
    not in the CR would force the operator to reach outside the seam.
 
 These three invariants are the split; the rest is packaging.
+
+### 7. The shell pod moves to `-control`, superseding ADR-007
+
+[ADR-007 (Shell Pod Resource
+Limits)](/design/decisions/adr-007-shell-pod-resource-limits/) documented shell
+settings in `ProjectSetting` and the worker creating the shell pod. The worker
+has owned shell launching through every backend: **bare-run → docker → kube.**
+In bare-run it spawned the shell directly; in docker it ran `docker exec`; when
+the cluster arrived (~6/2) that responsibility was translated to `kubectl apply`
+via `ProjectPod`, because the kube backend had to work that week and "shell
+still launches" was the priority, not "which process should own shell pods."
+Even if the ownership smell had been noticed then, fixing it would have ranked
+below making the shell work in kube at all. It is inherited responsibility,
+kept through three backends, not a decision that was correct and then broke.
+
+Now that the operator owns every other workspace resource, "the worker shells
+out to `kubectl` to make a pod" is the same worker-reaches-into-the-cluster
+smell the API-not-exec correction targets. **ADR-007 was also never
+implemented**: the `shell_cpu_*` / `shell_mem_*` columns it proposed do not
+exist in `project_settings`, and `project_pod.rb` still hardcodes the same
+limits the ADR opened with. Superseding it here is therefore the first time the
+durable shell-shape source of truth actually lands, not a migration off a live
+implementation. The shell pod becomes a **workspace
+resource**, owned by `-control`'s operator path:
+
+- The worker asks control (an API call) for a shell, instead of `kubectl apply`
+  itself. "Give me a shell for project N" becomes a request to the control
+  plane, not a subprocess the worker spawns against the cluster.
+- Shell shape (image, CPU, memory) lives in the Workspace CR / template, the
+  same as the workspace pod's shape, and is applied by the operator at shell
+  create time.
+- The worker keeps the **PTY streaming** — the one legitimate exec (spawning
+  and streaming `bash`) stays in the shell pod, but the pod itself is
+  provisioned by `-control`, not by the worker reaching into k8s.
+
+**Shell exec is authorized, not trusted.** The worker does not hold blanket
+`pods/exec` (or any pod-mutating RBAC) that could reach arbitrary pods, and
+does not know how to authenticate to Kubernetes for it. The PTY stream stays
+worker↔shell — it does **not** route through control — but the authorization to
+reach the shell comes from control, and it is **bounded, not forbidden**: the
+worker may exec into *its own workspace's* shell pod(s), and nothing else.
+
+- Control creates the shell pod and mints a **pod-scoped exec grant** bound to
+  exactly that shell pod's `pods/exec` subresource (`resourceNames:
+  [shell-pod-X]`, `verbs: [create]`). The grant may be session-lifetime (issued
+  at stream start) or workspace-shell-lifetime (valid for that workspace's
+  shell pods generally); either way it names a specific pod, never "any pod."
+  Revoking on terminal close is an optional further tightening, not the
+  mechanism — the mechanism is the single-pod bound.
+- The worker uses that grant only for the exec/attach connection that streams
+  the PTY. It holds no cluster-wide exec authority of its own, and the grant is
+  pod-scoped, so a leaked token can reach nothing but that shell's stream.
+- The worker's own ServiceAccount loses `pods/exec` (and any lingering pod
+  create/delete for shells); it only ever presents control-issued, per-shell,
+  expiring grants.
+
+This keeps the shell reachable without routing the stream through control, and
+without giving the worker a standing credential that could exec into any pod.
+
+**The worker gets a handle, not a pod.** Shell lifecycle is hidden behind one
+idempotent endpoint:
+
+```
+POST /api/v1/control/workspaces/:id/shell
+  → { shell_pod: "ws-N-shell", exec_token: "<pod-scoped grant>", keep_warm: true }
+```
+
+The worker does not know whether the shell is a Deployment or a bare pod, and
+does not create or delete pods itself. It asks for a handle; control returns the
+current shell pod name plus a fresh exec grant, **creating the shell if it does
+not already exist**. A missing shell is transparently re-created on the next
+request, which is the fix for the old auto-die behavior (a bare `restartPolicy:
+Never` pod that died and stayed dead).
+
+**Keep-warm is a per-workspace policy, not a global architecture choice.**
+`spec.shell.keepWarm` (default `true`) selects between two lifecycle modes that
+share the same handle endpoint:
+
+- `keepWarm: true` — the shell is a Deployment with one replica; an idle shell
+  stays alive (cheap — an idle `bash` is a few MiB, though the pod reserves its
+  `requests` from the node). `POST .../shell` is then a no-op after first
+  creation: the Deployment always exists and self-heals, so there is always one
+  handle to return.
+- `keepWarm: false` — the shell is a bare pod created on first request and
+  deleted when the last terminal closes. Zero idle footprint at the cost of
+  control tracking existence and recreating on death (the auto-die bookkeeping).
+
+The toggle is settable from the workspace settings (the same `PATCH` surface as
+resources) and is carried in the CR `spec.shell.keepWarm`. Both modes return the
+same handle shape; only the lifecycle behind it differs.
+
+### 8. Exec transport: the worker streams, it does not manage pods (#50)
+
+§7 moves shell **lifecycle** to `-control` and narrows the worker to a
+pod-scoped exec grant. This section settles what the worker **does with that
+grant** to stream the PTY — the residual surface #50 raised. The two
+candidates are:
+
+1. **`kubectl exec` with the scoped grant.** The worker still forks `kubectl`,
+   but now presents only the pod-scoped grant (KUBECONFIG / in-cluster token
+   bound to that one shell pod), never a standing cluster credential. This is
+   the current transport with the authorization model swapped underneath it.
+2. **Direct WebSocket exec.** The worker POSTs
+   `/api/v1/namespaces/{ns}/pods/{pod}/exec?command=bash&...&tty=true` and
+   upgrades to the `v5.channel.k8s.io` subprotocol, writing stdin / reading
+   stdout/stderr / sending resize frames itself. No `kubectl`, no local PTY
+   bridge, no shell-string.
+
+**The decision is a transport choice, not an ownership choice.** Ownership is
+§7 and is settled. Whether the exec bytes ride `kubectl` or a direct WebSocket
+is an implementation detail with one real discriminator: **terminal resize.**
+
+- `kubectl exec` gives resize "for free" today — the local `PTY.spawn` master
+  receives `TIOCSWINSZ` and `kubectl` forwards it; nothing new to prove.
+- Direct WebSocket exec requires a resize story over the WS channel-4 frame.
+  This has historically been the least-proven part of the exec subresource and
+  **must be spiked before this path is chosen** (does a channel-4 frame actually
+  change the remote PTY on the target cluster version?).
+
+**Default lean:** keep `kubectl exec` under the *narrowed* pod-scoped grant as
+the interim transport, because the PTY stream is the most failure-intolerant
+path in the worker and direct-WS resize is unproven. Direct WebSocket exec is
+the preferred end-state **only if** the resize spike succeeds, at which point
+`kubectl` leaves the image as a *consequence*, not a goal. "Drop `kubectl`" is
+not itself the objective; the objective is: the worker owns no pod lifecycle
+and holds no standing cluster exec authority. The transport it streams over is
+secondary.
 
 ## Consequences
 
@@ -253,7 +370,16 @@ These three invariants are the split; the rest is packaging.
    "usage" means — DBFS text + binary PVC bytes, or PVC bytes only) is open.
 3. **Template storage.** Resolved: DB-backed (`workspace_templates` table) as
    implemented in ADR-025, not a ConfigMap. The shell-pod half of the template
-   (shell CPU/RAM columns) lands with ADR-029.
+   (shell CPU/RAM columns) is added with §7's shell-pod move.
+4. **Exec-grant mechanism.** §7 says the worker streams with a pod-scoped,
+   control-issued exec grant; the concrete form is open — a Kubernetes
+   `TokenRequest` with `boundObjectRef` targeting the shell pod, or a
+   control-minted short-lived token for the `pods/exec` subresource.
+5. **Exec transport resize spike.** §8 defers direct WebSocket exec on the
+   unproven resize-over-WS path. The spike: establish a raw WS exec connection,
+   send a channel-4 resize frame, and verify `stty size` reflects it on the
+   target cluster version. This is the entry gate for the direct-WS transport;
+   until it passes, `kubectl exec` under the scoped grant remains.
 
 ## Alternatives considered
 
@@ -262,8 +388,7 @@ These three invariants are the split; the rest is packaging.
   contract, and a resize must be a spec change, not a cluster write.
 - **New WorkspaceTemplate CRD now.** More correct long-term (versioned presets),
   but adds a second kind of object before the mechanism that consumes it is
-  proven. Rejected in favor of the DB-backed `workspace_templates` table (§3),
-  which ADR-025 already implemented.
+  proven. Rejected in favor of a ConfigMap until templates need lifecycle.
 - **`storageClassName` as a template field / transition.** Attractive for
   "upgrade to Longhorn," but it is deployment-level, not per-workspace, and
   the operator has no safe story for cross-node data relocation of an RWO

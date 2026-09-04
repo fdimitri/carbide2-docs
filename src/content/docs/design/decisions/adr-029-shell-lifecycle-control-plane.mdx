@@ -1,0 +1,412 @@
+---
+title: "ADR-029: Shell Lifecycle Owned by Control; Worker Streams Only"
+description: "The shell pod moves from worker-kubectl to a control-owned workspace resource: mode enum, handle endpoints, namespace-scoped exec grants, and idle-down via worker refcount."
+sidebar:
+  order: 29
+  badge:
+    text: Proposed
+    variant: note
+status: Proposed
+date: "2026-09-03"
+extends:
+  label: ADR-016 (Workspace Shape Transitions, Templates, and the Control Plane Boundary)
+  href: /design/decisions/adr-016-workspace-shape-transitions/
+supersedes:
+  - label: ADR-007 (Shell Pod Resource Limits)
+    href: /design/decisions/adr-007-shell-pod-resource-limits/
+---
+
+import AdrHeader from '../../../../components/AdrHeader.astro';
+
+<AdrHeader {...frontmatter} />
+
+## Context
+
+The worker has owned shell launching through every backend: bare-run (PTY
+spawn), docker (`docker exec`), and kube (`kubectl apply` via `ProjectPod`, with
+self-managed reference counting and readiness polling). In the kube backend the
+worker reaches into the cluster to create pods — the same
+worker-reaches-into-the-cluster smell this ADR's predecessors have been closing
+around, and a violation of the "Rails writes nothing but Workspace CRs, the
+operator owns every other object" boundary the rest of the control plane already
+enforces.
+
+ADR-007 proposed durable shell shape in `ProjectSetting` and the worker as the
+launcher; it was never implemented — the `shell_cpu_*`/`shell_mem_*` columns do
+not exist and `project_pod.rb` still hardcodes its limits. ADR-016 carried the
+shell as a §7/§8 concern; this ADR extracts and settles it, superseding ADR-007.
+
+## Decision
+
+### 1. The shell is a control-owned workspace resource
+
+The shell pod is provisioned by the control operator, exactly like the
+workspace Deployment, PVC, Service, and IngressRoute. The worker holds **no pod
+lifecycle authority**: it does not create, delete, scale, describe, or
+readiness-poll shell pods. Its only remaining shell responsibility is streaming
+the PTY into a pod control has already provisioned. `ProjectPod` and the
+docker-backend `ProjectContainer` path in kube mode are deleted.
+
+Shell shape (image, tag, CPU, memory) lives in the Workspace CR / template,
+applied by the operator at shell reconcile time — same as the workspace pod's
+shape. Under ADR-016 §1 this makes shell image/resources a **patch transition**
+(roll the shell pod, no data movement); this ADR owns the lifecycle, not the
+shape semantics.
+
+### 2. Lifecycle mode is an enum, and demand state is a separate field
+
+```yaml
+spec:
+  shell:
+    mode: eager | lazy | disabled   # default eager
+    replicas: 1                     # derived demand (0|1), written by Rails, read by operator
+    image: carbide2-shell:dev
+    imagePullPolicy: IfNotPresent
+    resources:
+      requests: { cpu: 50m, memory: 128Mi }
+      limits:   { cpu: "6", memory: 8Gi }
+```
+
+- **`eager`** — the shell Deployment is always present at replicas 1 and
+  self-heals.
+- **`lazy`** — the shell Deployment exists at replicas 0; launched on first
+  demand, suspended on idle. `spec.shell.replicas` carries the demand state.
+- **`disabled`** — no shell object exists. Terminals and agent `shell_exec`
+  report unavailable. Editor, chat, VFS, and agent read tools are unaffected.
+  Cheap; the shell-less posture; need not surface in the dashboard on day one.
+
+**Default resolution (invariant 1 preserved).** Rails resolves the default from
+the global `Setting` `workspace_shell_mode` (env bootstrap `WORKSPACE_SHELL_MODE`),
+records the resolved per-workspace intent on `control_projects.shell_mode`, and
+**stamps the resolved value into `spec.shell.mode`** at create/apply time — the
+ADR-025 pattern (same as `template_name` → `spec.resources`). The operator reads
+only `spec` and never consults the DB.
+
+**Three layers, not one.** The durable input, the stored intent, and the
+applied output are different things:
+
+- `control_projects.shell_terminals` + `control_projects.shell_last_report_at` —
+  the **durable input**, written by Rails on every worker release/heartbeat.
+  Lives on the control-side project row (same table as `template_name` /
+  `workspace_image_tag`), so it survives a control restart.
+- `control_projects.shell_replicas` — the **intent** (0|1), decided by Rails from
+  the input and stored durably. This is what the sweep changes.
+- `spec.shell.replicas: 0|1` — the **applied output**, stamped into the CR only
+  when the intent transitions (1→0 or 0→1), read by the operator. This is the
+  only value the operator acts on.
+
+The DB holds input + intent; the CR holds the applied projection; the operator
+reads only the CR. That keeps invariant 1 true while intent and the refcount
+stay durable.
+
+**Precedence.** `spec.shell.replicas` is consulted **only when `mode: lazy`**.
+Under `eager` the operator holds replicas 1 regardless of what `replicas` says;
+under `disabled` there is no object. This resolves the "reconcile toward spec"
+rule so a refcount-driven `replicas: 0` can never scale an eager shell down.
+
+**Mode transitions.** The user-visible behavior on a mode flip, stated rather
+than left to the reader to derive:
+
+- **eager → lazy** — the shell stays up at the moment of the flip. It becomes
+  *eligible* for idle-down immediately, and drops on the next refcount-0 +
+  idle-timeout decision, not on the mode change itself.
+- **lazy → eager** — Rails writes `replicas: 1` (so the value and the mode
+  agree) and the shell comes up; the operator holding 1 regardless of `replicas`
+  is the load-bearing rule, the write is belt-and-braces.
+- **→ disabled** — object delete (§3); live terminals lose the exec-PTY.
+- **disabled → eager** — object created at replicas 1.
+- **disabled → lazy** — object created at replicas 0 (lazy's default).
+
+**`spec.shell.replicas` is not a user configuration field.** It is **derived
+state** — the operator-facing projection of the durable `terminals: n` refcount —
+written only by Rails. It is not patchable through the ADR-025 surface and is not
+something the dashboard or a user sets directly, unlike `mode`, `image`, and
+`resources`. It lives in `spec` only so the DB-free operator can read it; the
+human-facing knobs end at `mode`/`image`/`resources`.
+
+### 3. Object shape: a Deployment for both eager and lazy
+
+Both `eager` (replicas 1) and `lazy` (replicas 0↔1) are a **Deployment**. A
+lazy shell therefore self-heals once launched, and an eager↔lazy switch is a
+`replicas` patch — no object-kind change, no workspace restart. `disabled`
+creates no object; switching to/from `disabled` is an object create/delete, not
+a patch. On a switch to `disabled`, control deletes the shell object and the
+operator reconciles it away; live terminals lose the exec-PTY and end, the
+worker otherwise runs as normal, and terminal create is refused.
+
+The shell Deployment is scheduled with **pod affinity** to the workspace pod's
+node, because both mount the same ReadWriteOnce PVC. On a node move the two
+cannot swap cleanly while the RWO volume is held by one of them; the PVC holder
+wins and the other waits — the existing RWO constraint, unchanged.
+
+### 4. Handle endpoints: authenticated, split by caller
+
+Both endpoints are **authenticated**. The split is by caller and what is
+returned:
+
+- `GET /api/v1/control/workspaces/:id/shell` — **display-only status**, for the
+  client. `{ phase, ready, reason, mode }`. No pod name, no exec grant.
+  `phase` is `Starting | Running | Idle | Failed | Disabled`; `reason` carries
+  failure detail only on `Failed` (`ImagePullBackOff`, `ErrImagePull`, …). A
+  non-empty `reason` always means "something is wrong."
+- `POST /api/v1/control/workspaces/:id/shell` — **the worker's handle**. The
+  only path returning `{ shell_pod, exec_token }`. **The worker is the only
+  caller** — the exec grant never reaches the browser. `shell_pod` is read from
+  `status.shell.podName` (written by the operator) — Rails never lists pods.
+
+**Sequencing.** The worker calls POST on terminal create. If `ready` is `false`,
+it **re-POSTs with backoff**; POST is idempotent, so it doubles as the worker's
+own poll. **Minting is gated on `ready: true`** — a not-ready POST returns
+`{ ready: false, reason }` with no grant, so an `ImagePullBackOff` loop mints
+nothing. The client's GET is display-only; there is no client↔worker handoff.
+
+The worker learns the pod name from POST, never caches it beyond a single
+terminal's lifetime, and re-fetches every terminal open. A shell-image rollout
+is invisible to a terminal opened after it settles; a terminal opened **during**
+the rollout may get one bad attach (the returned `podName` can name a
+terminating pod), recovered by re-POSTing. `ready: true` is gated on the named
+pod being Ready and not terminating.
+
+### 5. Idle-down: worker refcount plus report-recency, not refcount alone
+
+The up direction is the ensure endpoint. The down direction (lazy 1→0) is
+decided in Rails from two inputs, then expressed as a single `replicas: 0` CR
+write the operator reconciles:
+
+- `POST /api/v1/control/workspaces/:id/shell/release` — `{ terminals: n }`, sent
+  on terminal create/destroy and as a periodic keep-alive. Rails stores both
+  `n` and `last_report_at` durably (§2).
+
+**Scale-to-zero fires when EITHER condition holds:**
+
+1. `n == 0` **and** `now − last_report_at > workspace_shell_idle_timeout`
+   — the graceful path: genuinely no terminals for long enough, and the worker
+   is still alive to say so.
+2. `now − last_report_at > workspace_shell_max_report_time`
+   — the liveness path: the worker has stopped reporting, so it is frozen or
+   dead **regardless of what the last `n` claimed**. A frozen worker with a
+   stale `n: 3` is not three live terminals; it is a dead worker, and its shell
+   is orphaned.
+
+Condition 1 is refcount-aware; condition 2 is refcount-independent. That is the
+point of having both. A healthy worker with zero terminals keeps heartbeating
+`n: 0`, so only condition 1 ever fires for it; a wedged worker stops
+heartbeating, so only condition 2 can catch it.
+
+**Why condition 2 is load-bearing.** A frozen-but-alive worker (e.g. the
+EventMachine reactor wedged, or a hung `kubectl exec`) is still a `Running` pod:
+kubelet does not restart it, and the liveness probe hits Rails `/up`, not the
+worker's reactor, so the Deployment sees it as healthy. Nothing else scales the
+shell down. Only the report-recency rule notices the silence and reclaims the
+orphaned shell. Even when the workspace pod *does* die and restart, the shell
+Deployment is a separate object and survives as an idle replica until this rule
+scales it down — restarting the workspace does not tear the shell down.
+
+The 0→1 direction is **not** debounced: any `n > 0` report (or the ensure POST)
+refreshes `last_report_at` and writes `replicas: 1` immediately. At carbide
+scale that is acceptable; a reconnect storm writes the CR once per workspace,
+which is deliberate, not a surprise.
+
+**Threshold relationship.** `workspace_shell_max_report_time` must exceed
+`workspace_shell_idle_timeout` (a liveness ceiling should be longer than a
+graceful-idle grace), and both must comfortably exceed the heartbeat interval,
+or a single missed heartbeat reads as a dead worker and scales a live shell
+down.
+
+Client-driven idle-down is rejected: the browser is not a trustworthy liveness
+signal — a closed tab, refresh, or crash would strand a shell with no reliable
+"last terminal gone" event.
+
+**Sweep execution: `bin/clock`, uncoordinated, no leader election.** A small
+`bin/clock` loop runs the sweep on an interval: evaluate both conditions over
+`control_projects` (lazy, intent currently 1), and where the result differs from
+`control_projects.shell_replicas`, update the intent column and stamp the CR on
+the transition. It is deliberately **uncoordinated** — every control replica
+runs its own clock, offset by an env var (`SHELL_SWEEP_OFFSET`, a per-replica
+time slice) so replicas stagger rather than collide on the same CR write. Each
+replica does the full sweep at a different time; the redundancy is idempotent
+and cheap. This is imperfect — no shared lock, no queue, no persistence of the
+sweep cursor — but it is the fastest path to something that works, and it is
+accepted as such. Operator concurrency, partitioning, replica count, and the
+Rails↔kube contract are revisited in ADR-030.
+
+### 6. Credentials: two audiences, no standing authority
+
+The worker authenticates to **two different audiences**, with two different
+credential shapes.
+
+**Worker → control** (ensure, status, release/keep-alive). The worker presents
+a **projected ServiceAccount token** with audience `carbide-control`, mounted and
+auto-rotated by the kubelet, bound to the workspace pod. It dies when the pod
+dies — implicit retirement, no hand-rolled expiry or revocation. Control
+verifies it with a **TokenReview** (audience + SA identity match), cached
+briefly.
+
+**Worker → kube exec** (the PTY stream). Control mints a short-lived,
+**namespace-scoped** exec token on each ready `POST /shell` and returns it in the
+handle. The per-workspace RoleBinding to the fixed `carbide-workspace-exec`
+ClusterRole grants `get pods` + `create pods/exec` in the
+workspace's own namespace to a dedicated exec ServiceAccount — no
+`resourceNames`, no `boundObjectRef`.
+
+**Why namespace scope is the right scope.** A `ws-N` namespace contains exactly
+the workspace pod (which the worker is already running inside), its shell pod,
+and the transient storage-migration copy job (ADR-016 §4) — nothing the worker
+does not already have or own. A leaked namespace-scoped token therefore reaches
+nothing the worker could not already touch. This closes the pod-scoped-vs-
+namespace-scoped question and removes the need for a deterministic pod name — §3
+stays a Deployment.
+
+**The condition that reopens it.** If a per-workspace database pod ever lands in
+`ws-N` (per-workspace CNPG), namespace scope would then also reach that pod,
+which holds credentials the worker does not. At that point pod-scoping
+(`resourceNames` + `boundObjectRef`) must be reconsidered. Until then, pay for
+nothing.
+
+**Who mints what.** The chart installs two fixed ClusterRoles: `carbide-workspace-exec`
+(`get pods`, `create pods/exec`) and `carbide-workspace-token-mint`
+(`create serviceaccounts/token`). The operator creates only the per-workspace
+**RoleBindings** — exec SA → `carbide-workspace-exec`, Rails SA →
+`carbide-workspace-token-mint` — and never creates a Role. Rails mints **only
+the token**; it never creates Role/Binding objects.
+
+**RBAC authority, not escalation.** Binding a fixed ClusterRole needs no
+`escalate` (nothing is dynamically created), and the operator already holds
+`pods/exec`, so the exec RoleBinding needs no `bind` either. The only new
+permission is `serviceaccounts/token` on the operator — minting a token bounded
+by the target SA's own RBAC. Under the current topology the operator is the most
+privileged SA in the cluster, so minting a token for another SA grants it
+nothing it does not already hold; revisit if a more-privileged SA ever exists.
+This is strictly narrower than `bind` on clusterroles, which would let the
+operator delegate arbitrary permission.
+
+**This is the named exception to ADR-016 §6 invariant 2.** Rails does not
+**directly** mutate cluster state (it changes it only through the CR), but it
+does mint a `serviceaccounts/token` for the shell exec grant — a subresource
+write that mutates no object. That is the sole direct k8s touch beyond the
+Workspace CR, and it is deliberate, not scope creep.
+
+The worker's own ServiceAccount loses every cluster verb inherited from the
+`ProjectPod` era — `pods`, `pods/exec`, `pods/log`, `pods/portforward`,
+`configmaps`, `secrets`, `persistentvolumeclaims` — and holds **no standing
+cluster credential**. There is no fallback to the worker's own SA; a missing or
+expired exec grant is resolved by re-POSTing the handle.
+
+This is acceptable because the flow is **workspace → shell, one direction**: the
+worker streams into its own shell and exposes no surface the shell can call back
+into. It is materially less dangerous than bidirectional workspace ↔ shell
+trust, and the token is short-lived, with namespace teardown as the long-term
+boundary (§7).
+
+**The PTY bytes do not route through control.** "One direction" above describes
+trust (who may reach whom), not the wire path. The exec/attach connection is
+worker↔shell directly — control only provisions the shell, mints the short-lived
+grant, and returns the handle; the stream itself never traverses control. The
+only control-mediated traffic is the handle/status/release HTTP surface.
+
+### 7. Revocation: TTL plus namespace teardown, not per-pod GC
+
+The two chart-installed ClusterRoles are cluster-scoped and exist for the
+cluster's lifetime. The operator creates only the per-workspace **RoleBindings**,
+which are namespace-scoped and die with the `ws-N` namespace when the workspace
+is deleted. There is no per-pod-generation churn to garbage-collect, and **no
+`ownerReference` to the Workspace CR** — the CR lives in `carbide-system`, the
+RoleBinding lives in `ws-N`, and a cross-namespace ownerReference would make the
+GC treat the owner as missing and collect the binding. Namespace teardown is the
+ownership mechanism. The token is short-lived, so a leaked token self-expires;
+namespace teardown is the long-term boundary.
+
+### 8. Exec transport
+
+`kubectl exec` under the namespace-scoped grant is the transport — the current
+mechanism, with only the authorization model swapped underneath it. The worker
+forks `kubectl` presenting the short-lived namespace-scoped token (KUBECONFIG /
+in-cluster token), never a standing cluster credential; the ClusterRole grants
+`get pods` + `create pods/exec` (`kubectl exec` does a GET before the exec
+subresource).
+
+Direct WebSocket exec — and removing `kubectl` from the worker image — is a
+**possible future**, not an objective of this ADR. The objective is ownership:
+the worker owns no pod lifecycle and holds no standing cluster exec authority.
+
+## Consequences
+
+**Positive**
+
+- Worker stops reaching into the cluster: one object kind, one owner, one
+  reconcile path, matching the rest of the workspace.
+- Eager/lazy/disabled is one field, hot-switched, no workspace restart.
+- The exec grant is namespace-scoped and short-lived, and the worker holds no
+  standing cluster authority.
+- Shell image/limits become a CR/template edit — same surface as the rest of the
+  workspace, no in-pod hardcoding.
+
+**Negative / to resolve**
+
+- New worker→control coupling (ensure, status, release, keep-alive) plus a new
+  credential surface to operate.
+- Lazy demand is a CR write per cold start, and idle-down is a CR write per idle
+  transition.
+- Rails gains `create serviceaccounts/token` (via the fixed
+  `carbide-workspace-token-mint` ClusterRole); the operator gains
+  `serviceaccounts/token` — minting a token bounded by the target SA's own
+  RBAC, which under the current topology grants it nothing new. No
+  `escalate`/`bind` is needed. The worker gains a new worker→control coupling
+  (ensure/status/release).
+- Namespace-scoped `pods/exec` reaches the workspace pod too (the worker already
+  runs there); revisited if a per-workspace database pod lands in `ws-N`.
+
+## Open questions
+
+1. **Refcount column shape.** Resolved: `control_projects.shell_terminals` +
+   `control_projects.shell_last_report_at` (the same table carrying
+   `template_name` / `workspace_image_tag`). The values are settled; the column
+   names are settled.
+2. **Idle + report thresholds.** Default values for `workspace_shell_idle_timeout`
+   and `workspace_shell_max_report_time` live in the global `Setting` table;
+   per-workspace overrides (if any) are `control_projects` columns. Their
+   ordering (`max_report_time > idle_timeout`) is settled; the numbers are not.
+3. **TokenReview cache TTL.** How long the worker→control TokenReview is cached.
+   A cached review lets a deleted worker authenticate until expiry and could
+   write `spec.shell.replicas: 1` for a dead workspace; bounded by TTL and
+   self-corrected by the idle timeout, but the TTL needs a value.
+4. **Direct WebSocket exec.** Deferred possible future, gated on a later spike
+   that a raw WS channel-4 resize frame actually changes the remote PTY.
+
+## Deferred to ADR-030
+
+The shell-lifecycle mechanism above deliberately assumes a **single operator
+replica** and an **uncoordinated control plane**. The following are out of scope
+here and are the seeds of ADR-030 (a larger ADR defining the operator and the
+Rails↔Kubernetes interaction contract):
+
+- **Operator concurrency model** — leader election vs. hash-partitioning vs.
+  the single-writer status quo. Today there is exactly one reconciler and no
+  fencing; the sweep above is explicitly tolerant of that by being idempotent.
+- **Rails↔kube interaction** — how far Rails may reach into the cluster (CRs,
+  status reads, the `serviceaccounts/token` mint), and where the operator's
+  authority begins. §6.2 states the rule; ADR-030 codifies the full contract.
+- **Control replica count** — scaling control to match node count (and whether
+  that is dynamic as the cluster grows), plus whether control moves to a
+  StatefulSet to gain a stable ordinal for time-partitioning the sweep.
+- **The imperfect sweep** — the `bin/clock` + `SHELL_SWEEP_OFFSET` staggering is
+  the quick path; a durable, collision-free sweep is an ADR-030 concern.
+
+## Alternatives considered
+
+- **Keep the worker as launcher (status quo).** Rejected: worker-reaches-into-
+  cluster, violates the control boundary, and hardcodes shell shape in-pod.
+- **`keepWarm` boolean (ADR-016 §7 as originally written).** Rejected: can't
+  express `disabled` without a second field, and hard-links lazy to a bare pod.
+- **Pod-scoped grant (`resourceNames` + `boundObjectRef`).** Rejected once the
+  namespace scope decision landed: it required a deterministic pod name (a
+  StatefulSet), a pod-creation-triggered reconcile, and solved a problem — a
+  per-workspace database pod — that does not exist. Reopened only by that
+  future pod.
+- **StatefulSet for a deterministic shell pod name.** Rejected: the deterministic
+  name existed only to pin pod-scoped RBAC, which namespace scope no longer
+  needs.
+- **Client-driven idle-down.** Rejected: browser is not a trustworthy liveness
+  signal.
+- **Operator mints the grant.** Rejected: heavier round-trip or sidecar for no
+  security gain over Rails' narrow grant.

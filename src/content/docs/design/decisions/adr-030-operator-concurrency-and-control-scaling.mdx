@@ -1,0 +1,144 @@
+---
+title: "ADR-030: Operator Concurrency and Control-Plane Scaling"
+description: "How multiple control-plane replicas and multiple operator replicas coexist without double-reconciling: control is stateless and scaled, the operator is the sole mutator of cluster state, and the single-writer assumption is replaced deliberately."
+sidebar:
+  order: 30
+  badge:
+    text: Exploratory
+    variant: note
+status: Exploratory
+date: "2026-09-03"
+extends:
+  label: ADR-029 (Shell Lifecycle Owned by Control; Worker Streams Only)
+  href: /design/decisions/adr-029-shell-lifecycle-control-plane/
+related:
+  - label: ADR-016 §6 (Rails/operator invariants)
+    href: /design/decisions/adr-016-workspace-shape-transitions/
+---
+
+import AdrHeader from '../../../../components/AdrHeader.astro';
+
+<AdrHeader {...frontmatter} />
+
+## Context
+
+ADR-029 moved the shell pod to `-control` and left two things deliberately
+unresolved, pointing them here:
+
+1. The operator is currently assumed to be **a single replica**. It watches
+   Workspace CRs and reconciles without leader election, fencing, or any notion
+   of "which replica owns which workspace." One reconciler is safe; two are not.
+2. The control plane (Rails) is **stateless** and could run many replicas, but
+   nothing says how many, how they coordinate the sweep, or how far Rails may
+   reach into the cluster.
+
+This ADR decides those two things. It is a skeleton: the mandatory requirements
+are fixed, the mechanism choices are recorded as options to be settled.
+
+## Mandatory requirements
+
+- **Many active control replicas.** The control plane runs N replicas (target:
+  roughly the node count), all active, none standby. It is stateless and
+  horizontally scaled. Nothing in the request path may assume "the one Rails."
+- **Many operators.** The operator runs M replicas. Each workspace reconciles
+  exactly once regardless of M — no double-reconcile, no two writers patching
+  the same object.
+
+## What has to be true for "many of each" to be safe
+
+### 1. Control replicas are interchangeable and uncoordinated
+
+- Request path is stateless: auth, token mint, workspace CRUD, shell
+  ensure/status/release all work against any replica.
+- Coordination that does not need to survive a restart (e.g. sweep staggering)
+  is in-memory per replica, keyed by a stable per-replica slice (env var).
+- Coordination that *does* need to be shared is in Postgres (the one shared
+  store both control replicas already use), never in a process-local variable.
+
+### 2. The operator is the only mutator of Kubernetes objects
+
+Restated from ADR-016 §6 and made explicit for M > 1:
+
+- Rails directly mutates nothing but the Workspace CR (plus subresource token
+  mints). Everything else — Deployment, PVC, Service, Namespace, RoleBinding,
+  shell object — is mutated only by an operator replica.
+- The CR remains the complete desired-state contract. An operator replica never
+  reads the control DB; it reads only `spec` and reports into `status`.
+
+### 3. Exactly one operator replica acts per workspace
+
+This is the crux. Options, all satisfying "many operators, one actor per CR":
+
+- **(a) Leader election + fencing.** One replica holds a lease (a `Lease` or
+  configmap in `carbide-system`) and is the only reconciler; the rest are hot
+  standby. Simple semantics, but M-1 replicas do no work.
+- **(b) Hash partitioning.** `hash(workspace.name) % M` assigns each CR to one
+  replica; all M reconcile their own slice. No election, scales work, but
+  rebalances on replica-count change and requires all replicas to agree on M.
+- **(c) Sharded queues.** A queue/worklist partitioned by workspace; operator
+  replicas pull work items, and the queue guarantees single-consumer. Heavier,
+  but gives retries and backpressure for free.
+
+### 4. Rails↔Kubernetes contract
+
+- Rails writes the CR; it does not reach past it to mutate objects.
+- Rails reads `status` (and the CR) for observability — drift, phase, shell
+  pod name — but never treats a read as authority.
+- The operator reports into `status`: observed generation, applied generation,
+  per-resource conditions, and a human-readable `message`. Control reads this;
+  it does not poll the live objects itself.
+
+### 5. The ADR-029 sweep, revisited
+
+ADR-029 shipped the quick path: a `bin/clock` per control replica, offset by
+`SHELL_SWEEP_OFFSET`, idempotent and uncoordinated. Under many replicas this is
+accepted as imperfect. Here it is revisited:
+
+- The sweep remains best-effort and idempotent.
+- A shared, collision-free alternative (a single sweeper, or a partition by
+  replica slice, or a durable sweep cursor) is the thing to decide, not assume.
+- The sweep writes intent in the DB and stamps the CR only on transition —
+  unchanged from ADR-029.
+
+## Open questions
+
+1. **Operator mechanism** — (a) election, (b) hash partitioning, or (c) sharded
+   queue? Which survives an operator restart, a replica-count change, and a
+   mid-migration crash?
+2. **Replica count** — is control `replicas = node count` fixed, or does it
+   follow the node count dynamically as the cluster grows? Does control move to
+   a StatefulSet to gain a stable ordinal for hash/time partitioning?
+3. **Operator count** — is M fixed, or derived (e.g. ceil(workspaces / N) or
+   node count)? Does partitioning assume M is stable for the lifetime of a
+   reconcile, or tolerate rebalance mid-flight?
+4. **Migration safety** — the ADR-016 §4 storage migration is a multi-step state
+   machine. What stops two operator replicas from both running the same
+   migration, or a restarted replica from re-running a half-done step?
+5. **Status contract** — what exactly goes in `status` (observedGeneration,
+   appliedGeneration, conditions), and what does control treat as "converged" vs
+   "failed" vs "in progress"?
+
+## Consequences (once decided)
+
+**Positive**
+- The operator scales past one replica without double-reconciling, and the
+  control plane scales with the cluster.
+- The single-writer assumption becomes a named, enforced contract instead of a
+  silent property of "we only deploy one."
+
+**Negative / to resolve**
+- Whatever mechanism is chosen (lease, partitioning, queue) is new machinery
+  with its own failure modes — a lease to expire, a hash to keep stable, a
+  queue to drain.
+
+## Alternatives considered
+
+- **Keep single operator, single control replica.** Rejected by the mandatory
+  requirements: the whole point is to scale both.
+- **Operator queries Rails for workspace state.** Rejected: inverts the
+  boundary, gives the least-trusted process a cross-tenant read path, and
+  reintroduces the coupling the CR exists to eliminate.
+- **Do nothing and rely on reconcile idempotency.** Rejected as the durable
+  answer: idempotency makes double-reconcile *harmless for plain objects*, but
+  it does not make the migration state machine or roll ordering safe under two
+  writers.

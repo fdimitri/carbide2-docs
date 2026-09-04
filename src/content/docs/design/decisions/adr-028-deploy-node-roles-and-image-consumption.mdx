@@ -1,0 +1,195 @@
+---
+title: "ADR-028: Deploy node roles, publish duties, and derived image consumption"
+description: "How a deploy host expresses what it is (cluster membership), what it publishes (build/push/registry), and how its own cluster consumes images — without one flag answering all three questions."
+sidebar:
+  order: 28
+  badge:
+    text: Proposed
+    variant: note
+status: Proposed
+date: "2026-09-02"
+extends:
+  label: ADR-025 (Workspace Spec Patching, Roll, and Image Tag Listing)
+  href: /design/decisions/adr-025-workspace-spec-patching-and-roll/
+---
+
+import AdrHeader from '../../../../components/AdrHeader.astro';
+
+<AdrHeader {...frontmatter} />
+
+## Context
+
+A single deploy host answers three independent questions, and today one flag
+(`registry.host`) is used to answer all three:
+
+1. **Membership** — what cluster does this box belong to, and in what role?
+2. **Publish** — what does this box produce for *other* boxes: build images,
+   push them to a registry, or host the registry itself?
+3. **Consume** — how does this box's *own* cluster obtain images: import the
+   local `:dev` images into its single node's containerd, or pull immutable
+   SHA tags from a registry?
+
+Question 1 already has a home (`cluster.backend`, `cluster.role`). Question 2
+has a partial home (`--publish-only`, `--external-registry`). Question 3 has
+**no home at all** — it is inferred from the other two, and inferred wrongly.
+
+The concrete failure this records: a host that runs a k3d cluster for local
+development *and* serves as the build/publish host for a separate k3s cluster
+sets `registry.host` to its own name. That single value flips three pull-side
+code paths:
+
+- `publish_images` stops importing `:dev` and pushes instead.
+- `ControlPlane#install` pins `registry.url`, `image.repository`,
+  `workspace.image`, `workspace.imageTag`, and `workspace.shellImage` into the
+  helm release — pointing the k3d cluster's pods at a registry its containerd
+  does not trust.
+- `roll_deployments` skips the forced rollout on the assumption that helm
+  already rolled the pods via a new immutable tag.
+
+The k3d node never receives containerd registry trust
+(`Node#trust_registry!` is only called on the k3s path), so the pinned
+registry tags are guaranteed `ImagePullBackOff`. The host wanted to *publish*
+to the registry; the code concluded it wanted to *pull from* it.
+
+The fix is not a one-line gate. The flag vocabulary itself has no name for
+"publish for others, consume locally," which is why the conflation keeps
+re-breeding.
+
+## Decision
+
+### 1. Three orthogonal questions get three orthogonal homes
+
+Replace the overloaded `registry:` block with two top-level keys — **what this
+box is** and **what this box offers** — and make the third question derived.
+
+```yaml
+node:                       # membership — what this box IS
+  backend: k3d              # k3d | k3s | none
+  role: init                # init | join | agent | none   (k3s; k3d implies none)
+
+publish:                    # what this box OFFERS to other boxes
+  build: true               # docker buildx the images
+  push: true                # push to a registry (implies build)
+  registry: local           # local | remote | none  (see §2)
+  host: carbide-ws3.lan     # registry endpoint (required unless registry: local-with-hostname-only)
+  port: '5000'
+  ca: ''                    # inline PEM / --publish.ca-file for a remote registry
+```
+
+**Consumption is never a knob.** It is derived from `node` and `publish` per
+the truth table below. A user cannot set "how does my cluster pull images"
+independently and get it wrong.
+
+### 2. The role enumeration
+
+**Membership (`node.backend` / `node.role`):**
+
+- `k3d` — single-node dev (k3s-in-Docker). Role is always `none`.
+- `k3s` + `init` — first full control-plane server (embedded-etcd HA).
+- `k3s` + `join` — additional control-plane server.
+- `k3s` + `agent` — worker/compute node. **Not implemented today**; the code
+  deliberately makes every joiner a full control-plane server.
+- `none` — no cluster (pure publish host).
+
+**Publish (`publish.*`):**
+
+- `build` only — buildx, nothing else.
+- `build` + `push` — build and push to a registry (local or remote).
+- `registry` only — serve a `registry:2` store, no build. **Not expressible
+  today** (today's only route is `--publish-only`, which also builds).
+- `build` + `push` + `registry` — today's `--publish-only`.
+
+### 3. Consumption truth table
+
+| `node.backend` | `node.role` | registry | consumption |
+| --- | --- | --- | --- |
+| `none` | — | any | n/a (publish only) |
+| `k3d` | `none` | absent | import `:dev` |
+| `k3d` | `none` | local (self-hosted) | **import `:dev`** ← the fixed case |
+| `k3s` | `init` | absent | import `:dev` (single-node) |
+| `k3s` | `init`/`join`/`agent` | shared | pull SHA tags |
+
+The rule collapses to: **a single-node backend always imports `:dev`; a
+multi-node backend pulls SHA tags from the shared registry.** Whether the host
+*also* publishes to that registry is irrelevant to consumption.
+
+This makes the broken hybrid trivially expressible and correct:
+
+```yaml
+node: { backend: k3d, role: none }
+publish: { build: true, push: true, registry: true, host: carbide-ws3.lan }
+# derived consumption: import — because backend is k3d
+```
+
+### 4. Validation rules (fail at config-parse, not mid-deploy)
+
+- `publish.push` without `publish.host` is an error — nothing to push to.
+- `publish.registry` of `local` or `remote` without `publish.host` is an error.
+- `publish.registry: local` implies a `registry:2` is run locally; `remote`
+  means push/pull an existing registry (requires `publish.ca`); `none` means no
+  registry involvement.
+- `node.backend == none` with no `publish.*` set is an error — the host does
+  nothing.
+- `node.role` of `join` or `agent` requires `node.backend == k3s`.
+- `node.role == agent` is rejected until the agent tier exists (no silent
+  full-server fallback).
+
+The three existing pull-side sites re-key onto the derived consumption value
+instead of `registry.host`:
+
+- `publish_images`: push when publishing, **and** import `:dev` when
+  consumption is import.
+- `ControlPlane#install`: pin registry coordinates and image tags only when
+  consumption is pull.
+- `roll_deployments`: skip the forced rollout only when consumption is pull.
+
+## Consequences
+
+**Positive**
+
+- The "publish for others, consume locally" host is a first-class, named shape
+  instead of an accidental fall-through.
+- Two roles that are impossible today become possible: a pure registry store,
+  and build+push to a *remote* registry without hosting one.
+- `registry:` returns to meaning one thing — registry coordinates — rather
+  than also encoding machine identity.
+- The k3s multi-node story gains an explicit `agent` tier as a future target
+  instead of being papered over by "every node is a server."
+
+**Negative / to resolve**
+
+- A schema migration: existing `cluster.yaml` files with `registry.host` must
+  be rewritten to the `publish:` shape, and the old key must warn (not
+  silently accept) for one release.
+- `--publish-only` and `--external-registry` are subsumed and must be kept as
+  thin aliases over the new fields during the transition.
+- The `agent` role is specified here but unimplemented; naming it in the
+  schema commits the vocabulary without the code.
+
+## Open questions
+
+1. **Backward compatibility window.** How long `registry.host` continues to
+   work (and whether it maps to `publish.host` + an inferred
+   `publish.registry: local`).
+2. **Agent tier.** Whether `node.role: agent` lands before or after the
+   publish/consume split, since it is orthogonal but touches the same
+   `cluster.role` field.
+
+*Resolved in this ADR: key names are `node`/`publish`; `publish.registry` is a
+`local | remote | none` enum, not a boolean.*
+
+## Alternatives considered
+
+- **A one-line gate: pin registry tags only when `cluster.backend == k3s`.**
+  Rejected as the *recorded* decision (it may still be the immediate bug fix):
+  it removes the symptom but leaves "consume" implicit and derived from a
+  publish flag, so the same conflation returns on the next topology that is
+  not exactly k3d-vs-k3s.
+- **Two cluster.yaml files per topology.** Rejected as the durable answer:
+  it works today but the fact that the user had to *know* which of two files
+  to feed the same host is the defect — the flag vocabulary, not the file
+  count, is what failed.
+- **Keep `registry:` and add `registry.role`.** Rejected: nesting the publish
+  duty under `registry` preserves the lie that the registry block describes
+  only registry coordinates, and `role` is already overloaded by
+  `cluster.role`.
