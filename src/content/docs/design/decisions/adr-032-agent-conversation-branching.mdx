@@ -1,0 +1,301 @@
+---
+title: "ADR-032: Agent Conversation Forking"
+description: How a conversation gets a "fork" affordance — modeled as copying the thread's history up to a fork point into a new self-contained conversation with recursive lineage metadata, not as a git-style in-thread tree.
+sidebar:
+  order: 32
+  badge:
+    text: Implemented
+    variant: success
+status: Implemented
+implementation_exists: true
+date: "2026-09-07"
+extends:
+  label: ADR-011 (Agent Conversation State Model & Per-Pane Identity)
+  href: /design/decisions/adr-011-agent-conversation-state-model/
+related:
+  - label: ADR-002 (Browser Session Tracking)
+    href: /design/decisions/adr-002-browser-session-tracking/
+---
+
+import AdrHeader from '../../../../components/AdrHeader.astro';
+
+<AdrHeader {...frontmatter} />
+
+## Context
+
+A user mid-conversation wants to try a different direction without destroying the
+work they have already done: "what if I asked it differently," "redo from this turn,"
+"explore two approaches in parallel." Today a conversation is a single linear thread
+with no way to fork it. The only escape is to start a fresh conversation and manually
+re-type or copy the context — losing the shared prefix and any provenance of where the
+second attempt split off.
+
+Two things make this the right time and shape the design:
+
+1. **The data model is linear on purpose.** `AgentMessage.turn` is a monotonic integer,
+   unique on `[agent_conversation_id, turn]` (see `schema.rb`), and `AgentSession` keeps
+   a flat `@history` array with a `@turn` counter. `AgentConversation#to_history` is
+   literally `agent_messages.map(&:to_history_entry)`. There is no parent pointer and no
+   fork concept. Retrofitting a tree into this would touch every layer — persistence,
+   resume, `load`, streaming, the tool-call loop, and the client transcript.
+
+2. **"Fork" is already an established concept in this codebase.** `browser_sessions`
+   models a fork as a self-referential `forked_from_id` (see `schema.rb`), and the client
+   renders forked sessions with a `↳` prefix (`ProjectPage.vue`). Reusing that pattern
+   keeps the agent feature consistent with how the rest of the product already thinks
+   about "same thing, second attempt."
+
+## Decision
+
+### 1. A fork is a new conversation, not an in-thread tree
+
+A fork is a **new `AgentConversation` row** seeded from a snapshot of the ancestor's
+message history up to a chosen fork point. It is a fully independent conversation: its
+own `uuid`, its own subscription set, its own `@turn` counter, its own visibility, its
+own `last_activity_at`. Nothing in the send / stream / tool-call / resume path changes.
+
+The fork records **lineage** — *where* it forked from — but does **not** share rows
+with the ancestor after the fork. Later messages on the ancestor do not appear in the
+fork, and vice versa. This is the semantic users expect from a fork: a snapshot of the
+shared prefix, then divergence.
+
+### Deep copy now, references later
+
+A fork is a **deep copy, not a reference**. The reason to ship deep copy now is
+pragmatic, not architectural: copying the prefix is **fast and easy to get predictably
+correct**. The fork is just a second conversation and reuses every existing read/write
+path unchanged, so there are no new edge cases around shared state, revocation, or
+ancestor authorization to reason about.
+
+Deep copy also *happens* to sidestep the private/no-view concern as a side effect: once
+forked, the copy is self-contained and a later `project → private` flip on the ancestor
+cannot revoke the forker's copy. That is a nice property, but it is **not** the reason to
+choose copy *now* — it is the reason refs need care *later*.
+
+References are the long-term shape. They solve the private/no-view concern directly (a
+fork keeps a live view onto the ancestor rather than a frozen snapshot) and they do have
+a small storage effect, but storage was never the motivation. Refs are deferred because
+the deep copy is the fast, obviously-correct starting point; refs can be introduced
+behind the same `agent/fork` surface without changing the fork semantics.
+
+### 2. Schema: two additive, nullable columns on `agent_conversations`
+
+```
+forked_from_id   bigint, null: true, FK → agent_conversations (self)
+forked_at_turn   integer, null: true  # ancestor turn number at which the fork was cut
+```
+
+`forked_at_turn` identifies the fork point because `turn` is unique within the ancestor
+conversation. It is metadata for the UI breadcrumb and for `recent`/`load` lineage; it is
+never used to re-derive history (the fork owns its copied rows). Lineage is **recursive**:
+`forked_from_id` is followed to the origin — parent after parent until a conversation whose
+`forked_from_id` is `null` — so a fork-of-a-fork reports its full ancestry, not just the
+immediate parent. A migration is **additive and nullable**, so it is backward-compatible —
+no data migration and no `SESSION_DOC_VERSION` bump (unlike ADR-011's tab-key change).
+
+### The fork point is a logical turn, not a raw message ordinal
+
+`AgentMessage.turn` is a **per-message** counter, not a turn: one exchange — user
+question + the agent's tool loop + final reply — spans many consecutive `turn` values (the
+assistant call and each of its `tool` results are separate rows). A raw `turn` number can
+therefore land **mid-tool-loop**, between a call and its result, which is not a meaningful
+place to fork.
+
+Introduce **`AgentTurn`** as the logical exchange unit:
+
+```
+AgentConversation has_many AgentMessage        (turn = global linear ordinal, unchanged)
+AgentConversation has_many AgentTurn
+AgentTurn        belongs_to AgentConversation   (its own agent_conversation_id)
+AgentTurn        has_many AgentMessage
+AgentMessage     belongs_to AgentConversation   (required agent_conversation_id)
+AgentMessage     belongs_to AgentTurn, optional: true   # nullable agent_turn_id
+```
+
+This is a **nullable FK on `agent_messages` (`agent_turn_id`), not a join table** — the
+relationship is many-to-one, mirroring the existing `agent_messages.user_id` (nullable
+`belongs_to :user, optional: true`). Nothing re-parents: `to_history` still reads
+`order(:turn)`, fork copies by `turn` range, `load` replays by `turn`. `AgentTurn` is pure
+addition — the label that says "these consecutive messages are one thing."
+
+`fork_at_turn` denotes a **logical-turn boundary**: the copy cutoff is the last message
+turn within the chosen `AgentTurn` (never a position between a call and its result). The
+fork button is offered per logical turn, and the client derives the boundary from the turn
+whose button was clicked.
+
+### 3. Fork semantics
+
+A fork from ancestor `A` at logical turn `T` (an `AgentTurn`) produces fork `B`:
+
+- **Copy** every `A.agent_messages` row whose `turn` falls within `T`'s boundary (i.e. up
+  to the last message turn of `T`), in order, into `B`, re-numbered `0..N` (the `system`
+  prompt row included — it is within the range for any meaningful fork). `B`'s `@turn`
+  resumes at `N + 1`.
+- **`B.forked_from_id`** = `A`, **`B.forked_at_turn`** = `T` — the lineage link.
+- **`B.title`** inherits `A.title` so the fork reads as the same topic; it is
+  re-auto-titled on `B`'s first user ask exactly as today.
+- **`B.visibility`** inherits `A.visibility`: a private thread's fork stays private;
+  a project thread's fork is project-visible. This avoids a private fork leaking.
+- **`B.user_id` (owner)** = the forker (`session.user_id`), consistent with `create`
+  and with the existing rule that any member may post into a project-visible thread.
+- **Not copied:** `last_activity_at` (set to `Time.current`), subscription state (the
+  forker is subscribed as part of the command), and nothing else on the ancestor.
+
+### 4. Authorization mirrors `ask`
+
+Forking a conversation requires the same permission as posting into it: the forker must
+be able to see the conversation and, for a `private` one, be the owner. The fork point is
+always a real logical turn in the ancestor (an `AgentTurn`), never an arbitrary
+user-typed number nor a mid-tool-loop message. Forking a conversation with no completed
+turn yet is rejected.
+
+### 5. Wire command: `agent/fork`
+
+```
+-> { cs:'agent', cmd:'fork', payload:{ conversation_id, fork_at_turn } }
+<- { cs:'agent', cmd:'forked', payload:{ conversation_id, agent,
+       forked_from_conversation_id, forked_at_turn } }
+```
+
+`fork_at_turn` is **derived by the client** from the turn whose fork button was
+clicked — it is never a field the user types. The handler copies the prefix through that
+turn synchronously (conversation sizes are bounded), subscribes the forker, and replies
+with the new UUID — the same shape as `agent/create` / `created`. The client then
+rewrites the pane's tab key to `agent:<newUuid>` (ADR-011's identity model) and renders
+the copied prefix from a `load` of the new conversation.
+
+### 6. Client affordance
+
+**Every turn in the timeline carries a fork button.** Clicking it forks the
+conversation at that turn — the client reads the turn number off the turn and sends it
+as `fork_at_turn`; the user never sees or enters a turn number. The fork opens
+in the current pane as a new tab key, so the ancestor is still reachable by switching
+back — this composes with ADR-011's per-pane, per-conversation maps and needs no new
+store shape.
+
+The explorer tree cannot show per-turn forks (it lists conversations, not turns),
+so its fork affordance is **fork-from-latest**: fork at the conversation's last turn.
+This is a distinct, coarser action from the per-message button, and the two share the
+same `agent/fork` command with different `fork_at_turn` values. `recent`/`loaded` may
+include the lineage fields so the UI can render a `↳` / "forked from …" hint, mirroring
+the browser-session fork indicator.
+
+### 7. Visualization: conversations in the explorer tree, lineage as nesting
+
+Conversations belong in the **explorer tree** alongside Files / Terminals / Channels,
+as a new `Agents` group — not in a dedicated selector. `ExplorerPane` already renders
+terminals and channels as `group:*` nodes from prop arrays (`terminalList`,
+`chatChannels`); agent conversations become a third such list with an `open-agent` emit
+and the same select/context-menu/`open-in-pane` plumbing. `ProjectPage` already has the
+target handler (`selectAgentNode`, routed through `pendingNavigation`'s `kind === 'agent'`
+branch), so this is mostly new props + one emit.
+
+The pane's conversation `<select>` stays **for now** (it is the only conversation surface
+today and removing it in the same change would be a regression), but it is the declared
+retirement target: once the explorer group exists, the dropdown is redundant and should
+be removed. The agent picker (which *agent*, not which *conversation*) is unrelated and
+stays in the pane.
+
+**Fork lineage is rendered as nesting, not as a graph.** Merges are out of scope
+for now (see Non-goals), so lineage is a tree: root conversations (`forked_from_id` is
+`null`) are the top-level children of the `Agents` group, and each fork nests under its
+ancestor, recursively — exactly the recursive ancestry the schema records. PrimeVue
+`Tree` (already in `ExplorerPane`) draws this with no new dependency:
+
+```
+Agents
+├─ Design the schema               (root)
+│   └─ ↳ Design the schema (t12)   (forked at turn 12)
+│       └─ ↳ Design the schema (t20) (fork of the fork)
+└─ Fix the deploy                  (root)
+```
+
+The `↳` prefix reuses the existing browser-session fork indicator (`ProjectPage.vue`
+`sessionOptionLabel`). Node labels are title + fork-point marker only; owner, agent,
+visibility, and relative time live in a tooltip / the pane header, not in the tree label
+(conversation titles + metadata make long, noisy tree rows).
+
+**Guide lines are scoped to the Agents subtree only.** The tree's existing nested
+`<ul>`/`<li>` structure renders the indentation; the little branch lines are pure CSS on
+the Agents group's nodes (dashed vertical spine + a rounded horizontal elbow into each
+row), keyed off a `group-agents` data kind — e.g. `.group-agents .p-tree-node-children`
+and a `::before` elbow on `.p-tree-node-content`. They must **not** apply to the Files,
+Terminals, or Channels groups: there the elbow lines would imply a sequence/derivation
+that does not exist, and would add visual noise. The scoping is by ancestor group, so
+only descendants of the `Agents` node get the lines.
+
+**Why not a git-graph view (yet).** vscode's git graph (and `git-graph`/`gitlens` style
+railroad diagrams) is the natural thing to reach for, but it visualizes a problem this
+feature does not yet have: those lanes exist to show **merges and crossing parallel
+histories**. Fork-only lineage has neither — it is a tree, and a tree component
+represents it exactly and with no bespoke rendering. If merges arrive later (see
+Non-goals), a DAG/graph view becomes the right tool and should supersede the nested
+tree; until then a railroad diagram would introduce lanes and merge edges that cannot
+occur and would mislead readers into expecting a merge affordance that is out of scope
+for this decision.
+
+**Deferred: a compact "spine" view.** If deep chains make the nested tree heavy (many
+indent levels under one long-lived ancestor), a dedicated vertical timeline with forks
+branching right at their `forked_at_turn` is the eventual upgrade — a small SVG
+component, not a general graph library. It is listed so the option is recorded, not
+because it is planned. Both it and the nested tree are subsumed by a DAG/graph view if
+merges are ever added.
+
+### 8. Non-goals (deliberately out of scope)
+
+- **No merge for now.** Forks are independent in this decision; there is no "merge fork
+  into ancestor" affordance. This is a scoping choice, not a permanent exclusion — merges
+  are a plausible future option, and they arrive together with the refs/DAG model (a
+  merged node has two parents, which the single `forked_from_id` column cannot express).
+- **No live tree / parent-pointer messages.** A fork is a snapshot, not a shared
+  DAG. Edits to the ancestor after the fork do not propagate to the fork.
+- **No re-parenting or re-cutting** an existing fork.
+
+## Consequences
+
+**Positive**
+
+- Reuses the entire linear pipeline (persist, resume, `load`, stream, tool-call loop,
+  subscription) unchanged — a fork is just another conversation.
+- Consistent with the existing `browser_sessions.forked_from_id` fork idiom and its `↳`
+  UI, so the mental model matches the rest of the product.
+- Lineage is recorded, so "why does this thread exist" is answerable from the row,
+  not only from the chat.
+- Additive, nullable schema change with no breaking session-doc change.
+
+**Negative / to resolve**
+
+- **Storage duplication:** the shared prefix is copied per fork. Accepted here because
+  the deep copy is the fast, obviously-correct starting point and conversations are
+  bounded; storage is *not* the reason to move to refs later.
+- **Frozen ancestor:** because the prefix is copied, a fork does not see later
+  ancestor messages (and later ancestors do not see fork messages). This is the
+  intended fork semantics, but it is different from a "checkpoint + reflog" model and
+  should not be confused with one.
+- **Recursive lineage costs a chain walk** to render a fork-of-a-fork's full ancestry;
+  bounded in practice (forks are shallow), and the immediate parent is always one hop.
+
+## Alternatives considered
+
+- **Parent-pointer tree within one conversation (git-like).** Add `parent_id` to
+  `agent_messages`, replace the monotonic `turn` with parent-chain ordering, introduce
+  branch heads, and make `@history`/`to_history`/`load`/streaming tree-aware. The
+  powerful option, and the only one that could later support merge. Rejected for v1:
+  it rewrites the one thing that is currently simple and correct (the flat linear
+  transcript) across worker, server, and client, for a benefit nobody has asked for yet.
+- **Shared-prefix reference instead of copy (fork stores a pointer + offset, reads
+  ancestor rows live).** Deferred as the future shape: a reference fixes the
+  private/no-view concern (the fork stays a live view of the ancestor) and has a small
+  storage benefit, but it is neither needed nor worth the correctness edge cases for the
+  first cut. The deep copy is chosen now because it is fast and predictably correct;
+  refs are revisited later behind the same `agent/fork` surface.
+- **Client-only "draft" forking (local alternate timeline, no server change).**
+  Cheap, but the fork is not persisted, not shareable with other members, and lost on
+  reload. Rejected — the whole point is a durable, resumable second attempt.
+
+## Open questions
+
+1. **What refs buy over deep copy.** References solve the private/no-view concern (a
+   fork tracks its ancestor instead of freezing it) and have a small storage effect, but
+   the primary reason to revisit is behavioral, not storage. The precise motivation
+   should be written down before any ref migration.

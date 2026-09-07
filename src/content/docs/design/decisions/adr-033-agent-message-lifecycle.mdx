@@ -1,0 +1,353 @@
+---
+title: "ADR-033: Agent Message Lifecycle (Tombstone, TTL, Rehydrate)"
+description: How an agent conversation's history stops growing without bound — soft-evict message content behind a tombstone, then move to per-message TTL with a pre-expiry warning and rehydrate_ttl renewal, surfaced through a debug expand in the agent pane.
+sidebar:
+  order: 33
+  badge:
+    text: Implemented
+    variant: success
+status: Implemented
+implementation_exists: true
+date: "2026-09-07"
+related:
+  - label: ADR-011 (Agent Conversation State Model & Per-Pane Identity)
+    href: /design/decisions/adr-011-agent-conversation-state-model/
+  - label: ADR-032 (Agent Conversation Forking)
+    href: /design/decisions/adr-032-agent-conversation-branching/
+---
+
+import AdrHeader from '../../../../components/AdrHeader.astro';
+
+<AdrHeader {...frontmatter} />
+
+## Context
+
+An agent conversation is a flat, append-only `AgentMessage` history (`schema.rb`:
+`turn` monotonic, `[agent_conversation_id, turn]` unique). Every turn, `AgentSession`
+sends the **entire** `@history` to the model (`outgoing_messages` returns `@history`
+plus AGENTS.md), and `@history` is reconstructed verbatim from persisted rows via
+`AgentConversation#to_history` → `AgentMessage#to_history_entry`. There is no
+compaction: tool results in particular (large file edits from `file_edit_anchored`,
+`file_write_lines`, shell output) live in `role='tool'` rows forever and are re-sent
+on every subsequent turn.
+
+Two distinct costs, one cause:
+
+1. **Prompt bloat** — the dominant cost. Old tool results burn tokens on every turn for
+   the rest of the conversation's life, even though the model no longer needs them.
+2. **Storage** — the rows are also persisted indefinitely.
+
+The problem is not "the history exists," it is "the history never expires and is never
+reducible." Forking (ADR-032) is orthogonal: it copies the prefix, it does not shrink
+the live conversation's own history.
+
+## Decision
+
+### 1. Eviction is a tombstone, not a delete
+
+Message eviction marks a row **tombstoned** rather than deleting it. The row — and
+critically its `turn`, `tool_call_id`, and `name` — survives; only the **content** is
+removed from the prompt. This keeps the OpenAI tool-call protocol valid: a `tool` result
+must pair with an assistant message whose `tool_calls` carries the matching `id`, and a
+deleted row would leave a dangling call or an orphaned result. A tombstone keeps the
+structure and drops the payload, so a subsequent turn still parses.
+
+Concretely, a tombstoned message still produces a structurally-valid wire entry — the
+row keeps its data, and the payload is **omitted only when the history is serialized for
+the model** (`to_history_entry` / `outgoing_messages`), never deleted from the row:
+
+- **Tool result** (`role='tool'`): `content` is omitted from the outgoing entry;
+  `tool_call_id` + `name` are still sent.
+- **Tool call text** (`role='assistant'` `tool_calls_json`): `function.arguments` is
+  omitted from the outgoing entry; the call `id` + `function.name` are still sent.
+
+Non-tool content (user text, assistant prose, reasoning) is out of scope for phase 1 —
+the bloat is tool payloads; evicting prose would change what "this conversation said"
+means and is not needed for the cost that motivates this ADR.
+
+### 2. Phase 1 (now): tombstone flag + manual debug trigger
+
+Add `evicted_at datetime, null: true` to `agent_messages` (phase 2 may rename/generalize
+it). Eviction is **front-trimming** (oldest-first): a selector computes the set of items
+to tombstone, then applies it. The selector targets **both tool results and tool call
+text** — a call can be as large as a result (`file_edit_anchored` carries `old_string` /
+`new_string`, a terminal write carries a whole heredoc), so call `arguments` are evictable
+on the same footing as result `content`. A `scope` field chooses results, call text, or
+both. Three interchangeable modes:
+
+- **before a datetime** — everything older than a cutoff;
+- **first N items** — the oldest N evictable items (results and/or call text per scope);
+- **N size** — the oldest items until N bytes are reclaimed;
+- **fraction of prompt** — remove until at least `f` of prompt tokens is reclaimed, with a
+  floor (e.g. `f ≥ ⅓`) so the trim clears the break-even line instead of nickeling away.
+
+`f` is the fraction of prompt *tokens*, not of items — tool payloads dominate, so removing
+30–50% of tool items is often ≥50% of the window. Item-count and byte modes do **not**
+reveal `f`; with per-turn `prompt_tokens` (§7) the preview computes it directly. The
+fraction mode is the honest selector; the others stay, but every mode displays the
+resulting `f` and its cost.
+
+A **preview (dry-run) is mandatory** and shows, before anything is written: tool-call
+count, tool-result count, current total bytes, how much each mode would remove, **and the
+cache-cost outcome — `f`, the one-turn surcharge, and the break-even turn count** (see
+§8). The bytes-reclaimed number is not enough: a small trim can reclaim bytes while
+*costing* more than it saves, because it forces a full re-prefill of the surviving prefix.
+
+The trigger lives in an **AgentPane debug expand** only — not a first-class user surface,
+not part of the normal agent flow. Eviction removes content from the prompt, so the expand
+requires an explicit confirm — but it is **not destructive**: a tombstone flags content
+out rather than deleting it, so the content stays in the row and is restorable in
+principle (there is just no restore UX yet).
+
+### 3. Phase 2 (in scope, deferred): TTL + pre-expiry warning + rehydrate
+
+The manual selector becomes an automatic lifecycle:
+
+- **Turn-based TTL.** A tool call's lease is a **turn budget, not wall-clock time**: it
+  is evicted once N subsequent turns have elapsed since it was created. A sweeper
+  tombstones messages when their budget is exhausted.
+- **Two tiers by size.** The budget N is chosen by the call's footprint — a **small-result
+  TTL** (long budget) for cheap calls and a **big-result TTL** (short budget) for
+  expensive ones, so large payloads leave the prompt first. The footprint that decides
+  the tier is the **combined** size of the two rows that form one call: the assistant
+  row's `tool_calls_json` bytes for that call (its `arguments`) **plus** the matching
+  `tool` row's `content` bytes (the result), joined on `tool_call_id`. The call spec and
+  its result are stored separately but are one evictable thing, so their TTL is computed
+  on the sum, not either half alone.
+- **Pre-expiry warning.** Before eviction the worker tells the agent which tool calls
+  are expiring ("tool calls X/Y/Z are expiring") so the agent can decide whether it
+  still needs them. This is the agent-facing signal; a human does not triage expiries.
+- **`rehydrate_ttl(toolCallID)`.** The agent renews the lease on the specific IDs it
+  still needs, resetting their turn budget. This is **lease renewal before eviction** —
+  the agent keeps the content in the prompt before it is flagged out. A tombstone is a
+  *flag*, not a delete: the content stays in the row, so eviction is reversible in
+  principle (un-flag it), even though there is no restore UX yet. `rehydrate_ttl` matters
+  while a budget is *about to* run out; after tombstone the data is still there to
+  restore, not gone.
+- **Batched sweeps, not per-message expiry.** Tiered TTLs firing on individual results
+  as their budgets lapse produce frequent *small* trims, and each small trim pays a full
+  re-prefill (see §8) — the same exposure as the `N items`/`N size` modes. The sweeper
+  therefore accumulates expiring items and evicts in one batch once the accumulated `f`
+  clears the break-even line, rather than evicting each message the moment its budget
+  runs out. `rehydrate_ttl` still acts per-`tool_call_id`; only the *sweep* is batched.
+  The evict-vs-hold decision for a batch is the **Resolver** (§9).
+
+Phase 1's `evicted_at` is the tombstone marker; phase 2's turn-budget TTL is the *rule*
+that sets it automatically. They are distinct fields — a recorded outcome vs. the policy
+that produces it — not two names for one column.
+
+### 4. The in-memory history must agree with the tombstone
+
+`AgentSession` holds `@history` in memory and re-sends it every turn, so persisting a
+tombstone is not enough: a live conversation would keep sending the evicted content until
+it reloads. The tombstone command therefore also mutates the in-memory `@history` for the
+conversation (drop `content`/`arguments`, keep the structural fields), so the next turn
+reflects the eviction immediately — the in-memory `@history` entry keeps the structural
+fields (`tool_call_id`, `name`, `id`) but **omits** `content`/`arguments` when serialized
+for the next send. A turn in flight is rejected (or the eviction is
+deferred until `done`) — mutating `@history` mid-loop would interleave with the
+already-running completion.
+
+### 5. Wire surface (phase 1)
+
+```
+-> { cs:'agent', cmd:'clean', payload:{ conversation_id, mode, cutoff|n_results|n_bytes, scope, dry_run } }
+<- { cs:'agent', cmd:'cleaned', payload:{ conversation_id, removed_results, removed_calls, bytes_reclaimed } }
+<- { cs:'agent', cmd:'clean_preview', payload:{ ...counts, bytes, would_remove } }   // dry_run
+```
+
+Authorization mirrors `ask` (any member for a project-visible thread, owner-only for
+private). `dry_run` returns the preview without writing. The client renders the preview,
+then re-sends with `dry_run:false` on confirm.
+
+### 6. Tombstone side-pane (the debug expand)
+
+The debug expand is a **side-pane that opens within the agent conversation** — the same
+kind of collapsible disclosure already used for reasoning and tool-call groups in
+`AgentPane`. It lists the tombstoned messages for that conversation, one row per item,
+showing:
+
+- **turn** — the message's turn number;
+- **size** — bytes evicted from the prompt;
+- **kind** — either the tool call (name) or "result for `tool_call_id`"; it shows *what*
+  was evicted, **never the evicted content itself** (the whole point is that the payload
+  is out of the prompt);
+- **N bytes** — the reclaimed byte count per item.
+
+The side-pane is read-only: it surfaces what was tombstoned (and the dry-run preview of
+what *would* be), but does not re-render evicted payloads. A restore affordance (un-flag
+`evicted_at`) is the phase-2 counterpart to the existing manual eviction, and is not built
+here.
+
+### 7. Usage stats (what to capture, and what the API does not give)
+
+Track per-turn model usage so the side-pane (and later the cost view) has real numbers:
+
+- **`prompt_tokens`, `completion_tokens`, `total_tokens`** — returned by the model as
+  `usage.*`. In streaming this requires sending `stream_options: { include_usage: true }`
+  (the worker streams today and does **not** send it yet); the values arrive on the final
+  chunk.
+- **`cached_tokens`** — `usage.prompt_tokens_details.cached_tokens` where the provider
+  reports it (OpenAI/Anthropic/DeepSeek); local servers often omit it, so it is nullable.
+- **Cost is *not* returned by the API.** It must be derived from a model → price table
+  (input/output, cached/uncached rates). Store token counts now; cost is a derived,
+  out-of-scope column for a later price table.
+- **Where usage lands: a separate `agent_turn_usage` table.** Because we stream (SSE),
+  `usage` arrives once per completion *request* — on the final chunk — not per
+  `agent_messages` row. One request produces one assistant message (whose `tool_calls_json`
+  holds the call spec) plus any number of `tool` result rows; `tool_call_id` is the join
+  between a call and its result, but the result comes back as the tool row's `content`.
+  Usage therefore keys to the completion request (the assistant turn), not to the
+  per-message `turn` (turn 4 = the call, turn 5 = its result).
+
+### 8. Is eviction worth it? The cache-cost arithmetic
+
+Prompt caching charges ~⅓ for a cache hit vs. an uncached token (DeepSeek's hit price).
+Eviction is **front-trimming** (oldest-first), which breaks the cached prefix at the
+first tombstone. The head — the `system` prompt and the AGENTS.md banner — is never
+evicted, so the cache survives up to that first tombstone; only the surviving suffix
+after it re-prefills **uncached** on the trim turn. So it is not literally "everything
+flips uncached" — the head stays hot — but the suffix carries the surcharge below, and
+the head is small enough that the math is a close upper bound.
+
+Normalize cached = 1, uncached = 3, and let `f` be the fraction of prompt tokens removed
+(ignoring the non-evictable head):
+
+```
+trim turn cost       = 3(1 − f)     # surviving suffix re-prefills uncached
+baseline (no trim)   = 1            # everything cached
+surcharge            = 3(1 − f) − 1 = 2 − 3f     (positive iff f < ⅔)
+recovery per later turn = f          # removed tokens are no longer re-sent (cached)
+break-even turns     = (2 − 3f) / f = 2/f − 3
+```
+
+So a trim is immediately worthwhile at `f ≥ ⅔` (no surcharge), breaks even in one turn at
+`f = ½`, and at small `f` (e.g. `f = 0.1`) you pay ~3× that turn and need ~17 turns to
+recover — a bad trade on a conversation that is nearly done. The output is therefore
+**"likely recovery in ~N turns," not a pass/fail verdict**: the Resolver reports the
+number and lets the caller weigh it against the conversation's remaining life, rather
+than pretending to know that life itself (see §9).
+
+This is the "should we remove anything at all?" check — basic math, not a heuristic:
+compute `f` from the prior turn's `prompt_tokens` (§7), and the surcharge/break-even
+follow directly.
+
+### 9. The Resolver: one evict-vs-extend decision, with a ceiling
+
+The §8 arithmetic is not a one-off preview — it is a reusable decision function, named
+**the Resolver** to sit alongside the existing **Decider** (ADR-020, capability
+resolution). It runs every time eviction is contemplated and returns a verdict:
+
+- **Inputs:** the candidate set (items whose budget lapsed, or the user's manual
+  selection), the prior turn's `prompt_tokens` (see below), and per-item token sizes.
+- **Output:** `f`, the one-turn surcharge, **"likely recovery in ~N turns"**, and one of:
+  - **evict** — `f` clears break-even; tombstone the candidates now.
+  - **extend** — `f` is too small; evicting now costs more than it saves, so **push the
+    candidates' TTLs out** and wait for more to accumulate into a worthwhile batch.
+  - **evict (mandatory)** — the ceiling overrides: `prompt_tokens` is approaching the
+    context limit, so eviction happens regardless of `f`; the alternative is the
+    conversation dying. Break-even ceases to be the criterion at the ceiling.
+
+**The ceiling is the fix for a quiet conversation.** Break-even assumes future turns to
+recover over; a conversation that goes quiet has none, so a below-break-even batch would
+be extended forever while the prompt stays bloated — until it hits the wall and dies
+having paid full-price prefill the whole way. A hard threshold (e.g. `prompt_tokens`
+within X% of the model's context window) overrides the `extend` branch and forces a trim,
+so eviction becomes *mandatory* as the context fills regardless of economics.
+
+Phase 1 uses the Resolver **read-only** (it *is* the dry-run preview's cost line). Phase
+2 uses it as the sweeper's policy: a TTL expiring is a *nomination*, not a hard eviction —
+the Resolver decides whether honoring it is worth it, and **extends the TTL itself** when
+it is not (below the ceiling).
+
+Two distinct reasons to extend, one mechanism:
+
+- **economic** — the Resolver extends because a too-small eviction would waste a full
+  re-prefill (its `extend` branch);
+- **semantic** — the agent extends via `rehydrate_ttl` because it still *needs* the
+  content.
+
+Both reset the turn budget, but they answer different questions: the Resolver owns "is
+removing this worth it," the agent owns "do I still need this." Neither implies the
+other.
+
+**Measuring `prompt_tokens` and `f` without guessing.** `prompt_tokens` is known from the
+*previous* request's final SSE chunk (`usage.prompt_tokens`), so after turn N the Resolver
+has turn N's exact prompt size as its baseline for a trim before turn N+1 — off only by
+what was appended since, which is the candidate set it is already holding. `f` is a ratio,
+so that small appended term is a minor error.
+
+Per-item token sizes are the harder half. Differencing consecutive `agent_turn_usage`
+rows yields the token weight of *everything* appended between two requests — one assistant
+message plus its tool results — i.e. per-`AgentTurn` granularity, not per-item. A turn
+with three tool calls gives one number for all three. Front-trimming takes contiguous
+spans, so **the cutoff should land on `AgentTurn` boundaries**: summing whole turns up to
+the cutoff is then measured, not estimated. Splitting *within* a turn needs a
+byte-proportional guess, which the `AgentTurn`-boundary cutoff avoids. Per-item *bytes*
+remain fine for the §3 tier bucketing, which only needs a size class, not a cost.
+
+## Consequences
+
+**Positive**
+
+- The dominant cost — old tool results re-sent every turn — is removed for a
+  conversation's later turns.
+- Tombstone (not delete) keeps the transcript protocol-valid and leaves a footprint of
+  what the agent did, even after the payload is gone.
+- Phase 2 turns a one-off cleanup into a self-managing lease model the agent itself
+  drives, which is the shape the feature wants to grow into.
+
+**Negative / to resolve**
+
+- **Reversible in data, not yet in UX.** Tombstoning flags content out of the prompt but
+  keeps it in the row, so it can be restored by un-flagging; there is just no surface to
+  do that yet. Until one exists, the dry-run + confirm (and fork-first as the user's own
+  safety valve) are the mitigations.
+- **In-memory reconciliation.** The `@history` mutation and the turn-lock interaction
+  (§4) is the one genuinely tricky piece of phase 1 — it must not corrupt an in-flight
+  completion or leave `@history` diverged from the DB.
+- **TTL needs agent discipline.** Phase 2's rehydrate only works if the agent actually
+  renews what it needs; an agent that ignores the pre-expiry warning loses context. This
+  is inherent to a lease model, not a bug, but it is a behavior change from "history is
+  forever."
+
+## Alternatives considered
+
+- **Hard delete rows.** Rejected: breaks `tool_call_id` pairing and loses the
+  structural footprint; a dangling `tool`/`tool_calls` pair would be sent to the model.
+- **Truncate to a single summary message (classic LLM compaction).** Rejected for now:
+  summarizing changes what "this conversation said" and is a semantic transformation,
+  not a lifecycle. A tombstone is lossy but faithful; a summary is lossy and editorial.
+- **Window-only (keep last N turns, drop the rest).** Rejected as the *only* mechanism:
+  it cannot target the actual cost (tool payloads) without also dropping user/assistant
+  turns that are small and still meaningful. The tombstone selector targets content, not
+  position.
+- **Cold storage + rehydrate-from-cold.** Rejected: `rehydrate_ttl` is lease renewal
+  *before* eviction, deliberately not a cold read. Because a tombstone keeps content in
+  the row (flag, not delete), there is no cold layer and no need for one.
+
+## Open questions
+
+1. **Tier thresholds.** The small/big split needs a byte cutoff and two turn-budget
+   values (small-result TTL and big-result TTL), plus a home for the policy (per-agent,
+   per-project, or a worker constant). Not decided here.
+2. **Turn budget counts logical turns.** The budget decrements per `AgentTurn` (ADR-032),
+   not per raw `turn` row — a tool loop spanning several rows must not burn budget per
+   message. Confirm the counter is `AgentTurn`-scoped.
+3. **Turn-marker column.** Phase 1 records the tombstone in `evicted_at` (datetime);
+   phase 2's turn-based TTL naturally records *which turn* evicted it. Decide whether to
+   add `evicted_at_turn` (or replace `evicted_at`) when TTL lands.
+4. **`agent_turn_usage` key.** Usage is per completion request, so the table needs an
+   anchor that is not `agent_messages.turn` (per-message). Whether it references the
+   assistant message id (the head of the request) or carries its own completion-turn
+   counter is the remaining detail to settle when the table is built.
+5. **The break-even floor is a guess about remaining lifetime.** "Recovery in ~17 turns"
+   is only good or bad relative to how many turns are left, which nothing knows. Any floor
+   (e.g. `f ≥ ⅓`) is a prior on conversation length — on the short, fork-heavy sessions
+   of ADR-032 it will refuse trims that would have paid. The floor is a tuning parameter,
+   not a derived constant, and should stay explicit.
+6. **Ceiling threshold.** The Resolver's mandatory-eviction override needs a concrete
+   "approaching the context limit" value (fraction of the model's context window), and
+   whether it is per-model, per-agent, or a worker constant. Not decided here.
+7. **Resolver naming.** "Resolver" is chosen to pair with the existing "Decider"
+   (ADR-020); confirm the name sticks before implementation.
