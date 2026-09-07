@@ -90,7 +90,7 @@ This is the crux. Options, all satisfying "many operators, one actor per CR":
 
 ### 5. The ADR-029 sweep, revisited
 
-ADR-029 shipped the quick path: a `bin/clock` per control replica, offset by
+ADR-029 proposes the quick path: a `bin/clock` per control replica, offset by
 `SHELL_SWEEP_OFFSET`, idempotent and uncoordinated. Under many replicas this is
 accepted as imperfect. Here it is revisited:
 

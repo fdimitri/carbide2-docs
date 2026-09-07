@@ -1,0 +1,220 @@
+---
+title: "ADR-031: Remove All References to the Docker and Bare Backends"
+description: "The worker's local-PTY and docker-exec terminal backends, the docker-compose stack, and the bare-metal deployment path are deleted outright. Control is the only way a workspace runs."
+sidebar:
+  order: 31
+  badge:
+    text: Implemented
+    variant: note
+status: Implemented
+implementation_exists: true
+date: "2026-09-06"
+extends:
+  label: ADR-029 (Shell Lifecycle Owned by Control; Worker Streams Only)
+  href: /design/decisions/adr-029-shell-lifecycle-control-plane/
+---
+
+import AdrHeader from '../../../../components/AdrHeader.astro';
+
+<AdrHeader {...frontmatter} />
+
+## Context
+
+The worker was originally written with a single backend for bare-metal and 
+then converted to Docker. There was still some compatibility between bare
+and Docker, and all was good in the world. But then we switched to Kubernetes,
+and there were three paths with bare metal not being touched, and that was the
+whole direction of the project; carbide2-control was born. At that point, to 
+run bare/docker, you would still need control (since everything depends on it),
+and something to route incoming requests (Traefik) and that makes the whole path
+absurd. The only purpose would be to test faster as there would be no point in
+not relying on atleast k3d. Both bare and docker runtime environments couldn't
+work without major changes to support them, and they also confuse LLMs (and people, 
+if there were any) so we're going to remove them entirely. Bare/docker fallbacks,
+references, etc. This is a cleansing. The code will no longer act as if it's a
+possibility, because this decision is to make it clear that it is not.
+
+What that leaves in the tree today:
+
+- the switch itself, `CARBIDE_BACKEND`, with `local` (PTY spawn on the
+  worker's host), `docker` (`docker exec` into a per-project container managed
+  by `ProjectContainer`), and `kube`;
+- a `docker-compose.yml` stack, `quickstart.sh`, and an `INSTALL.md` that calls
+  Compose "the supported deployment";
+- `scripts/dev-native.sh`, a host-process mode;
+- `BARE-METAL.md`, a single-box install guide with no Kubernetes;
+- two scripts for moving project files in and out of the compose volume;
+- and the comments, env vars, chart values, and help text that describe any of
+  the above as an option.
+
+ADR-029 §1 deleted `ProjectPod` and stated that "the docker-backend
+`ProjectContainer` path in kube mode" goes with it. This ADR removes the modes.
+
+## Decision
+
+### 1. One backend, no switch
+
+The worker has exactly one way to open a terminal: ask control for a shell
+handle and `kubectl exec` into the pod it names (ADR-029 §4, §8). The
+`CARBIDE_BACKEND` switch is removed from the worker, from the operator's
+workspace Deployment env, and from the workspace chart. Terminal create no
+longer branches on a mode; there is no mode.
+
+### 2. The docker backend is deleted
+
+`project_container.rb` and everything that existed only to serve it:
+`PROJECT_CONTAINERS`, `CARBIDE_USE_DOCKER`, `CARBIDE_PROJECTS_VOLUME`, the
+compose-volume `subpath` mount logic, and the shutdown hook that stopped
+containers. `Dockerfile.shell` remains — it builds the shell image the
+StatefulSet runs — but its header no longer describes `ProjectContainer` as the
+thing that mounts the project directory.
+
+### 3. The local backend is deleted
+
+The `local` PTY branch, `PROJECT_ROOT` (env, `carbide.yml` `project_root`, and
+the `Dir.pwd` fallback), and the `carbide.yml` machinery whose only remaining
+key was `project_root`. The worker's project root comes from
+`ProjectSetting#root_path`, which control's handed-down identity determines
+(ADR-029; project directories are keyed by workspace UUID). There is no
+"fallback only — overridden by the DB" path because there is no deployment in
+which the DB is absent.
+
+### 4. The non-control run paths are deleted
+
+From `carbide2-server`: `docker-compose.yml`, `quickstart.sh`,
+`scripts/dev-native.sh`, `scripts/import-host-dir.sh`,
+`scripts/migrate-storage.sh` (export/import of the compose volume), and
+`BARE-METAL.md`. `.env.example` loses its compose-specific guidance.
+`INSTALL.md` stops describing Docker Compose as the supported deployment and
+points at `scripts/deploy.rb` in the meta repo, which is. `README.md`,
+`DEPLOY-k3d.md`, and `config/database.yml` lose their compose cross-references.
+The meta repo's `INSTALL.md` and `README.md` lose the "simpler single-host
+docker-compose" pointers.
+
+### 5. What is *not* a docker reference and stays
+
+- **Every `Dockerfile`** and the CI that builds and pushes images. Docker is the
+  image build tool; that is unrelated to the docker *backend*.
+- **Docker as k3d's substrate.** `scripts/setmeup.sh` installs `docker.io` and
+  `docker-buildx` because k3d and `build-all.sh` need them. The
+  `docker-compose-v2` package it also installs was justified by `quickstart.sh`
+  and is dropped from the list; the surrounding comments are corrected.
+- **`project_settings.shell_image`** and the "Container image" field in
+  `ProjectSettingsPane`. This column is a per-project shell-image setting that
+  no backend ever read — `ProjectContainer` took its image from
+  `CARBIDE_SHELL_IMAGE`, not from the row. It is the ADR-007 shape that ADR-029
+  says was never implemented and relocates to control as
+  `spec.shell.imageRepo`/`imageTag`. Whether a *per-project* image setting
+  survives alongside the per-workspace one is a question for ADR-007's
+  retirement, not this ADR. Only its help text changes: it currently says
+  "The Docker image … must be accessible to the Docker daemon on the server",
+  which describes a runtime that does not exist.
+- **`gcc-arm-none-eabi … bare-metal-compatible`** in `Dockerfile.shell`. That is
+  a microcontroller target, not a deployment mode.
+
+### 6. No schema change
+
+Nothing in the database was docker- or bare-specific. `shell_image` stays for
+the reason in §5. No migration ships with this ADR.
+
+## Implementation
+
+A single branch per repository, `adr/adr-031-remove-docker-bare`, each touching
+only what is listed here.
+
+**carbide2-worker**
+- delete `project_container.rb`
+- `handlers/term_handlers.rb` — remove the `case ENV.fetch('CARBIDE_BACKEND')`;
+  the kube arm becomes the body of `create`
+- `worker.rb` — remove `PROJECT_ROOT` and the `carbide.yml` loader,
+  `PROJECT_CONTAINERS`, `require_relative 'project_container'`, the
+  `CARBIDE_BACKEND == 'kube'` guards on `on_terminal_exit` /
+  `report_shell_terminals` / the heartbeat, the "Docker container mode" and
+  "Shell backend" startup lines, and `PROJECT_CONTAINERS.each_value(&:stop)`
+- delete `carbide.yml.example` — `project_root` is its only key
+
+**carbide2-server**
+- delete `docker-compose.yml`, `quickstart.sh`, `BARE-METAL.md`,
+  `scripts/dev-native.sh`, `scripts/import-host-dir.sh`,
+  `scripts/migrate-storage.sh`
+- `INSTALL.md` — rewrite to the control-plane install; `README.md` — remove
+  the backend table rows and the "Alternative: Docker Compose" section;
+  `DEPLOY-k3d.md` — remove the compose pointer; `.env.example` and
+  `config/database.yml` — remove compose guidance; `Dockerfile` — remove the
+  "run via docker compose" and `RAILS_ENV`-from-compose comments;
+  `Dockerfile.shell` — correct the header
+- `charts/workspace/templates/deployment.yaml` — drop `CARBIDE_BACKEND` and
+  `CARBIDE_SHELL_IMAGE` env; `charts/workspace/values.yaml` — drop the backend
+  comment block
+- `app/models/project.rb`, `app/models/project_setting.rb`,
+  `app/controllers/spa_controller.rb`, `app/services/client_registry.rb` —
+  comments that name `ProjectContainer` or `dev-native`
+
+**carbide2-control**
+- `operator/object_builders/deployment.rb` — drop the `CARBIDE_BACKEND: kube`
+  env and the comment that explains `CARBIDE_SHELL_IMAGE` is gone (it is; the
+  comment is now the only reference)
+
+**carbide2-client**
+- `src/components/workspace/ProjectSettingsPane.vue` — reword the `shell_image`
+  help text; the field stays
+
+**carbide2 (meta)**
+- `INSTALL.md`, `README.md` — remove the compose pointers
+- `scripts/setmeup.sh` — drop `docker-compose-v2` and correct the comment;
+  `scripts/deploy.rb` — correct the package comment
+
+## Consequences
+
+**Positive**
+
+- The worker's terminal path is one function with one caller, and it matches
+  the ADR-029 design without a conditional in front of it.
+- A reader following `INSTALL.md` is led to the deployment that exists.
+- Three env vars, one config file, one Ruby class, six shell/compose files, and
+  one deployment guide stop being maintained.
+
+**Negative / to resolve**
+
+- The fast test loop goes with it. Running the worker bare skips the image
+  rebuild, and rebuilds hurt. That speed is real and it is given up here,
+  because the code required to keep bare working — a second project-root
+  resolution, a second terminal path, a second set of assumptions about what is
+  running alongside the worker — is most of what this ADR removes. Test
+  against k3d.
+- `Dockerfile.shell` and the compose-era `Dockerfile` header comments were the
+  most legible description of how the shell image is expected to be used.
+  ADR-029 §3 and the shell builder are now the reference.
+
+## Open questions
+
+1. **`project_settings.shell_image`.** A write-only column and a UI field with
+   no consumer. Retire with ADR-007, or keep as the per-project half of a
+   per-workspace/per-project image split under a 1:N workspace. Not decided
+   here.
+2. **`docker-compose-v2` on deploy hosts.** Dropped from `setmeup.sh`. Its own
+   comment names `quickstart.sh` as the sole reason it is installed, and
+   nothing under `scripts/` in the meta repo invokes `docker compose`. Listed
+   here only because it is the one removal that touches a deploy host's package
+   set rather than this tree.
+
+## Alternatives considered
+
+- **Keep the backends behind the switch, default `kube`.** Rejected: the arms
+  cannot work without major changes — they predate the UUID-keyed project
+  layout and the control handshake — so the switch advertises options that fail
+  on selection.
+- **Keep `local` as a test-only fast path.** Rejected: the appeal is skipping
+  the image rebuild, and that is a real cost. But a test-only bare path still
+  needs control and something routing to it, and the code to keep it alive is
+  the code being removed. Too much to carry for a faster test.
+- **Keep docker-compose as a "simple mode" for contributors.** Rejected: it is
+  a second install path, with its own volume layout, its own docs, and its own
+  drift, for a mode nobody runs. `scripts/deploy.rb` with k3d is the
+  single-host path.
+- **Delete `Dockerfile.shell` too, since `ProjectContainer` referenced it.**
+  Rejected: the shell StatefulSet runs that image. The file is a build input,
+  not a backend.
+- **Drop `shell_image` while we are here.** Rejected on inspection: it is not a
+  docker artifact (nothing docker ever read it), and its fate is bound to
+  ADR-007/029, not to this cleanup.

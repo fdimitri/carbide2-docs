@@ -13,6 +13,17 @@ sidebar:
 - Component repos: work lands on `dev`, then fast-forwards to `main`.
 - Meta repo (`carbide2`): bump **all four** submodule pins together before deploying.
 
+## Branch naming
+
+- `adr/ADR-NNN-slug` — implementing a decided ADR. Use the **same branch name in every
+  repo the ADR touches**, so a multi-repo change stays one identifiable unit.
+- `feat/slug`, `fix/slug` — the default for everything else.
+- `experimental/slug`, `arch/slug` — **sparingly**, and mainly for work done *while
+  drafting* an ADR, before there is a decision to implement against. Reaching for
+  `arch/` on work that has no ADR is a signal the work needs one.
+
+Branches created before this rule (`experimental/ADR-NNN`, `feat/ADR-NNN`) stay as they are.
+
 ## Licensing
 
 All repos are **GPLv3**. Substantial new files need a copyright header:

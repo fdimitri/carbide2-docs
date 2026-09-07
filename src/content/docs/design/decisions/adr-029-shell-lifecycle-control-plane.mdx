@@ -4,9 +4,10 @@ description: "The shell pod moves from worker-kubectl to a control-owned workspa
 sidebar:
   order: 29
   badge:
-    text: Proposed
+    text: Accepted
     variant: note
-status: Proposed
+status: Accepted
+implementation_exists: true
 date: "2026-09-03"
 extends:
   label: ADR-016 (Workspace Shape Transitions, Templates, and the Control Plane Boundary)
@@ -47,11 +48,11 @@ readiness-poll shell pods. Its only remaining shell responsibility is streaming
 the PTY into a pod control has already provisioned. `ProjectPod` and the
 docker-backend `ProjectContainer` path in kube mode are deleted.
 
-Shell shape (image, tag, CPU, memory) lives in the Workspace CR / template,
-applied by the operator at shell reconcile time — same as the workspace pod's
-shape. Under ADR-016 §1 this makes shell image/resources a **patch transition**
-(roll the shell pod, no data movement); this ADR owns the lifecycle, not the
-shape semantics.
+Shell shape (image repository, tag, CPU, memory) lives in the Workspace CR /
+template, applied by the operator at shell reconcile time — same as the workspace
+pod's shape. Under ADR-016 §1 this makes shell image/resources a **patch
+transition** (roll the shell pod, no data movement); this ADR owns the lifecycle,
+not the shape semantics.
 
 ### 2. Lifecycle mode is an enum, and demand state is a separate field
 
@@ -60,16 +61,34 @@ spec:
   shell:
     mode: eager | lazy | disabled   # default eager
     replicas: 1                     # derived demand (0|1), written by Rails, read by operator
-    image: carbide2-shell:dev
+    imageRepo: carbide2-shell-base
+    imageTag: dev
     imagePullPolicy: IfNotPresent
     resources:
       requests: { cpu: 50m, memory: 128Mi }
       limits:   { cpu: "6", memory: 8Gi }
 ```
 
-- **`eager`** — the shell Deployment is always present at replicas 1 and
+**Image identity is repository plus tag, not one string.** Several shell images
+are expected — toolchain and language variants — each versioned on its own
+schedule. `control_projects.shell_image_repo` and
+`control_projects.shell_image_tag` hold them as separate columns and Rails stamps
+both into `spec.shell`.
+
+The variant belongs in the **repository** name (`carbide2-shell-rust`), not in
+the tag, because the registry is repository-scoped: `/v2/<repo>/tags/list`
+answers "what versions of this shell exist" in one call, with no tag-string
+parsing and no retention policy shared across unrelated variants. Encoding the
+variant in the tag would mean sorting substrings to find the newest build of one
+variant, which is the part that rots. `shell_image_tag` then carries exactly the
+meaning `workspace_image_tag` already has — a tag against a known repository —
+rather than two similarly-named columns behaving differently.
+`ImageRegistry::REPOS` becomes a `carbide2-shell-*` prefix match instead of a
+fixed three-element allowlist.
+
+- **`eager`** — the shell StatefulSet is always present at replicas 1 and
   self-heals.
-- **`lazy`** — the shell Deployment exists at replicas 0; launched on first
+- **`lazy`** — the shell StatefulSet exists at replicas 0; launched on first
   demand, suspended on idle. `spec.shell.replicas` carries the demand state.
 - **`disabled`** — no shell object exists. Terminals and agent `shell_exec`
   report unavailable. Editor, chat, VFS, and agent read tools are unaffected.
@@ -85,10 +104,11 @@ only `spec` and never consults the DB.
 **Three layers, not one.** The durable input, the stored intent, and the
 applied output are different things:
 
-- `control_projects.shell_terminals` + `control_projects.shell_last_report_at` —
-  the **durable input**, written by Rails on every worker release/heartbeat.
-  Lives on the control-side project row (same table as `template_name` /
-  `workspace_image_tag`), so it survives a control restart.
+- `control_projects.shell_terminals`, `control_projects.shell_last_report_at`,
+  and `control_projects.shell_idle_since` — the **durable input**,
+  written by Rails on every worker release/heartbeat. Lives on the control-side
+  project row (same table as `template_name` / `workspace_image_tag`), so it
+  survives a control restart.
 - `control_projects.shell_replicas` — the **intent** (0|1), decided by Rails from
   the input and stored durably. This is what the sweep changes.
 - `spec.shell.replicas: 0|1` — the **applied output**, stamped into the CR only
@@ -98,6 +118,38 @@ applied output are different things:
 The DB holds input + intent; the CR holds the applied projection; the operator
 reads only the CR. That keeps invariant 1 true while intent and the refcount
 stay durable.
+
+**The zero latch is an edge, not a level.** `shell_last_report_at` is refreshed
+by *every* report, including `n: 0` keep-alives, so it measures worker liveness
+and nothing else. It cannot also measure how long the refcount has been zero: a
+worker heartbeating `n: 0` every 30s refreshes it every 30s, and the difference
+never grows past the heartbeat interval no matter how long the shell has been
+unused.
+
+`control_projects.shell_idle_since` is therefore a separate column
+holding the **falling edge**: the time `shell_terminals` last transitioned from
+`> 0` to `0`. Rails latches it, on the control side, by comparing each incoming
+report against the stored value — the worker's payload is unchanged and the
+worker keeps no timer of its own. This is deliberate: the worker is the process
+condition 2 (§5) explicitly declines to trust for liveness, and a wedged
+worker's self-reported idle duration would be exactly as stale as its `n`.
+
+Latch rules:
+
+- Report with `n == 0` and stored `shell_terminals > 0` — set
+  `shell_idle_since = now`.
+- Report with `n == 0` and stored `shell_terminals == 0` — leave it alone. Not
+  an edge; re-latching here would restart the idle clock on every heartbeat,
+  which is the failure this column exists to avoid.
+- Report with `n > 0`, or a successful ensure `POST /shell` — null it. Demand
+  is the rising edge, and the ensure POST is a demand signal even before the
+  worker's subsequent `n: 1` release lands.
+- Null means **no falling edge has been observed**, and condition 1 cannot fire.
+  A workspace that has never had a terminal never satisfies it. This is
+  harmless: such a shell is either already at replicas 0 (lazy, nothing to scale
+  down) or held at 1 by `eager`, where §2's precedence rule ignores
+  `spec.shell.replicas` anyway. The one case that needs an explicit write is a
+  mode flip into `lazy`, below.
 
 **Precedence.** `spec.shell.replicas` is consulted **only when `mode: lazy`**.
 Under `eager` the operator holds replicas 1 regardless of what `replicas` says;
@@ -109,24 +161,34 @@ than left to the reader to derive:
 
 - **eager → lazy** — the shell stays up at the moment of the flip. It becomes
   *eligible* for idle-down immediately, and drops on the next refcount-0 +
-  idle-timeout decision, not on the mode change itself.
+  idle-timeout decision, not on the mode change itself. Rails sets
+  `shell_idle_since = now` on the flip if `shell_terminals == 0`,
+  because nothing was tracking the falling edge while the mode was `eager` and
+  the latch would otherwise be null — leaving the shell up until condition 2
+  eventually caught it. "Eligible immediately" means the idle clock starts at
+  the flip.
 - **lazy → eager** — Rails writes `replicas: 1` (so the value and the mode
   agree) and the shell comes up; the operator holding 1 regardless of `replicas`
-  is the load-bearing rule, the write is belt-and-braces.
-- **→ disabled** — object delete (§3); live terminals lose the exec-PTY.
+  is the load-bearing rule, the write is belt-and-braces. The latch is left as
+  it is; it is unreadable under `eager` and will be corrected by the next edge
+  or by a later flip back to `lazy`.
+- **→ disabled** — object delete (§3); live terminals lose the exec-PTY. The
+  latch and `shell_replicas` are left as they are — neither is consulted while
+  `disabled`, and any transition out of it restamps what it needs.
 - **disabled → eager** — object created at replicas 1.
-- **disabled → lazy** — object created at replicas 0 (lazy's default).
+- **disabled → lazy** — object created at replicas 0 (lazy's default). Rails
+  sets `shell_idle_since = now`, same reasoning as eager → lazy.
 
 **`spec.shell.replicas` is not a user configuration field.** It is **derived
 state** — the operator-facing projection of the durable `terminals: n` refcount —
 written only by Rails. It is not patchable through the ADR-025 surface and is not
-something the dashboard or a user sets directly, unlike `mode`, `image`, and
-`resources`. It lives in `spec` only so the DB-free operator can read it; the
-human-facing knobs end at `mode`/`image`/`resources`.
+something the dashboard or a user sets directly, unlike `mode`, `imageRepo`,
+`imageTag`, and `resources`. It lives in `spec` only so the DB-free operator can
+read it; the human-facing knobs end at `mode`/`imageRepo`/`imageTag`/`resources`.
 
-### 3. Object shape: a Deployment for both eager and lazy
+### 3. Object shape: a StatefulSet for both eager and lazy
 
-Both `eager` (replicas 1) and `lazy` (replicas 0↔1) are a **Deployment**. A
+Both `eager` (replicas 1) and `lazy` (replicas 0↔1) are a **StatefulSet**. A
 lazy shell therefore self-heals once launched, and an eager↔lazy switch is a
 `replicas` patch — no object-kind change, no workspace restart. `disabled`
 creates no object; switching to/from `disabled` is an object create/delete, not
@@ -134,10 +196,46 @@ a patch. On a switch to `disabled`, control deletes the shell object and the
 operator reconciles it away; live terminals lose the exec-PTY and end, the
 worker otherwise runs as normal, and terminal create is refused.
 
-The shell Deployment is scheduled with **pod affinity** to the workspace pod's
-node, because both mount the same ReadWriteOnce PVC. On a node move the two
-cannot swap cleanly while the RWO volume is held by one of them; the PVC holder
-wins and the other waits — the existing RWO constraint, unchanged.
+**The pod name is the reason for the kind.** A StatefulSet names its pod by
+ordinal — `proj-N-shell-0` — so the name is **derivable, not discoverable**:
+Rails computes it from the project id and never learns it from the cluster. That
+is what lets §4 resolve the exec target without a `status.shell.podName` to go
+stale and without listing pods. It also preserves the property today's bare
+`ProjectPod` already depends on, recorded in its own header comment: the pod name
+is deterministic so a worker restart can reattach.
+
+`spec.serviceName` is required by the API, so a headless Service is created
+alongside the set. Nothing resolves the shell by DNS — exec addresses the pod
+directly — and it exists only to satisfy validation. `volumeClaimTemplates` is
+**not** used: the shell mounts the pre-existing workspace PVC by name, exactly as
+the bare pod does today, so the usual StatefulSet trap of orphaned per-replica
+PVCs does not apply.
+
+**Rollout is terminate-then-create.** At replicas 1 a StatefulSet does not surge,
+so a shell image roll leaves a window with no shell pod rather than briefly two.
+That is the better failure for this object, and a Deployment would have needed
+`maxSurge: 0` to get the same behavior. A terminal opened during the roll gets a
+failed attach and re-POSTs (§4).
+
+**Node failure is a storage-backend question, not a design one.** A StatefulSet
+will not recreate ordinal `-0` until the old pod object is fully gone from the
+API, and on an unreachable node kubelet cannot confirm termination, so it can sit
+`Terminating`. Under the `local-path` backend this is moot — the volume is
+node-local and does not outlive the node either. Under Longhorn the volume
+*does* survive and re-attaches elsewhere, so the stuck pod is the only thing in
+the way, and Longhorn's own `defaultSettings.nodeDownPodDeletionPolicy` exists
+for exactly this case. `scripts/lib/carbide_storage.rb` currently passes only
+`defaultReplicaCount`, leaving that setting at its `do-nothing` default; changing
+it is a companion change to the storage install, not to this design. Force
+deletion is acceptable here because concurrent writers to the workspace volume
+are the normal case rather than a hazard — the workspace pod and the shell
+already write the same files by design.
+
+The shell pod is scheduled with **pod affinity** to the workspace pod's node
+while the PVC is ReadWriteOnce, because both mount it and an RWO volume cannot be
+held from two nodes. The PVC holder wins and the other waits — the existing RWO
+constraint, unchanged. Under a future ReadWriteMany volume the affinity is no
+longer required for correctness.
 
 ### 4. Handle endpoints: authenticated, split by caller
 
@@ -151,8 +249,40 @@ returned:
   non-empty `reason` always means "something is wrong."
 - `POST /api/v1/control/workspaces/:id/shell` — **the worker's handle**. The
   only path returning `{ shell_pod, exec_token }`. **The worker is the only
-  caller** — the exec grant never reaches the browser. `shell_pod` is read from
-  `status.shell.podName` (written by the operator) — Rails never lists pods.
+  caller** — the exec grant never reaches the browser. `shell_pod` is the
+  StatefulSet's ordinal-0 pod name (§3), computed by Rails rather than looked up.
+
+**What Rails may read from the cluster.** Two GETs, never a LIST and never a
+watch: the Workspace CR by name, and the shell pod by a name Rails derives.
+
+The derivation is what makes this safe, because there is nothing left to go
+stale. The operator reconciles **only on CR events** — it holds no Pod or
+StatefulSet informer and runs no periodic resync — so any pod identity it
+published into `status` would be a value latched at the last reconcile, and the
+next eviction, OOM kill, drain, or self-heal would invalidate it with no
+reconcile to notice. This design therefore has no `status.shell.podName` at all.
+`phase`, `ready`, and `reason` change with kubelet on no schedule the operator
+observes, so they are computed from a live GET of that one named pod in that one
+namespace. Neither read enumerates anything.
+
+Having the operator publish readiness instead would need it to watch Pods and
+StatefulSets, which is a different operator than the one that exists; it has no
+channel to control and this ADR does not add one.
+
+**Phase is computed, not stored.** Each value resolves from state Rails already
+holds, so no phase column exists:
+
+- `Disabled` — `mode == disabled`.
+- `Idle` — `mode == lazy` and `spec.shell.replicas == 0`. The shell is
+  deliberately at zero and will cold-start on demand. Note this is **not**
+  "refcount has been zero for a while": during the idle-timeout window the shell
+  is still up and usable, and reporting `Idle` then would tell the client the
+  shell is down when it is not.
+- `Starting` — `spec.shell.replicas == 1` (or `mode == eager`) and the named pod
+  is not yet Ready.
+- `Running` — the named pod is Ready and not terminating.
+- `Failed` — the pod is present but not progressing; `reason` carries the k8s
+  detail.
 
 **Sequencing.** The worker calls POST on terminal create. If `ready` is `false`,
 it **re-POSTs with backoff**; POST is idempotent, so it doubles as the worker's
@@ -160,12 +290,17 @@ own poll. **Minting is gated on `ready: true`** — a not-ready POST returns
 `{ ready: false, reason }` with no grant, so an `ImagePullBackOff` loop mints
 nothing. The client's GET is display-only; there is no client↔worker handoff.
 
-The worker learns the pod name from POST, never caches it beyond a single
+A successful POST nulls `shell_idle_since` (§2) and, under `lazy`,
+drives the intent to 1. It does not wait for the worker's follow-up release to
+do so — the cold-start path must not race its own idle clock.
+
+The worker takes the pod name from POST, never caches it beyond a single
 terminal's lifetime, and re-fetches every terminal open. A shell-image rollout
 is invisible to a terminal opened after it settles; a terminal opened **during**
-the rollout may get one bad attach (the returned `podName` can name a
-terminating pod), recovered by re-POSTing. `ready: true` is gated on the named
-pod being Ready and not terminating.
+the rollout is refused, because the ordinal-0 pod is terminating or not yet
+recreated (§3), and the worker recovers by re-POSTing. `ready: true` is gated on
+the named pod being Ready and not terminating, so the refusal is the gate doing
+its job rather than a bad attach reaching the PTY.
 
 ### 5. Idle-down: worker refcount plus report-recency, not refcount alone
 
@@ -174,24 +309,34 @@ decided in Rails from two inputs, then expressed as a single `replicas: 0` CR
 write the operator reconciles:
 
 - `POST /api/v1/control/workspaces/:id/shell/release` — `{ terminals: n }`, sent
-  on terminal create/destroy and as a periodic keep-alive. Rails stores both
-  `n` and `last_report_at` durably (§2).
+  on terminal create/destroy and as a periodic keep-alive. Rails stores `n` and
+  `last_report_at` durably, and latches `shell_idle_since` on the
+  falling edge (§2).
 
-**Scale-to-zero fires when EITHER condition holds:**
+**The two conditions read different clocks.** This is the point of having both,
+and it is why they need separate columns:
 
-1. `n == 0` **and** `now − last_report_at > workspace_shell_idle_timeout`
-   — the graceful path: genuinely no terminals for long enough, and the worker
-   is still alive to say so.
-2. `now − last_report_at > workspace_shell_max_report_time`
+1. `shell_terminals == 0` **and**
+   `now − shell_idle_since > workspace_shell_idle_timeout`
+   — the graceful path: genuinely no terminals for long enough. Measured from
+   the **falling edge**, not from the last report, so a healthy worker
+   heartbeating `n: 0` does not reset it.
+2. `now − shell_last_report_at > workspace_shell_max_report_time`
    — the liveness path: the worker has stopped reporting, so it is frozen or
    dead **regardless of what the last `n` claimed**. A frozen worker with a
    stale `n: 3` is not three live terminals; it is a dead worker, and its shell
    is orphaned.
 
-Condition 1 is refcount-aware; condition 2 is refcount-independent. That is the
-point of having both. A healthy worker with zero terminals keeps heartbeating
-`n: 0`, so only condition 1 ever fires for it; a wedged worker stops
-heartbeating, so only condition 2 can catch it.
+Condition 1 is refcount-aware and edge-triggered; condition 2 is
+refcount-independent and level-triggered on liveness. A healthy worker with zero
+terminals keeps heartbeating `n: 0`, so only condition 1 ever fires for it; a
+wedged worker stops heartbeating, so only condition 2 can catch it.
+
+An earlier draft of this ADR computed both conditions from `last_report_at`.
+That is recorded here because the bug is not obvious from reading it: with
+keep-alives refreshing the same timestamp condition 1 could never be satisfied
+by a healthy worker, so every idle-down would have come from condition 2 — the
+opposite of the intent, and only after the much longer liveness ceiling.
 
 **Why condition 2 is load-bearing.** A frozen-but-alive worker (e.g. the
 EventMachine reactor wedged, or a hung `kubectl exec`) is still a `Running` pod:
@@ -199,19 +344,42 @@ kubelet does not restart it, and the liveness probe hits Rails `/up`, not the
 worker's reactor, so the Deployment sees it as healthy. Nothing else scales the
 shell down. Only the report-recency rule notices the silence and reclaims the
 orphaned shell. Even when the workspace pod *does* die and restart, the shell
-Deployment is a separate object and survives as an idle replica until this rule
+StatefulSet is a separate object and survives as an idle replica until this rule
 scales it down — restarting the workspace does not tear the shell down.
 
-The 0→1 direction is **not** debounced: any `n > 0` report (or the ensure POST)
-refreshes `last_report_at` and writes `replicas: 1` immediately. At carbide
-scale that is acceptable; a reconnect storm writes the CR once per workspace,
-which is deliberate, not a surprise.
+**Condition 2 must also reset the refcount.** Scaling down on liveness while
+leaving `shell_terminals` at whatever the dead worker last claimed leaves the row
+asserting terminals that cannot exist — the shell is gone. The durable damage is
+worse than the cosmetic: `shell_terminals` never afterwards transitions from
+`> 0` to `0`, so the falling edge never re-arms, `shell_idle_since` stays null,
+and condition 1 can never fire for that workspace again. The condition-2 write
+therefore sets `shell_terminals = 0` and `shell_idle_since = now` in the same
+transaction as `shell_replicas = 0`.
 
-**Threshold relationship.** `workspace_shell_max_report_time` must exceed
-`workspace_shell_idle_timeout` (a liveness ceiling should be longer than a
-graceful-idle grace), and both must comfortably exceed the heartbeat interval,
-or a single missed heartbeat reads as a dead worker and scales a live shell
-down.
+**Worker restart.** A restarted worker reports `n: 0` with no terminals. If the
+stored value was `> 0` this is an ordinary falling edge and latches normally. If
+the stored value was already 0 it is not an edge, the latch keeps its earlier
+value, and the shell may scale down shortly after the restart on a clock that
+ran through the outage. That is the intended reading: no terminals existed while
+the worker was down, so the time counts as idle. Discarding it would require the
+worker to report a boot identity, which is a wire change bought for nothing.
+
+**Report reordering.** Create and destroy reports are separate HTTP calls, so a
+destroy carrying `n: 0` can arrive after a later create carrying `n: 1`, latching
+zero while a terminal is live. The next keep-alive reports `n > 0` and nulls the
+latch, so the window is bounded by the heartbeat interval and the idle timeout is
+far longer. Accepted as self-correcting. A monotonic sequence number on the
+release payload would close it and is the obvious fix if this ever bites.
+
+The 0→1 direction is **not** debounced: any `n > 0` report (or the ensure POST)
+refreshes `last_report_at`, nulls the latch, and writes `replicas: 1`
+immediately. At the intended workspace count that is acceptable; a reconnect
+storm writes the CR once per workspace, which is deliberate, not a surprise.
+
+**Threshold relationship.** Both `workspace_shell_idle_timeout` and
+`workspace_shell_max_report_time` must comfortably exceed the heartbeat
+interval, or a single missed heartbeat reads as a dead worker and scales a live
+shell down.
 
 Client-driven idle-down is rejected: the browser is not a trustworthy liveness
 signal — a closed tab, refresh, or crash would strand a shell with no reliable
@@ -229,6 +397,13 @@ and cheap. This is imperfect — no shared lock, no queue, no persistence of the
 sweep cursor — but it is the fastest path to something that works, and it is
 accepted as such. Operator concurrency, partitioning, replica count, and the
 Rails↔kube contract are revisited in ADR-030.
+
+The sweep and the release/ensure handlers both write
+`control_projects.shell_replicas`, from different processes. The sweep must
+therefore re-evaluate its conditions inside the transaction that writes the
+intent, rather than acting on values read at the start of the pass — otherwise a
+cold start landing mid-sweep can be overwritten by a `replicas: 0` decided
+against a refcount that is no longer current.
 
 ### 6. Credentials: two audiences, no standing authority
 
@@ -254,8 +429,9 @@ the workspace pod (which the worker is already running inside), its shell pod,
 and the transient storage-migration copy job (ADR-016 §4) — nothing the worker
 does not already have or own. A leaked namespace-scoped token therefore reaches
 nothing the worker could not already touch. This closes the pod-scoped-vs-
-namespace-scoped question and removes the need for a deterministic pod name — §3
-stays a Deployment.
+namespace-scoped question: the grant no longer needs a deterministic pod name to
+pin `resourceNames` against. §3 supplies one regardless, for pod resolution
+rather than for RBAC.
 
 **The condition that reopens it.** If a per-workspace database pod ever lands in
 `ws-N` (per-workspace CNPG), namespace scope would then also reach that pod,
@@ -340,6 +516,8 @@ the worker owns no pod lifecycle and holds no standing cluster exec authority.
   standing cluster authority.
 - Shell image/limits become a CR/template edit — same surface as the rest of the
   workspace, no in-pod hardcoding.
+- Idle duration and worker liveness are separate signals in separate columns, so
+  neither threshold's tuning distorts the other.
 
 **Negative / to resolve**
 
@@ -347,6 +525,9 @@ the worker owns no pod lifecycle and holds no standing cluster exec authority.
   credential surface to operate.
 - Lazy demand is a CR write per cold start, and idle-down is a CR write per idle
   transition.
+- A third refcount column, with edge semantics that are only correct if every
+  writer of `shell_terminals` also maintains the latch. The mode-flip writes in
+  §2 are the non-obvious ones.
 - Rails gains `create serviceaccounts/token` (via the fixed
   `carbide-workspace-token-mint` ClusterRole); the operator gains
   `serviceaccounts/token` — minting a token bounded by the target SA's own
@@ -358,18 +539,34 @@ the worker owns no pod lifecycle and holds no standing cluster exec authority.
 
 ## Open questions
 
-1. **Refcount column shape.** Resolved: `control_projects.shell_terminals` +
-   `control_projects.shell_last_report_at` (the same table carrying
-   `template_name` / `workspace_image_tag`). The values are settled; the column
-   names are settled.
-2. **Idle + report thresholds.** Default values for `workspace_shell_idle_timeout`
-   and `workspace_shell_max_report_time` live in the global `Setting` table;
-   per-workspace overrides (if any) are `control_projects` columns. Their
-   ordering (`max_report_time > idle_timeout`) is settled; the numbers are not.
+1. **Refcount column shape.** Resolved: `control_projects.shell_terminals`,
+   `control_projects.shell_last_report_at`, and
+   `control_projects.shell_idle_since` (the same table carrying `template_name` /
+   `workspace_image_tag`). The working name `shell_terminals_zero_since` is
+   dropped — it named the mechanism, `shell_idle_since` names the meaning, and
+   the meaning is what every call site is actually asking about.
+2. **Idle + report thresholds.** Resolved. `workspace_shell_idle_timeout` is
+   **4h**, `workspace_shell_max_report_time` is **5m**. Both live in the global
+   `Setting` table and both are overridable per workspace by nullable
+   `control_projects` columns, where null means "inherit the global default."
+
+   An earlier draft called the ordering `max_report_time > idle_timeout`
+   settled. These numbers invert it deliberately, because the two conditions
+   answer different questions. Condition 2 means *the worker is gone*, and
+   reclaiming an orphan is urgent: at a 30s heartbeat, 5m is ten consecutive
+   misses, which is ample evidence. Condition 1 means *the worker is here and
+   nobody wants a shell*, which is a comfort decision — 4h holds the shell
+   through a working day's gaps and still reclaims it overnight. Under the old
+   ordering condition 2 was close to dead code: the orphan case it exists to
+   catch would sit for the longer clock before anything noticed. The constraint
+   that does hold is the one stated in §5 — both must comfortably exceed the
+   heartbeat interval.
 3. **TokenReview cache TTL.** How long the worker→control TokenReview is cached.
-   A cached review lets a deleted worker authenticate until expiry and could
-   write `spec.shell.replicas: 1` for a dead workspace; bounded by TTL and
-   self-corrected by the idle timeout, but the TTL needs a value.
+   A cached review lets a deleted worker authenticate until expiry. The
+   `replicas: 1` direction is self-limiting — a spurious 1 for a dead workspace
+   starts a shell that the idle rules then reclaim. The direction that costs is a
+   cached-auth `n: 0` release, which latches the falling edge and can scale down
+   a shell whose workspace is fine. Bounded by TTL, but the TTL needs a value.
 4. **Direct WebSocket exec.** Deferred possible future, gated on a later spike
    that a raw WS channel-4 resize frame actually changes the remote PTY.
 
@@ -398,14 +595,29 @@ Rails↔Kubernetes interaction contract):
   cluster, violates the control boundary, and hardcodes shell shape in-pod.
 - **`keepWarm` boolean (ADR-016 §7 as originally written).** Rejected: can't
   express `disabled` without a second field, and hard-links lazy to a bare pod.
+- **Idle measured from `last_report_at`.** Rejected: keep-alives refresh it, so
+  a healthy idle worker resets its own idle clock on every heartbeat and
+  condition 1 can never fire. Replaced by the falling-edge latch (§2).
+- **Worker-reported idle duration (`time_at_zero` on the wire).** Rejected: the
+  worker is the process condition 2 declines to trust for liveness, so its
+  self-reported idle duration is exactly as stale as its `n` in the failure that
+  matters. Control has every report already and can latch the edge itself with
+  no wire change.
 - **Pod-scoped grant (`resourceNames` + `boundObjectRef`).** Rejected once the
-  namespace scope decision landed: it required a deterministic pod name (a
-  StatefulSet), a pod-creation-triggered reconcile, and solved a problem — a
-  per-workspace database pod — that does not exist. Reopened only by that
-  future pod.
-- **StatefulSet for a deterministic shell pod name.** Rejected: the deterministic
-  name existed only to pin pod-scoped RBAC, which namespace scope no longer
-  needs.
+  namespace scope decision landed: it required a deterministic pod name and a
+  pod-creation-triggered reconcile, and solved a problem — a per-workspace
+  database pod — that does not exist. The StatefulSet in §3 now supplies the
+  deterministic name for its own reasons, so only the second objection still
+  stands. Reopened by that future pod.
+- **A Deployment for the shell object.** Rejected: its pod is named by the
+  ReplicaSet as `<deploy>-<rshash>-<podhash>`, a name that does not exist at
+  reconcile time and that changes on eviction, OOM kill, drain, and ReplicaSet
+  self-heal — none of which are CR writes. Nothing in this design could then
+  learn the current pod name and keep it current: a `status.shell.podName` would
+  be invalidated by exactly the self-healing the Deployment was chosen for, and
+  resolving it live would require listing pods on the client-facing status path.
+  The self-healing a Deployment offers over a StatefulSet is real only during
+  node failure, and is addressed at the storage layer (§3).
 - **Client-driven idle-down.** Rejected: browser is not a trustworthy liveness
   signal.
 - **Operator mints the grant.** Rejected: heavier round-trip or sidecar for no

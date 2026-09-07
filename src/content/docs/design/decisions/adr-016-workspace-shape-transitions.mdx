@@ -7,6 +7,8 @@ sidebar:
     text: Proposed
     variant: note
 status: Proposed
+#create_date: "2026-08-24"
+#updated_date: "2026-09-03"
 date: "2026-09-03"
 ---
 
@@ -153,7 +155,7 @@ the Deployment is ever pointed at it.** A cutover to a new volume that is
 empty or partial is the one failure this sequence exists to make impossible.
 
 1. Provision the new PVC at the target size (same StorageClass).
-2. Scale the workspace Deployment **and the shell Deployment** (ADR-029) to 0.
+2. Scale the workspace Deployment **and the shell StatefulSet** (ADR-029) to 0.
    Both mount the same PVC; a live eager shell would keep writing during the
    copy and break the byte-for-byte guarantee.
 3. Copy old → new (a one-shot copy job in the workspace namespace) such that
