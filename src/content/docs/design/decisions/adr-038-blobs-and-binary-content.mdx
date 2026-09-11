@@ -85,6 +85,28 @@ digest -> bs: "new"
 bs -> rev
 ```
 
+## Where the bytes live
+
+Three tiers with three jobs. Postgres holds history; the PVC holds the live copy
+in-pod tools read; the object store holds bytes by digest. None of them is "the
+filesystem" on its own.
+
+```d2
+# Three tiers, three jobs. History is not on disk; the disk is not the archive.
+direction: down
+
+edit: "a write"
+pg: "Postgres\nrevisions DAG · branches · keyframes\nblob index by sha256 (bytea by default)" {shape: cylinder}
+pvc: "PVC — working area\nthe live copy shell tools read\n(rebuilt cache, never the truth)" {shape: cylinder}
+obj: "S3 / MinIO / Ceph\nbytes by digest: put once, read many\n(archive; historical content)" {shape: cylinder}
+
+edit -> pg: "text: content + full history"
+edit -> pvc: "text: flushed for in-pod tools"
+edit -> obj: "binary: bytes via BlobStore seam"
+pg -> obj: "revision references a digest" {style.stroke-dash: 3}
+pvc -> pg: "inotify folds external writes back" {style.stroke-dash: 3}
+```
+
 ## Consequences
 
 **Positive**

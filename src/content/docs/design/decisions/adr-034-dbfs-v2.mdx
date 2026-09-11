@@ -121,6 +121,66 @@ v2: "v2 — revision DAG" {
 }
 ```
 
+## The round trip
+
+A single keystroke, end to end — and the three places the bytes end up.
+
+```d2
+# keyboard → client → worker → DBFS → Postgres / PVC / object store, and back.
+direction: right
+
+client: "Client (browser)" {
+  direction: down
+  mon: "MonacoEditor\nkeystroke → delta ops"
+  pane: "FilePane\nfs/write { path, changes, base }"
+  apply: "applyRemoteChange\n(peer edits land here)"
+}
+
+worker: "Worker (EventMachine)" {
+  direction: down
+  fs: "FsStore.handle_write"
+  doc: "DocumentCache\nwarm buffer per (node, branch)"
+  bc: "broadcast fs/change"
+  fl: "VfsFlusher\n(text sweeps)"
+  wt: "VfsWatcher\n(inotify)"
+}
+
+store: "DbfsV2::Store#write"
+lock: "branch row lock\n(FOR UPDATE)"
+xf: "transform past\nthe intervening revs"
+
+pg: "Postgres" {
+  direction: down
+  rev: "revisions (DAG)"
+  kf: "keyframes"
+  br: "branches (head)"
+}
+
+pvc: "PVC — VFS working area\ntext, real file IO" {shape: cylinder}
+obj: "S3 / MinIO\ncontent-addressed blobs\n(archive)" {shape: cylinder}
+
+client.mon -> client.pane: "1 delta"
+client.pane -> worker.fs: "2 ws"
+worker.fs -> store: "3 write"
+store -> lock: "4 serialize"
+lock -> xf: "5 rebase"
+xf -> pg.rev: "6 append"
+xf -> pg.br: "advance head"
+xf -> pg.kf: "on threshold"
+store -> worker.doc: "7 advance (after commit)"
+worker.fs -> worker.bc: "8 fan out"
+worker.bc -> client.apply: "9 fs/change"
+worker.fl -> pg: "read current"
+worker.fl -> pvc: "write TEXT only"
+pvc -> worker.wt: "inotify"
+worker.wt -> store: "external → setContents / Ingest"
+worker.fs -> obj: "binary bytes → BlobStore"
+```
+
+Steps 1–9 are the interactive path: a write is durable *before* it is broadcast.
+The flusher and watcher are the separate disk-facing loop. Binaries leave through
+the `BlobStore` and never enter the text log.
+
 ## Consequences
 
 **Positive**

@@ -96,6 +96,51 @@ g -> ap: "disjoint"
 g -> cf: "overlap"
 ```
 
+### Decision points
+
+The same path as a decision sequence. Only two branches change the outcome: an
+overlapping write refuses, and a binary skips the transform entirely. Everything
+else is bookkeeping.
+
+```d2
+# Every branch a write takes, in order. Only two of them change the outcome.
+direction: down
+
+start: "fs/write(path, changes, base)"
+
+qbin: "binary?"
+bin: "writeBinary → BlobStore\nno OT — last write wins"
+
+qstale: "base == head?"
+blind: "blind append\n(genesis makes this rare)"
+current: "no transform needed"
+
+xf: "transform past\nintervening revisions"
+qov: "ambiguous?\n(overlapping writes)"
+conflict: "ConflictError\nnothing committed"
+apply: "append a revision"
+
+qkf: "keyframe threshold\ncrossed?"
+kf: "write keyframe\n(skip-replay hint only)"
+done: "advance cache\nbroadcast to peers"
+
+start -> qbin
+qbin -> bin: "yes"
+qbin -> qstale: "no"
+qstale -> blind: "empty / no base"
+qstale -> current: "current"
+qstale -> xf: "stale"
+current -> apply
+blind -> apply
+xf -> qov
+qov -> conflict: "yes"
+qov -> apply: "no"
+apply -> qkf
+qkf -> kf: "yes"
+qkf -> done: "no"
+kf -> done
+```
+
 ## Consequences
 
 **Positive**
