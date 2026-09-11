@@ -126,60 +126,59 @@ v2: "v2 — revision DAG" {
 A single keystroke, end to end — and the three places the bytes end up.
 
 ```d2
-# keyboard → client → worker → DBFS → Postgres / PVC / object store, and back.
-direction: right
+# Vertical: client → worker → DBFS → the three backing stores.
+direction: down
 
 client: "Client (browser)" {
-  direction: down
+  style: { stroke-width: 0; fill: transparent }
+  direction: right
   mon: "MonacoEditor\nkeystroke → delta ops"
   pane: "FilePane\nfs/write { path, changes, base }"
-  apply: "applyRemoteChange\n(peer edits land here)"
+  apply: "applyRemoteChange"
+  mon -> pane
 }
 
 worker: "Worker (EventMachine)" {
-  direction: down
-  fs: "FsStore.handle_write"
-  doc: "DocumentCache\nwarm buffer per (node, branch)"
+  style: { stroke-width: 0; fill: transparent }
+  direction: right
+  fs: "FsStore\nhandle_write"
+  doc: "DocumentCache\nwarm buffer"
   bc: "broadcast fs/change"
-  fl: "VfsFlusher\n(text sweeps)"
-  wt: "VfsWatcher\n(inotify)"
+  fl: "VfsFlusher"
+  wt: "VfsWatcher\ninotify"
 }
 
-store: "DbfsV2::Store#write"
-lock: "branch row lock\n(FOR UPDATE)"
-xf: "transform past\nthe intervening revs"
-
-pg: "Postgres" {
-  direction: down
-  rev: "revisions (DAG)"
-  kf: "keyframes"
-  br: "branches (head)"
+dbfs: "DBFS" {
+  style: { stroke-width: 0; fill: transparent }
+  direction: right
+  store: "Store#write"
+  lock: "branch row lock\n(FOR UPDATE)"
+  xf: "transform past\nthe intervening revs"
+  kf: "keyframe\n(on threshold)"
+  store -> lock -> xf -> kf
 }
 
-pvc: "PVC — VFS working area\ntext, real file IO" {shape: cylinder}
-obj: "S3 / MinIO\ncontent-addressed blobs\n(archive)" {shape: cylinder}
+pg: "Postgres\nrevisions DAG · branches · keyframes" {shape: cylinder}
+s3: "S3 / MinIO\ncontent-addressed blobs\n(archive)" {shape: cylinder}
+pvc: "PVC — VFS working area\ntext, real file IO (cache)" {shape: cylinder}
 
-client.mon -> client.pane: "1 delta"
-client.pane -> worker.fs: "2 ws"
-worker.fs -> store: "3 write"
-store -> lock: "4 serialize"
-lock -> xf: "5 rebase"
-xf -> pg.rev: "6 append"
-xf -> pg.br: "advance head"
-xf -> pg.kf: "on threshold"
-store -> worker.doc: "7 advance (after commit)"
-worker.fs -> worker.bc: "8 fan out"
-worker.bc -> client.apply: "9 fs/change"
-worker.fl -> pg: "read current"
+client.pane -> worker.fs: "1 fs/write"
+worker.fs -> dbfs.store: "2 write"
+dbfs.kf -> pg: "3 append + advance head"
+dbfs.kf -> s3: "4 binary bytes → BlobStore"
+dbfs.kf -> worker.doc: "5 advance cache"
+worker.fs -> worker.bc: "6 fan out"
+worker.bc -> client.apply: "7 fs/change"
+worker.fl -> dbfs.store: "read current"
 worker.fl -> pvc: "write TEXT only"
 pvc -> worker.wt: "inotify"
-worker.wt -> store: "external → setContents / Ingest"
-worker.fs -> obj: "binary bytes → BlobStore"
+worker.wt -> dbfs.store: "external → setContents / Ingest"
 ```
 
-Steps 1–9 are the interactive path: a write is durable *before* it is broadcast.
-The flusher and watcher are the separate disk-facing loop. Binaries leave through
-the `BlobStore` and never enter the text log.
+Top to bottom: the client, the worker, the DBFS write path, the three backing
+stores. Steps 1–7 are the interactive path — a write is durable *before* it is
+broadcast. The flusher/watcher pair is the separate disk-facing loop against the
+PVC. Binaries leave through the `BlobStore` and never enter the text log.
 
 ## Consequences
 
