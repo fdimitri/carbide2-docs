@@ -160,17 +160,17 @@ dbfs: "" {
 stores: "" {
   style: { stroke-width: 0; fill: transparent }
   direction: right
-  pg: "Postgres" {
+  pg: "Postgres" {shape: cylinder
     direction: down
     rev: "revisions (DAG)"
     br: "branches (head)"
     kfr: "keyframes"
   }
-  s3: "S3 / MinIO" {
+  s3: "S3 / MinIO" {shape: cylinder
     direction: down
     blobs: "content-addressed\nblobs (archive)"
   }
-  pvc: "PVC — working area" {
+  pvc: "PVC — working area" {shape: cylinder
     direction: down
     live: "text, real file IO\n(derived cache)"
   }
