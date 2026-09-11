@@ -219,6 +219,64 @@ PVC. Binaries leave through the `BlobStore` and never enter the text log.
 - The project DAG (ADR-042) does not exist, and offline/divergent editing cannot
   be finished without it.
 
+## Data model
+
+The v2 entities, and what each replaces in v1:
+
+| v2 | v1 | note |
+|---|---|---|
+| `FileNode` (UUID id) | `DirectoryEntry` (integer id) | the path is an *attribute* of the node; adds `deleted_at`, `symlink_target` |
+| `Branch` (name, `head_revision_id`) | — | `main` auto-created per node |
+| `Revision` (`parent_id`, `second_parent_id`, `change_type`, `change_data`, `priority`, UUID id) | `FileChange` (`revision = count`) | a DAG, not a chain |
+| `Keyframe` | — | full-content snapshot, used *only* to skip replay |
+| `Blob` (`digest` PK, `bytea`, `size`) | binary bytes on the PVC | content-addressed, behind the `BlobStore` seam |
+
+Migrations `001..005` create these; `006` makes the `[project_id, path]` unique
+index **partial** (`WHERE deleted_at IS NULL`), which is what lets a live node and
+a tombstoned history coexist at one path (ADR-035; this is ADR-004's own
+"partial index" resolution).
+
+## The wire changes
+
+`fs/write` gains a base revision. v1 sends deltas with no base:
+
+```
+-> { cs:'fs', cmd:'write', payload:{ path, changes:[ { change_type, change_data, start_line, ... } ] } }
+<- { cs:'fs', cmd:'written', payload:{ path, revisions:[ 7, 8 ] } }     // == file_changes.count
+```
+
+v2 threads the base and can refuse:
+
+```
+-> { cs:'fs', cmd:'write',   payload:{ path, changes:[...], base: <revision_id> } }
+<- { cs:'fs', cmd:'written', payload:{ path, revisions:[ <id>, ... ] } }   // opaque ids
+<- { cs:'fs', cmd:'conflict',payload:{ path, base, head } }                // new frame
+```
+
+Three consequences worth stating plainly: `revision` stops being an integer the
+client can compare or increment; the client must render a **conflict** state that
+does not exist today; and the agent tools already carry `base_revision` (as
+content-keyed CAS), so the *field* is not new even though the semantics are.
+
+## Open questions
+
+1. **Agent tools.** They already do content-keyed CAS + reject (`{ stale: true }`).
+   Do they move onto the same transform path, or keep rejecting and let the model
+   re-read? Both are correct; they differ in who retries.
+2. **Mixed fleet.** During the transition the editor wire changes for everyone at
+   once, or is versioned (`ADR-019` caps) so a stale client is told to reload?
+3. **Cutover.** Does v2 land as a wipe-and-re-import (ADR-026's precedent for
+   existing rows), or is there a migration from `FileChange` to `Revision`? A
+   migration is machinery that exists only for a pre-alpha install.
+4. **Where the split lands.** `DirectoryEntry` could become a thin façade over
+   `Store` (smaller diff, two models live on) or be replaced outright (bigger
+   diff, one model). Not decided here.
+
+## Out of scope
+
+- **Hardlinks.** Not modeled (ADR-026).
+- **Project/repo-directory DAG.** ADR-042; explicitly not this decision.
+- **A CRDT store.** Parked by ADR-001; v2 keeps the per-keystroke log.
 ## Alternatives considered
 
 - **Keep v1 and add branching on top.** Rejected: v1's log is linear by

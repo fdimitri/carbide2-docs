@@ -162,6 +162,113 @@ kf -> done
 - The client needs a bit-compatible JS port of this transform (fold order, Myers
   tie-break, conflict gate) for offline editing.
 
+### Primitives and the one coordinate space
+
+Every delta normalizes to a flat character-offset splice:
+
+```ruby
+(start, end, text, priority)   # insert: start == end
+                               # delete: text == ""
+                               # replace: decomposes to [delete, insert]
+```
+
+Two conventions existed (chained and same-space) and mixing them compounded
+shifts wrongly. Everything is same-space now: `transform_di/dd/dr` emit
+post-other remnants applied **right-to-left**, and `apply_transformed!` folds at
+the **prim level**, with no re-encode between hops.
+
+### Fold order is right-to-left, and it is load-bearing
+
+A single revision can emit several prims — a multi-hunk `setContents` diff, or a
+pcre replace with several matches. `transform_list` sorts `others` by
+**descending start** before folding, because a prim to the *right* never shifts
+one to its left, so each other stays valid in the op's current space.
+
+Folding in list order was wrong: after the op moved past `p1` it was in post-`p1`
+space, but it was then transformed against `p2`, still in *base* space, so the
+shifts compounded. The bug slipped past the overlap gate whenever the op sat in
+the **gaps** between prims (`ambiguous?` false, so the precise fold ran).
+
+Observed, deterministically: a pcre `-` → `===` on `a-b-c-d`, then a stale delete
+of `b`, deleted `c` — yielding `"a===b======d"` instead of `"a======c===d"`. The
+index tie-break keeps equal-start prims stable.
+
+### Insert-inside-replace never splits
+
+There is no correct prim split for an insert inside a replace: both halves would
+need the replacement text, and an insert cannot be ordered unambiguously relative
+to the replacement within one prim. That is *why* it is a conflict rather than a
+clever fold. The two branches that used to attempt it (both of which doubled
+content) are now a `raise`, so any future narrowing of `ambiguous?` crashes
+loudly instead of silently duplicating text.
+
+### The diff: Myers, bounded, with a pinned tie-break
+
+`diff_hunks` trims the common token prefix/suffix first (exact — any minimal edit
+script keeps them), then runs `DbfsV2::Myers` on the middle only, minimal at cost
+`n + m − 2·LCS`. Past `MAX_D` (a genuine full rewrite) Myers returns nil and the
+caller falls back to one coarse hunk — correct, and right for that case.
+
+The tie-break is a **semantic choice**: with repeated tokens the placement of an
+added token is ambiguous and all options are minimal. `"a\na"` → `"a\na\na"` can
+insert the extra `a` first, second or third, and *which* decides where a
+concurrent edit near the repeats lands. It is pinned: Myers appends at the END,
+`[[2, 2, 2, 3]]`. A future diff swap that changes this changes OT position
+semantics and must fail that test loudly.
+
+History is unaffected either way: replaying a `setContents` sets stored content
+and never runs the diff.
+
+### Write anchoring
+
+`write` captures the revision the edit is validated against and uses **that** as
+the effective base under the lock:
+
+- caller base, or the head for a blind append;
+- validation runs against `Content.at(node, base)` — the revision the edit is
+  anchored to — not a fresh head read.
+
+A foreign write landing between validation and lock is therefore *transformed
+against*, not mis-applied. `Chain` reloads its associations so a foreign-written
+revision is visible, and `DocumentCache.advance` takes the revision's `parent_id`
+and **drops** the entry when the cached head is not that parent (a `nil` cached
+head does not survive: `nil != parent` invalidates it), which is what fixes
+keyframe drift under a cross-process write.
+
+### `transform()` is a wrapper, not a second implementation
+
+The pairwise entry point used to route opaque ops and ambiguous overlaps to a
+`setContents` snapshot — which is *not* what the live path or merge do (they
+expand pcre into splices and raise on overlap). The two disagreed. It is now a
+thin wrapper over the same fold:
+
+```ruby
+def transform(a, b, base)
+  a_prims = to_prims(a, buf); b_prims = to_prims(b, buf)
+  raise ConflictError if ambiguous?(a_prims, b_prims)
+  [encode(transform_list(a_prims, b_prims), ...), ...]
+end
+```
+
+`transform_opaque` / `opaque?` are deleted. A raised `ConflictError` counts, in
+the property tests, as "converged by both refusing".
+
+### Cache advance sits outside the transaction
+
+`append!` defers `advance_cache!` via `ActiveRecord.after_all_transactions_commit`,
+so a rollback cannot leave in-memory state advanced. `write` validates (including
+compiling a pcre pattern) **before** the transaction, so a bad delta fails closed
+without poisoning the file.
+
+## Open questions
+
+1. **Runtime policy for serialization.** The lock is Postgres-only in practice
+   (SQLite drops the clause). Enforcing it needs a Postgres CI run, not a skip.
+2. **Binary is not OT.** Two concurrent `write_blob`s are last-write-wins.
+3. **PCRE budget.** `Settings#regexp_timeout` bounds a match; it is
+   process-global and per *match* (ADR-040).
+4. **Coalescing keystrokes.** A merge of same-user adjacent inserts would cut row
+   count while retaining the edit; explicitly *not* erasure. Not built.
 ## Alternatives considered
 
 - **Append order with no transform (v1).** Rejected: it cannot express a stale

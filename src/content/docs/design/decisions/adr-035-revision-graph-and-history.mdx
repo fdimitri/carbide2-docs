@@ -102,6 +102,82 @@ live -> future {style.stroke-dash: 3}
 - `deleted_at` + a partial unique index is a schema change against a live
   `[project_id, srcpath]` unique index.
 
+### Genesis: every create writes a revision
+
+`create_file` / `create_folder` write a **genesis revision even when empty** —
+including a 0-byte binary (`touch foo.png` is a real created file).
+
+This is not bookkeeping. Without a genesis the branch head is `nil`, so the next
+write is a *blind append* with no base and no transform, and two clients editing
+a new empty file get **delivery order instead of priority order** — OT silently
+skipped for exactly the case where it matters most. A genesis also makes
+resurrect-with-empty produce an actual empty file. The empty blob is
+content-addressed, so all 0-byte binaries share one `blobs` row.
+
+Consequence: revision counts shift by one per create. Any consumer that assumed
+"a new file has zero revisions" is wrong.
+
+### Keyframes: skip replay, never compact
+
+A keyframe is a full-content snapshot keyed by revision. It exists so a cold read
+starts replay later instead of at genesis. It does **not** replace or delete the
+rows before it, and pre-keyframe revisions stay reachable.
+
+```ruby
+Settings#keyframe_revisions  # nil => no automatic keyframes
+Settings#keyframe_bytes      # nil => no automatic keyframes
+```
+
+The byte threshold is measured as bytes **added since the last keyframe**
+(`bytes_since_kf`), not total buffer size — otherwise a large file writes a
+keyframe on every keystroke. The auto-keyframe counter lives in the in-memory
+cache, so a file written but never read gets no keyframe (its first cold read
+replays once). Persisting that counter is the next step if it matters.
+
+```d2
+# A keyframe is a place to start reading, not a thing that removes the history.
+direction: right
+g: genesis
+a: rev 1
+b: rev 2
+k: "keyframe at rev 2\n(replay can start here)"
+c: rev 3
+d: "head"
+g -> a -> b -> k -> c -> d
+k -> g {style.stroke-dash: 3}
+```
+
+### Read-path cost, stated
+
+`stat` does one indexed `COUNT(*)` plus a content size. Text size goes through
+`Content.head_cached`: O(1) on a warm cache, one replay on a cold read. The bulk
+paths (`Store#tree`, `Store#list`) do not compute size at all — they emit
+`{id, name, path, type, binary, symlink, children}` — so rendering a large tree
+never touches content size.
+
+The one caveat: `revisions.count` is still one `COUNT` per `stat` call. If a bulk
+"stat everything" path is ever added, cache it the way binary already caches
+`last_size`. Not needed for the current one-file-at-a-time flow.
+
+## Open questions
+
+1. **Tombstone retention.** Tombstones accumulate. A GC pass hard-deleting them
+   older than N would be the *only* place history is ever discarded, so it must
+   be explicit and opt-in — not a janitor that quietly runs.
+2. **Undelete UI.** `list`/`tree` can already return tombstones tagged
+   `deleted: true`. Whether the explorer surfaces them is a product call.
+3. **`setContents` is overloaded.** It is the VFS set-content op, *and* every
+   genesis, *and* every merge commit. Whether genesis and merge deserve their own
+   change types (`fileCreated`-style, per ADR-004) is recorded but not decided.
+4. **Persisting the keyframe counter.** Today a never-read file gets no keyframe.
+
+## Out of scope
+
+- **Hardlinks** (ADR-026).
+- **Auto-squash / WAL side-log.** A side log that batches raw keystrokes into a
+  compacted DAG is the bounded-size option (keeping the raw log for audit) and is
+  deferred until it is actually required.
+- **Custom on-disk revision format** instead of the database.
 ## Alternatives considered
 
 - **Hard delete, as today.** Rejected: it loses history by design (ADR-004).

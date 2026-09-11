@@ -92,6 +92,77 @@ store -> tl
   the settings row becomes the only source.
 - File ownership as a UUID is a forward note, not yet wired.
 
+### The value object
+
+```ruby
+DbfsV2::Settings.new(
+  max_blob_bytes:     nil,   # nil => no limit
+  keyframe_revisions: nil,   # nil => no automatic keyframes
+  keyframe_bytes:     nil,   # nil => no automatic keyframes
+  regexp_timeout:     nil,
+  off_parent_base:    :refuse # :refuse (default) | :rebase
+)
+DbfsV2::Store.new(project_id, settings: settings_or_nil)
+```
+
+**No defaults, and nil means unset** — not "nil means the default." A field that
+silently acquires a value hides a caller mistake; nil is an honest "unset." This
+replaces the `ENV.fetch('DBFS_V2_KEYFRAME_*')` constants, which are deleted.
+`Store.new(project_id)` with no settings is valid and means "nothing configured."
+
+### Errors are typed, and each one means one thing
+
+| error | raised when | caller's response |
+|---|---|---|
+| `DbfsV2::ConflictError` | a stale base overlapping a write; an off-first-parent base under `:refuse`; a merge target/source that advanced under the lock | re-sync, re-read, or ask a human |
+| `DbfsV2::TooLargeError` | a payload over `max_blob_bytes` | refuse; a size overrun is not a conflict |
+| `ActiveRecord::RecordNotFound` | a revision id scoped to another file (BlobIO, `Content.at`) | a caller bug, not a conflict |
+
+Two message strings on `ConflictError` are distinct on purpose: *"reachable only
+off the first-parent line"* (a real state — the base exists, via a merge's second
+parent) versus *"is not a revision of `<path>`"* (not a revision of this file at
+all). Before this, the first case was a bare `RuntimeError` string, which reads
+like a bug and which no caller handled.
+
+### Enforced at every byte entry point
+
+`max_blob_bytes` is checked **before** storing, at each path bytes can enter:
+
+- `Store#write_blob_on` — the bytes-in-hand path (also `create_file(binary:)`);
+- `Store#commit_blob` — the commit-by-digest path;
+- `Ingest#copy_hash` — aborts the streaming copy the moment the limit is crossed,
+  so an over-limit payload is never fully staged and leaves no staging file.
+
+`BlobIO` routes through the Store, so it inherits the cap for free.
+
+### Policy, not a constant
+
+`off_parent_base` makes "refuse vs rebase" a project choice. `:refuse` raises
+(the typed floor); `:rebase` rebases the edit onto the head via
+`diff(content(base), content(head))` — the *same* mechanism the live path already
+uses for a concurrent change. Overlapping writes still raise either way; the
+policy governs only the off-parent case.
+
+### The regexp timeout is global, and that is a real caveat
+
+`regexp_timeout` is applied as Ruby's process-global `Regexp.timeout` at
+`Store.new` — that is what Ruby exposes. It bounds a catastrophic-backtracking
+pcre match so it raises instead of hanging. The costs are stated, not hidden: two
+`Store`s with different settings means last-init wins, and the timeout is per
+*match*, not per operation.
+
+## Open questions
+
+1. **Relaxing the ENV ban.** `Store#default_owner` still reads `ENV['USER']` as
+   the file-ownership default. It is process identity rather than configuration,
+   and owner is `NOT NULL`, so removing it is a behaviour change.
+2. **Ownership as a user id.** The forward intent is the CARB/IDE2 user's **UUID**
+   passed in by the caller — the column is a string, so it is a caller-side change
+   plus dropping the `ENV['USER']` fallback. Deferred until there is a real user
+   to attribute to.
+3. **A size-cap default.** `max_blob_bytes: nil` means no limit, which is exactly
+   what the prototype shipped. A spliced-in deployment almost certainly wants a
+   number; where it is read from (the project row) is the caller's business.
 ## Alternatives considered
 
 - **Keep ENV fallbacks.** Rejected: three spellings of one knob, and the library

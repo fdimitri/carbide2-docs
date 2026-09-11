@@ -118,6 +118,97 @@ next: "reconcile file set,\nthen per-file merge"
   required" may need revisiting if project merges ever transform without the
   server lock.
 
+## What it has to carry
+
+A project revision is a statement about the whole workspace, so at minimum it
+pins **four** kinds of fact, and three of them are not content:
+
+| fact | why a path→revision map is not enough |
+|---|---|
+| content | which revision of each file |
+| existence | creates and tombstones — a file present in one state and absent in the other |
+| identity | rename keeps the node id and changes the path, so "the same file moved" is a fact no content map can express |
+| branch | a per-file branch set, co-versioned, or the project state is ambiguous |
+
+The fourth is the sharpest: v2 branches are **per file** (`main` per node). A
+repo-wide branch is a *set* of per-file branches, and that set has no name today.
+Without it, "check out `feature`" has nothing to resolve against.
+
+```d2
+# A per-file DAG answers "this file at R". A project revision must answer "this
+# workspace at R" — which is a statement about the file set too, not just content.
+direction: right
+
+pf: "per-file DAGs (independent)" {
+  direction: down
+  a: "/a.rb  rev 3 -> 7"
+  b: "/b.rb  rev 1 -> 4"
+  c: "/c/    folder"
+}
+
+proj: "project revision R" {
+  direction: down
+  m: "manifest: (file_id -> revision_id)"
+  e: "existence: created / tombstoned"
+  r: "renames: identity moved, path changed"
+  br: "branch set: which per-file branch"
+}
+
+pf.a -> proj.m
+pf.b -> proj.m
+pf.c -> proj.m
+```
+
+## Two shapes, neither chosen
+
+1. **Explicit manifest** — a commit-like object holding
+   `(file_id → revision_id, existence)`. Git-shaped, and a project revision is a
+   real row you can point at, label, and diff. The cost is that every write
+   potentially dirties a project-level object.
+2. **Derived frontier** — a project state is *implied* by a frontier (a set of
+   per-file heads), and "what did this snapshot contain" is a computation rather
+   than a stored fact. Compacter, and it makes the state a consequence of the
+   per-file DAGs rather than a second source of truth. The cost is that a state
+   you cannot compute is a state you cannot name.
+
+The second is attractive precisely because it avoids a second authority — the
+same reason v1's ADRs kept `DirectoryEntry` as the single row per path. The first
+is attractive because "which revision did this run against" wants to be a stored
+fact, not a derivation that must still be computable later.
+
+## Why it is not a thin wrapper
+
+Three of the four facts above live in *different* places: content in the revision
+DAG, existence in `deleted_at`, identity in the node id. And the per-file DAGs are
+independent — there is no shared clock, so "the project at time T" is not readable
+off a timestamp. It has to be **defined**, and defining it is the decision.
+
+A project merge is likewise two problems, not one: reconcile the *file set* (which
+paths exist on both sides, which were added, which deleted), then run each shared
+path's own per-file merge (ADR-036). The first has no mechanism at all yet.
+
+## Open questions
+
+1. **Manifest vs frontier** (above).
+2. **Project branches** — first-class object, or a label over a per-file-branch
+   mapping? And what does "check out a branch" do to a file that does not exist
+   on it?
+3. **Merge base for a project** — two project states need a project-level LCA,
+   which is a different computation from a per-file LCA.
+4. **Snapshot cost** — v1's snapshot story was `INSERT … SELECT` plus a
+   `created_at` filter. A project revision has to be comparably cheap or the
+   feature will not be used.
+5. **Interaction with the working area** — does materializing project revision R
+   to the PVC conflict with the watcher, which is watching that same tree?
+6. **Garbage collection** — if project revisions are stored, what retains them?
+
+## Relationship to the per-file ADRs
+
+This ADR does not weaken any of ADR-035–041; those decisions stand on their own
+evidence. It records that they are the **substrate**, and that the questions above
+are where the remaining work is. When this is specified, ADR-034 gains a decision
+link and ADR-041's "TP2 not required" may need revisiting if project merges ever
+transform without the server lock.
 ## Alternatives considered
 
 - **Fold a project DAG into the per-file ADRs.** Rejected: it is a different

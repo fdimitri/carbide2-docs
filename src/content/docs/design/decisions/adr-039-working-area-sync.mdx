@@ -105,6 +105,72 @@ cw -> setc: "text"
 - `mmap`'d writes are undetected (a project-policy exclusion), and the watcher's
   visibility is local-kernel.
 
+### The event rules
+
+| inotify | action | why |
+|---|---|---|
+| `:delete`, `:moved_from` (unpaired) | `Store#delete` → tombstone | history survives; v1 called `destroy!` |
+| `moved_to` **paired by cookie** | `Store#move` on the **same node** | identity and the DAG follow the file |
+| `moved_to` (unpaired) | arrival → ingest / create | an unpaired `moved_to` is a new path |
+| `:create` (non-dir) symlink | record the link entry | v1 dropped `create` at the `close_write` gate |
+| `:close_write` text | `Store#write` `setContents` | the external-write path (ADR-003) |
+| `:close_write` binary | `Ingest` | idempotent by digest |
+| `:isdir` create/moved_to | recurse, then create the entry | inotify misses files already under a new dir |
+| `q_overflow` | mark the tree dirty and rescan | events were lost |
+
+**Rename pairs by cookie, not by heuristic.** `moved_from` and `moved_to` share
+an inotify cookie, so the pairing is deterministic — this is the pairing ADR-004
+rejected as a *heuristic*, done the way it can be trusted. The watcher buffers
+`moved_from`; the matching `moved_to` in the same batch is one `Store#move`. An
+unpaired `moved_from` (moved out of the tree) is flushed as a tombstone at the end
+of the batch.
+
+**Why a rename does not disconnect a client:** files are addressed by
+`FileNode.id`; the path is an attribute. A rename mutating `srcpath` is still the
+same file. That is the *reason* the path is free to change under a rename.
+
+### Flusher scope
+
+`Flusher` iterates `FileNode.live` — a tombstoned text file must not be written
+back to disk, or the tombstone is undone on the working area. It writes **text
+only**; binary live copies are produced by ingest, and a flusher that also wrote
+binaries would be a second writer to the authoritative live copy.
+
+### Echo suppression is a property, not a timer
+
+v1 suppressed flusher writes with a `suppress_set` whose entries were removed on a
+1-second timer — a race with a clock. v2 relies on **digest idempotency**: a
+flush's trailing watcher event is a no-op because the digest equals the branch
+head. `Watcher#suppress!` existing but being uncalled is benign for the same
+reason.
+
+### Two import paths, one must win
+
+`FsLoader` (a full tree walk) and `Ingest` (one file, by digest) currently both
+exist. They must not both own import: the decision is whether `Ingest` subsumes
+`FsLoader` or `FsLoader` becomes a walker that calls `Ingest` per file. The
+watcher's debounced reconcile sweep also overlaps `IN_Q_OVERFLOW` dirty-rescan —
+one mechanism has to win. Recorded as a decision, not a repoint.
+
+`FsLoader`'s prune set (`.git`, `node_modules`, `.bundle`; `IGNORED_PATTERNS`;
+a 5 MB size cap) is shared with the watcher today, and v2 has to reproduce or
+deliberately supersede it — the prune intent also governs whether a symlink whose
+target lives only inside a pruned subtree resolves to nothing.
+
+## Open questions
+
+1. **Loader vs Ingest** (above) — which subsumes which.
+2. **Reconcile vs rescan** — keep the #72 debounced sweep, or the
+   `IN_Q_OVERFLOW` rescan, or fold both into one.
+3. **Symlink flush target.** `Flusher#flush_symlink` writes the *DBFS* target
+   path, which is a broken link on disk unless something maps DBFS→rooted paths.
+   Intentional for now; a real flusher rewrites the target relative to the disk
+   root (ADR-026).
+4. **Burst policy.** A `git checkout` wants a debounced sweep rather than inline
+   work per event; the constants (`RECONCILE_DEBOUNCE`, `RECONCILE_MAX_DELAY`)
+   are prototype values.
+5. **Local kernel only.** The watcher never sees a write made from another node,
+   and `mmap`'d writes are invisible.
 ## Alternatives considered
 
 - **Timer-based echo suppression (v1).** Rejected: it is a race with a clock.

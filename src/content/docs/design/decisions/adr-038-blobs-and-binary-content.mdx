@@ -124,6 +124,102 @@ pvc -> pg: "inotify folds external writes back" {style.stroke-dash: 3}
 - `fs/blob` / `download` currently `send_file` from disk and must read the byte
   store instead.
 
+### The seam
+
+```ruby
+# DbfsV2::BlobStore — an interface, not a choice
+put(bytes)        -> sha256          # content-addressed
+get(digest)       -> bytes
+exist? / size / delete(digest)
+read_range(digest, offset, length)   # optional native range; default slices get
+```
+
+`DbfsV2.blob_store` / `DbfsV2.with_blob_store(store)` swap the backend. Every
+caller (`Blob.store`, `Content#blob_content`, `BlobIO`) goes through `put`/`get`
+by digest, so nothing above the seam changes.
+
+| implementation | backend | status |
+|---|---|---|
+| `DbBlobStore` | `blobs.content` (`bytea`) | **default** — transactional with the revision, no orphan window |
+| `MemoryBlobStore` | in-memory | tests; proves the swap |
+| `S3BlobStore` | MinIO / S3 | drop-in, same interface |
+| `CephBlobStore` | CephFS (POSIX) | out of scope for the prototype; satisfiable by the same interface |
+
+Two families qualify and differ only in *access shape*, not capability: an
+**object API** (MinIO already in the cluster, S3, Ceph RGW — immutable
+put-once-read-many, which matches this access pattern directly) or a
+**distributed FS** (Ceph/CephFS — POSIX, which additionally gives the mirror
+direct file access, at the cost of running a distributed FS).
+
+**Content addressing is the property that makes the swap safe:** a digest names
+exact bytes, so any backend returning those bytes for that key is correct, and a
+digest-keyed cache can never be *stale* — eviction is size/time, correctness is
+free.
+
+### Blob IO surface
+
+`DbfsV2::BlobIO` (stateless): `read` (range), `size`, `digest`, `create`,
+`write`, `put`, `append`, `insert`, `overwrite`, `truncate`, `copy`. Every op is
+a pure function of `(path, revision, offset)`. Write ops uniformly return the
+**digest**.
+
+`Store#blob_cursor` / `DbfsV2::BlobCursor` gives POSIX ergonomics *client-side*:
+a cursor pinned to one revision, with `seek(:set/:cur/:end)`, `read`, `read_all`,
+`tell`, `eof?`, `close`. The server holds no fd.
+
+### Layers, kept distinct
+
+| | what it is | mutable? | who writes it |
+|---|---|---|---|
+| **working area (PVC)** | the live copy shell tools read | yes, in place | the flusher (text), inline ingest (binary) |
+| **archive (byte store)** | historical revision content | no, digest-keyed | ingest / `write_blob` |
+
+inotify applies **only** to the working area. The byte store is read by digest and
+never watched, so the archive tier's layout is independent of inotify's limits —
+which is what makes "Ceph as the byte store" a swap that does not touch the live
+file.
+
+### Ingest
+
+One function, two triggers:
+
+- **DBFS binary write (incl. upload)** — write a temp file on the PVC, rename it
+  into place, call ingest **inline** (not via inotify). The trailing watcher event
+  is a no-op by digest.
+- **External write** — inotify → watcher → the *same* ingest.
+
+Steps: hash while copying into a local cache file → rename the cache file to its
+digest **after** the clean-read check → upload to the byte store → commit the
+revision. The read is guarded: the inotify watch is held, and any `IN_MODIFY` /
+`IN_CLOSE_WRITE` / move for that path during the read **discards** the read and
+reruns. **Losing an intermediate state overwritten mid-read is accepted**;
+`fstat` before/after and double-read-until-stable were considered and rejected as
+the mechanism. `IN_Q_OVERFLOW` marks the tree dirty and rescans.
+
+The cache dir is local, digest-named, and **outside the watched tree** — so it
+cannot be re-ingested, and a torn read never reaches it (rename-to-digest happens
+only after the clean-read check).
+
+Ingest is **idempotent by digest** against the branch head. That has a useful
+consequence: revision inspection never writes the working tree, so there is no
+materialize-vs-commit split; materializing a branch resolves to `(file, branch)`
+and is a no-op by the same rule.
+
+For a *new* path the genesis **is** the content — `Ingest` takes
+`create_if_missing:` and creates the node with the staged content, one revision,
+rather than an empty-binary genesis followed by the content.
+
+## Open questions
+
+1. **Where the bytes live long-term.** `bytea` binds the whole payload in one
+   INSERT and carries it in base backups. The hybrid (inline below a threshold,
+   object storage above) is a small schema change, not built.
+2. **Efficient append.** `append`/`insert`/`overwrite`/`truncate` are
+   read-modify-write and O(size). Content-defined chunking (a blob is a list of
+   chunk digests; append keeps the prefix) is the fix if it is needed.
+3. **Binary merge.** Two `write_blob`s conflict rather than merge; whether the UI
+   offers LWW or a pick is open.
+4. **`mmap`'d writes** are undetected; project policy excludes them.
 ## Alternatives considered
 
 - **Keep bytes on the PVC (v1).** Rejected: it is a data-loss-shaped cost the day

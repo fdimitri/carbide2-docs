@@ -117,6 +117,87 @@ gate -> stop: "overlapping writes"
 - Per-file branches are not project branches — a repo-wide branch is a set of
   per-file branches, which ADR-042 has to define.
 
+### The two walks, named
+
+```ruby
+Chain.reachable_ids   # full DAG: parent_id + second_parent_id, cycle-guarded.
+                      # backs Merge.ancestors, fast_forward?, lowest_common_ancestor
+Chain.ancestor_ids    # first-parent only, ordered genesis -> rev. THE REPLAY ORDER.
+```
+
+They are deliberately different. `reachable_ids` is what makes `fast_forward?`
+correct *after* a merge: a merge commit's second parent is an ancestor of it, so
+a branch already merged in can fast-forward onto the merge commit. `ancestor_ids`
+is replay, because a merge commit is a full-content snapshot — its content is
+determined by the first-parent line, and replay must not descend the second
+parent.
+
+`Store#new_since` / `revisions_between` use the first-parent chain. When the
+caller's `since` is not on that line they return `found: false` / `nil`,
+signalling "replay from scratch" rather than transforming against the wrong chain.
+
+### The merge record
+
+A merge is its own change type, so the *operation* is in the log rather than
+being flattened into a `setContents`:
+
+```jsonc
+// mergeAuto — result is derivable from the params + algorithm version
+{ "data": "...", "target": "main", "source": "feature",
+  "target_head": "<id>", "source_head": "<id>", "algorithm_version": 1 }
+
+// mergeResolved — the human's bytes ARE the decision, not derivable
+{ "data": "...", "target": "main", "source": "feature",
+  "target_head": "<id>", "source_head": "<id>" }
+```
+
+`Delta` treats both as full-content and `Transform.to_prims` diffs them against
+the base exactly like `setContents`, so replay, concurrent folding and merge are
+unchanged. `Merge::ALGORITHM_VERSION = 1` is recorded but not yet *used* for
+derivation. The appendix the params buy: "how did this fork join" is answerable,
+and a graph/audit can label the node instead of printing `setContents`.
+
+### Head re-checks (the race that matters)
+
+Content is computed against a head read *before* the commit lock. If a write
+lands on the target in between, committing would clobber it. Every merge path
+therefore re-checks under the lock:
+
+- **fast-forward** — re-checked against the target's row lock.
+- **merge_auto** — compares `locked.head_revision_id` to the head the content was
+  computed from; on mismatch, aborts with
+  `reason: 'target advanced concurrently; re-check'`.
+- **merge_commit!** (user-resolved) — takes `expected_target_head` *and*
+  `expected_source_head`; the **pinned** source revision is what is recorded as
+  `second_parent`, not the source branch's current head. A source that advanced
+  is not silently ignored: the pin is validated (belongs to this file, reachable
+  from the source's current head) and a foreign or non-ancestor pin is a
+  `ConflictError`.
+
+`merge_auto` rescues **only** `ConflictError`. It used to rescue `StandardError`,
+which reported any internal bug as `reason: 'conflict'` — a real conflict and a
+`NoMethodError` must not look alike to the caller.
+
+## Open questions
+
+1. **Re-derive merge content.** Storing `mergeAuto`'s output is a for-now
+   convenience; the intent once spliced in is to store the params + version and
+   compute the bytes. That needs the whole cone versioned
+   (`auto_merge_content → transform_list → diff_prims → ambiguous?`), a registry
+   that can run every past version, two-parent replay, and a `result_sha256`
+   tripwire. Not built.
+2. **Criss-cross bases.** `lowest_common_ancestor` can have more than one valid
+   merge base. It returns the first along a's reachable set — deterministic, but
+   not *pinned* by a fixture yet.
+3. **Binary merges.** Two `write_blob`s are last-write-wins; `merge(resolved:)`
+   on a binary node is unexercised.
+4. **Per-file vs project branches.** A repo-wide branch is a set of per-file
+   branches; that set has no name (ADR-042).
+
+## Out of scope
+
+- **In-thread DAG merges for agent conversations** — that is ADR-032's scoping,
+  not filesystem merge.
 ## Alternatives considered
 
 - **A content-hash priority as the final arbiter.** Rejected: it is a stable

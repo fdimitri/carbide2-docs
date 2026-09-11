@@ -108,6 +108,71 @@ tp1 -> oracle
 - If offline editing lands without a server lock (see ADR-042), TP2 stops being
   optional and this ADR has to change.
 
+### The suite, by what it protects
+
+| file | protects |
+|---|---|
+| `tp1_test.rb` | the TP1 convergence property (2 concurrent ops, both orders) |
+| `intention_test.rb` | an op's effect survives concurrent ops (driven through the Store) |
+| `diff_test.rb` | the diff: exact shapes, randomized round-trip, minimality vs a reference LCS, the pinned repeated-line tie-break, scale/fallback |
+| `concurrent_edit_integrity_test.rb` | "a concurrent edit is never silently lost, misapplied or misreported" — conflict agreement, error propagation, no lost updates, cache coherence, validation base |
+| `store_convergence_test.rb` | TP1 end to end through `apply_transformed!`, including `setContents` and pcre |
+| `live_ot_test.rb` | the live write path: split deltas, stale ops, blind-append anchoring |
+| `merge_edge_cases_test.rb` | re-merging a branch, delete-vs-replace, empty-file branches, pcre/binary merges, fast-forward not orphaning a write |
+| `cache_integrity_test.rb` | keyframe content == full replay; the byte threshold does not keyframe every keystroke |
+| `write_validation_test.rb` | a bad delta fails closed without poisoning the file; inverted ranges rejected |
+| `path_safety_test.rb` | traversal cannot escape the flush root; no children under a file; duplicate create |
+| `watcher_test.rb` | external writes absorbed faithfully: invalid UTF-8 not mangled, text→binary promotion keeps history |
+| `branch_lock_test.rb` | branch serialization reality (skips with that reason off Postgres) |
+
+**Provenance is a poor name; behaviour is the right axis.** `concurrent_edit_integrity_test.rb`
+was briefly `review_findings_test.rb` and the old `claude_regression_test.rb` was
+split by subsystem into the files above.
+
+### Why TP2 is absent, concretely
+
+It is not merely "not needed" — the transform **violates** it, and the suite says
+so rather than leaving a suspicious gap. The counterexample is a mixed
+insert/delete triple:
+
+```
+a = insert "XX" at 1
+b = delete [0,1)
+c = insert "XX" at 0
+```
+
+Transformed past `a` then `b'`, `c` differs from `c` transformed past `b` then
+`a'`. Pure insert triples happen to satisfy TP2; mixed insert/delete do not. So a
+TP2 test would be red and would send someone chasing a property this architecture
+does not need. It would only become required if ops were transformed **without**
+the serializing lock — offline editing, client-to-client, or a local merge.
+
+### Tests that assert they fired
+
+The property harness asserts `checked > 0`: it used to return early on success, so
+a passing run executed **zero** assertions and a generator returning no ops stayed
+green. The concurrent-edit tests likewise assert each injected interleaving
+actually fired, so a test cannot pass vacuously.
+
+### What the lock test can and cannot prove
+
+`branch_lock_test.rb` asserts `FOR UPDATE` is present when the adapter is
+Postgres, and **skips with that reason** on SQLite, where the Arel visitor drops
+the lock clause entirely. A structural guard asserts `Branch.lock.find` is still
+used by `store.rb` and `merge.rb`. So the suite proves *the code path*, not the
+serialization, until it runs on Postgres.
+
+## Open questions
+
+1. **Postgres CI.** The only way to enforce the lock rather than skip it.
+2. **Criss-cross fixture.** Pin the chosen merge base and that `merge_auto` /
+   `merge_conflicts?` agree with it.
+3. **Cache vs rollback.** `append!` raising before commit must leave the cache
+   head unchanged — worth pinning.
+4. **Auto-keyframe after a read.** The counter lives in the cache, so a never-read
+   file gets no keyframe; pin the behaviour so a change to it is deliberate.
+5. **If offline editing arrives without the server lock**, TP2 stops being
+   optional and this ADR has to change.
 ## Alternatives considered
 
 - **Test TP2 because the literature says so.** Rejected: it would be red, and it
