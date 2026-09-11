@@ -1,0 +1,118 @@
+---
+title: "ADR-041: DBFS v2 correctness model and testing strategy"
+description: "What correctness means for a serialized OT store: TP1 is required, TP2 is not, intention preservation is separate, and the oracle is an independent splice rather than replica agreement."
+sidebar:
+  order: 41
+  badge:
+    text: Exploratory
+    variant: note
+status: Exploratory
+implementation_exists: false
+date: "2026-09-11"
+extends:
+  label: ADR-034 (DBFS v2)
+  href: /design/decisions/adr-034-dbfs-v2/
+related:
+  - label: ADR-037 (OT transform and the write path)
+    href: /design/decisions/adr-037-ot-transform-and-write-path/
+---
+
+import AdrHeader from '../../../../components/AdrHeader.astro';
+
+<AdrHeader {...frontmatter} />
+
+## Context
+
+Three distinct properties are easy to conflate:
+
+- **TP1** — the two-operation convergence property:
+  `apply(s, a, T(b,a)) == apply(s, b, T(a,b))`.
+- **TP2** — the **three-operation** property (Ressel et al.), which matters when
+  different sites transform the same op along *different* paths.
+- **Intention preservation** — the "I" in CCI: each op still does what its author
+  meant after concurrent ops are transformed away.
+
+A test suite that names these loosely will chase properties the architecture does
+not need, or pass while testing a function production never calls.
+
+## Decision
+
+**TP1 is the required property; TP2 is not tested and is deliberately violated;
+intention preservation is tested separately; and the oracle is an independent
+splice, not replica agreement.**
+
+- **TP1 holds because every write serializes through the branch row lock.** There
+  is one total order, and each stale op is transformed along exactly one path —
+  the Jupiter / Google-Docs model. It holds across worker processes too, since
+  they serialize on the same Postgres lock.
+- **TP2 is not required, and the transform does not satisfy it** (verified: a
+  mixed insert/delete triple produces different `c_ab` and `c_ba`). A TP2 test
+  would be red and would send someone chasing a property this architecture does
+  not need — recorded so it is not "fixed" blindly. It would only matter if edits
+  were transformed *without* the lock (offline, client-to-client, local merge).
+- **Intention preservation is scoped.** Overlapping *writes* are routed to the
+  conflict path by design, so we do not guess intention there. The intention test
+  asserts that non-conflicting stale ops (insert, delete) keep their intent
+  through `apply_transformed!` over multiple hops, and that overlapping write
+  pairs raise `ConflictError` and commit nothing.
+- **The oracle is an independent splice.** For disjoint operations the expected
+  content is computed by splicing the original base right-to-left with plain
+  string operations, independent of Transform, Myers, and coordinate conversion.
+  Equality between two potentially wrong replicas is not an oracle. The
+  arbitrary-order oracle is **limited to unambiguous disjoint edits**; a separate
+  same-position test specifies ascending unique priorities.
+- **`transform()` is a thin wrapper over the production fold**, so the pairwise
+  property test exercises the code the live path runs. A raised `ConflictError`
+  counts as "converged by both refusing."
+- **Read-model correctness is checked separately**: keyframe content must equal a
+  full replay, and the byte threshold must not keyframe every keystroke.
+- **Tests are named by what they protect, not where they came from** —
+  convergence, intention, diff, concurrent-edit integrity, cache integrity, write
+  validation, path safety, watcher. Provenance ("from a review") is a poor axis.
+
+```d2
+# Three properties, only two of which apply — and the one that does not is pinned.
+direction: right
+
+base: "two concurrent ops"
+tp1: "TP1\n(both orders converge)"
+int: "intention preservation\n(effect survives, driven via Store)"
+tp2: "TP2\nthree ops, different paths"
+nope: "NOT required\ndeliberately violated\n(lock gives one path)"
+
+base -> tp1
+base -> int
+base -> tp2 {style.stroke-dash: 3}
+tp2 -> nope {style.stroke-dash: 3}
+
+oracle: "independent splice oracle\n(not replica agreement)"
+tp1 -> oracle
+```
+
+## Consequences
+
+**Positive**
+
+- The suite tests the code that runs, and states why TP2 is absent instead of
+  leaving a suspicious gap.
+- Convergence is checked against an oracle, so two wrong replicas cannot agree
+  their way to green.
+
+**Negative / to resolve**
+
+- The branch lock is a no-op on SQLite, so serialization is only *proven* on
+  Postgres; the lock test skips with that reason on SQLite and needs a real
+  Postgres CI run.
+- Criss-cross merge bases have more than one valid merge base; the choice is
+  deterministic but needs a pinned fixture.
+- If offline editing lands without a server lock (see ADR-042), TP2 stops being
+  optional and this ADR has to change.
+
+## Alternatives considered
+
+- **Test TP2 because the literature says so.** Rejected: it would be red, and it
+  describes a peer-to-peer model this store does not use.
+- **Assert replica convergence (replica A == replica B).** Rejected: equality
+  between two wrong results is not correctness.
+- **Test `transform()` without the Store.** Rejected: it missed the split-delta
+  bug that only appears on the live multi-hop path.

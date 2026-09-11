@@ -1,0 +1,127 @@
+---
+title: "ADR-042: Project / repo-directory DAG"
+description: "The layer v2 does not yet provide: a project-level revision that says what the whole workspace is at R. Named, undesigned, and deliberately exploratory."
+sidebar:
+  order: 42
+  badge:
+    text: Exploratory
+    variant: note
+status: Exploratory
+implementation_exists: false
+date: "2026-09-11"
+extends:
+  label: ADR-034 (DBFS v2)
+  href: /design/decisions/adr-034-dbfs-v2/
+related:
+  - label: ADR-036 (Branches, ancestry, and merge)
+    href: /design/decisions/adr-036-branches-ancestry-and-merge/
+  - label: ADR-041 (Correctness model)
+    href: /design/decisions/adr-041-dbfs-correctness-model/
+---
+
+import AdrHeader from '../../../../components/AdrHeader.astro';
+
+<AdrHeader {...frontmatter} />
+
+## Context
+
+DBFS v2 is a **per-file** DAG. It can answer "what is this file at revision R."
+It has **no object** that means "this project at revision R" — no commit, no
+tree, no snapshot. Nothing in the prototype claims otherwise; its own tests say
+so explicitly ("Per-file DAG tests only; no assumptions about a future project
+DAG schema").
+
+That is the next layer, and it is *not* designed. This ADR exists so the gap is
+recorded rather than discovered later, and so nobody mistakes the per-file
+substrate (ADR-035–041) for the whole system. Snapshots, undo, "which repository
+state did this run against," and offline/divergent editing all want a
+project-level revision, and none of them can be finished without it.
+
+This is the layer that glues per-file DAGs together so "the repo" is a thing.
+
+## What is genuinely open
+
+This is Exploratory; the questions below are the decision space, not a decision.
+
+1. **What is a project revision?** A **manifest of head ids** — an explicit
+   `(file_id → revision_id, existence)` map stored as a commit-like object — or a
+   **frontier / vector** across the independent per-file DAGs, where a project
+   state is *derived* rather than stored. The first is git-shaped and explicit;
+   the second is compacter and makes "what did this snapshot contain?" a
+   computation.
+2. **Project branches.** v2 branches are per-file (`main` per node). A repo-wide
+   branch is a **set of per-file branches, co-versioned**, and that set has no
+   name today. Is a project branch a first-class object, or a label over a
+   per-file-branch mapping?
+3. **Existence is versioned, not just content.** `file_nodes` carry `deleted_at`,
+   and rename keeps identity (same id, new path). So a project node must snapshot
+   the **file set** — creates, tombstones, renames — not just a path→revision map.
+   A rename in particular is a pair of facts (identity moved, path changed) that
+   a content map cannot express.
+4. **There is no global clock.** The per-file DAGs are independent, so "the
+   project at time T" is not readable off a timestamp; it has to be *defined*.
+   That is the core reason this layer is not a thin wrapper.
+5. **What does a project merge recurse into?** Reconciling two project states is
+   at least two problems: reconcile the *file set* (which paths exist), then run
+   each path's own per-file merge (ADR-036) for the paths that exist on both
+   sides. The first has no mechanism yet.
+
+## Why it matters beyond tidy bookkeeping
+
+- **Offline editing.** "Very diverged → branch and try merging" needs to name and
+  reconcile a whole offline **workspace**, not one file. The offline story and
+  the project-DAG gap are the same missing piece.
+- **Snapshots and undo.** `INSERT … SELECT` and `deleted_at` were v1's cheap
+  snapshot story; at project scope they need a project revision to be cheap
+  against.
+- **Provenance.** "This run happened against project revision R" is unanswerable
+  today.
+
+```d2
+# A project revision is a manifest over independent per-file DAGs (one option).
+direction: right
+
+proj: "project revision R\n(manifest)" {
+  direction: down
+  f1: "/a.rb → rev 12"
+  f2: "/b.rb → rev 4"
+  f3: "/c/ → folder"
+  f4: "/d.rb → tombstoned"
+}
+
+da: "per-file DAG: /a.rb"
+db: "per-file DAG: /b.rb"
+dc: "per-file DAG: /c/"
+
+proj.f1 -> da: "resolves into"
+proj.f2 -> db
+proj.f3 -> dc
+
+proj -> next: "project merge"
+next: "reconcile file set,\nthen per-file merge"
+```
+
+## Consequences
+
+**Leaving it unspecified**
+
+- Per-file work (ADR-035–041) is not blocked and remains useful on its own.
+- Offline/divergent editing and project-scoped snapshots stay unfinished until
+  this is designed.
+- A future reader cannot mistake the per-file ADRs for the whole story, because
+  this one is linked from the parent.
+
+**When it is specified**
+
+- The parent ADR (ADR-034) should gain a decision link, this ADR should be
+  rewritten from Exploratory to Proposed/Accepted, and ADR-041's "TP2 not
+  required" may need revisiting if project merges ever transform without the
+  server lock.
+
+## Alternatives considered
+
+- **Fold a project DAG into the per-file ADRs.** Rejected: it is a different
+  problem with a different decision space; burying it would hide the gap.
+- **Treat "project revision" as a timestamp over the per-file heads.** Rejected as
+  a premise: the per-file DAGs are independent, so there is no single clock to
+  order them by.

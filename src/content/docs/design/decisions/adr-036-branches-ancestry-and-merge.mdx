@@ -1,0 +1,130 @@
+---
+title: "ADR-036: Branches, ancestry, and merge"
+description: "Named per-file branches, a full-DAG ancestry for merge verdicts against a first-parent replay, three-way auto-merge at the DAG base, and a conflict gate on overlapping writes."
+sidebar:
+  order: 36
+  badge:
+    text: Exploratory
+    variant: note
+status: Exploratory
+implementation_exists: false
+date: "2026-09-11"
+extends:
+  label: ADR-034 (DBFS v2)
+  href: /design/decisions/adr-034-dbfs-v2/
+related:
+  - label: ADR-037 (OT transform and the write path)
+    href: /design/decisions/adr-037-ot-transform-and-write-path/
+  - label: ADR-042 (Project / repo-directory DAG)
+    href: /design/decisions/adr-042-project-directory-dag/
+---
+
+import AdrHeader from '../../../../components/AdrHeader.astro';
+
+<AdrHeader {...frontmatter} />
+
+## Context
+
+v1 has no branches and no merge. A branch is a named pointer at a head revision
+(`main` auto-created); a merge is any of fast-forward, a three-way merge, or a
+human resolution.
+
+Two walks over the same graph, deliberately different:
+
+- **Ancestry membership** (is A an ancestor of B? is this a fast-forward? what is
+  the merge base?) needs the **full DAG**, both parents.
+- **Replay** (what are this revision's bytes?) needs the **first parent only**,
+  because a merge commit is a full-content snapshot and its content is fully
+  determined by the first-parent line.
+
+## Decision
+
+**Ancestry is a full-DAG walk; replay is a first-parent walk. Auto-merge is a
+three-way merge at the DAG base, and overlapping *writes* are a surfaced
+conflict — never a silent pick.**
+
+- **Ancestry (`reachable_ids`)** descends both parents, cycle-guarded, and backs
+  `fast_forward?` and `lowest_common_ancestor`. A merge commit's second parent is
+  an ancestor of it, so a branch already merged in can fast-forward onto it.
+- **Replay (`ancestor_ids`)** is first-parent, ordered genesis → head. When a
+  caller's `since` / base is not on that line, `new_since` / `revisions_between`
+  return `found: false` and the caller replays from scratch rather than
+  transforming against the wrong chain.
+- **Fast-forward** moves the branch pointer, re-checked **under the target's row
+  lock** so a concurrent write is not orphaned.
+- **Auto-merge is a real three-way merge at the merge base**: diff the base
+  against each head into prims (both in base coordinates), OT-transform the
+  source's prims past the target's, apply both. Merging a branch twice does not
+  replay already-merged edits, because the base is the previous source head.
+- **The conflict gate is diff-based and shared.** `merge_conflicts?` and
+  `merge_auto` make the *same* check against the merge base and cannot disagree.
+  Overlapping **insert/delete** overlaps auto-merge (both edits survive; priority
+  is a legitimate tie-break). Two concurrent ops that **replace/write** the same
+  region are a conflict for a human — no content-hash priority may pick between
+  two people's rewrites.
+- **A user-resolved merge pins both heads.** `expected_head` (target) and
+  `expected_source_head` (source) are required; the pinned source revision is what
+  is recorded as `second_parent`. If either advanced since the human resolved,
+  `ConflictError` — re-resolve, do not record a merge that skipped a write.
+- **A merge is its own change type** (`mergeAuto` / `mergeResolved`) carrying the
+  params, not a bare `setContents`. `mergeResolved` always stores the human's
+  bytes (that is the decision, not derivable); `mergeAuto` stores its result too
+  for now, with an `algorithm_version` recorded, so re-derivation is possible
+  later without a version registry today.
+
+```d2
+# Auto-merge is a three-way merge at the LCA; only overlapping writes stop it.
+direction: right
+
+lca: "DAG merge base (LCA)"
+t: "target head"
+s: "source head"
+dt: "diff(lca, target)"
+ds: "diff(lca, source)"
+xf: "transform source prims\npast target's"
+gate: "ambiguous?\n(shared check)"
+ok: "merge commit\n(parent, second_parent)"
+stop: "ConflictError\nsurface to a human"
+
+lca -> dt
+lca -> ds
+t -> dt
+s -> ds
+dt -> xf
+ds -> xf
+xf -> gate
+gate -> ok: "disjoint"
+gate -> stop: "overlapping writes"
+```
+
+## Consequences
+
+**Positive**
+
+- Branch, fast-forward, auto-merge and human resolution all exist, on one
+  substrate.
+- Conflict detection cannot disagree with auto-merge — they share the check.
+- The merge node is labelled in the log, so "how did this fork join" is
+  answerable.
+
+**Negative / to resolve**
+
+- `lowest_common_ancestor` picks one base deterministically when criss-cross
+  histories admit more than one; a fixture should pin that choice and that
+  `merge_auto` / `merge_conflicts?` agree with it.
+- Storing `mergeAuto`'s output is a for-now convenience; the intent is to derive
+  it from params + `algorithm_version` once that machinery exists.
+- Per-file branches are not project branches — a repo-wide branch is a set of
+  per-file branches, which ADR-042 has to define.
+
+## Alternatives considered
+
+- **A content-hash priority as the final arbiter.** Rejected: it is a stable
+  total order for convergence, not a statement about intent. It may tie-break
+  overlapping inserts; it may not choose between two rewrites of the same
+  function.
+- **Chain-flatten rebase for auto-merge.** Rejected (superseded in-prototype): it
+  could reorder same-offset sequential edits. A real three-way merge at the base
+  is correct, not merely convergent.
+- **Blind second-parent tracking (no pins).** Rejected: a long human-resolution
+  window makes the recorded parents stale and silently drops a concurrent write.

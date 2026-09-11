@@ -1,0 +1,114 @@
+---
+title: "ADR-039: Working-area sync (watcher and flusher)"
+description: "The PVC is the live working area and the byte store is the archive; the flusher writes text only, and the watcher folds external writes back through the same ingest, pairing renames by inotify cookie."
+sidebar:
+  order: 39
+  badge:
+    text: Exploratory
+    variant: note
+status: Exploratory
+implementation_exists: false
+date: "2026-09-11"
+extends:
+  label: ADR-034 (DBFS v2)
+  href: /design/decisions/adr-034-dbfs-v2/
+related:
+  - label: ADR-003 (External VFS Write Semantics)
+    href: /design/decisions/adr-003-external-write-semantics/
+  - label: ADR-026 (Symlinks in DBFS)
+    href: /design/decisions/adr-026-symlinks-dbfs/
+---
+
+import AdrHeader from '../../../../components/AdrHeader.astro';
+
+<AdrHeader {...frontmatter} />
+
+## Context
+
+The pod is a real machine, so userspace writes the on-disk filesystem directly —
+a terminal `vim`, a compiler, `git checkout`. v1 folds those back in with
+`setContents` (ADR-003), flushes text back out, and, on an external delete, calls
+`destroy!`, destroying the log (ADR-004). It has no rename pairing, no
+symlink-first handling, and its echo suppression is a 1-second timer.
+
+## Decision
+
+**The PVC is the live working area; the byte store is the archive. The flusher
+writes text only. External writes are absorbed by the same ingest, and inotify
+events are interpreted with the fixed rules below.**
+
+- **Two tiers.** Live file IO happens in the working area (mutable, in place);
+  historical revision content lives in the archive, read by digest. inotify
+  applies **only** to the working area — the byte store is never watched, so the
+  archive tier's layout is independent of inotify's limits.
+- **The flusher writes text, never binaries.** Writing the archive's bytes back
+  to the working area would make the flusher a second writer of the authoritative
+  live copy. Binary live copies are produced by ingest.
+- **A write through a symlink needs no special case.** A write through a link
+  fires inotify on the **target's** parent, so `handle_event` already resolves to
+  the real target row. `File.symlink?` / `lstat` is checked **before**
+  `File.directory?` / `File.file?` everywhere, per ADR-026.
+- **Delete tombstones** (`Store#delete`), never `destroy!`.
+- **Rename pairs by inotify cookie.** `moved_from` + `moved_to` share a cookie —
+  a deterministic pairing, not the heuristic ADR-004 rejects. The matching pair
+  is `Store#move` on the **same node**, so identity and the whole DAG follow the
+  file. An unpaired `moved_from` (moved out) is a tombstone at end of batch; an
+  unpaired `moved_to` is an arrival (ingest / create).
+- **A created or moved-in directory is ingested recursively**, because inotify
+  does not reliably deliver events for files that already exist under a new
+  directory (or land before the subdir's watch is armed). A large burst wants a
+  debounced sweep rather than inline work per event.
+- **Echo suppression is by digest idempotency**, not a timer: a flush's trailing
+  watcher event is a no-op because the digest equals the branch head.
+
+```d2
+# Event rules, and who is allowed to write the live copy.
+direction: right
+
+root: "watched tree (PVC)"
+ev: "inotify event"
+sym: "File.symlink?\n(lstat first)"
+del: "delete / moved_from"
+mv: "moved_to + cookie"
+cw: "close_write"
+ing: "Ingest (binary)\nno-op by digest"
+setc: "write setContents (text)"
+tomb: "Store#delete\n(tombstone)"
+move: "Store#move\n(same node)"
+
+root -> ev
+ev -> sym
+sym -> del: "unpaired"
+sym -> mv: "paired"
+sym -> cw
+del -> tomb
+mv -> move
+cw -> ing: "binary"
+cw -> setc: "text"
+```
+
+## Consequences
+
+**Positive**
+
+- The archive tier is decoupled from inotify entirely.
+- Rename and delete stop destroying history, and stop depending on a timer to
+  avoid a feedback loop.
+- The watcher and the loader share one ingest path, so they cannot drift.
+
+**Negative / to resolve**
+
+- **Two import paths collide** unless v2's `Ingest` subsumes `FsLoader` (or vice
+  versa). This is a decision, not a repoint.
+- The watcher's debounced reconcile sweep overlaps `IN_Q_OVERFLOW` dirty-rescan;
+  one mechanism has to win.
+- `mmap`'d writes are undetected (a project-policy exclusion), and the watcher's
+  visibility is local-kernel.
+
+## Alternatives considered
+
+- **Timer-based echo suppression (v1).** Rejected: it is a race with a clock.
+  Digest idempotency is a property, not a window.
+- **Let the flusher write binaries too.** Rejected: two writers to the live copy.
+- **Trust the event stream for state.** Rejected in practice: events say what
+  changed, not what is; a created tree is walked.

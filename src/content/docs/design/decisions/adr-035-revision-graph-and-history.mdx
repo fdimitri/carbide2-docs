@@ -1,0 +1,112 @@
+---
+title: "ADR-035: Revision graph, history, and identity"
+description: "The per-file log becomes a DAG that is never squashed, deletes tombstone instead of destroying, and identity is the node rather than the path."
+sidebar:
+  order: 35
+  badge:
+    text: Exploratory
+    variant: note
+status: Exploratory
+implementation_exists: false
+date: "2026-09-11"
+extends:
+  label: ADR-034 (DBFS v2)
+  href: /design/decisions/adr-034-dbfs-v2/
+related:
+  - label: ADR-004 (Filesystem Deletion & Identity)
+    href: /design/decisions/adr-004-fs-deletion-identity/
+  - label: ADR-005 (Keyframe Snapshot Read Model)
+    href: /design/decisions/adr-005-keyframe-snapshot-read-model/
+---
+
+import AdrHeader from '../../../../components/AdrHeader.astro';
+
+<AdrHeader {...frontmatter} />
+
+## Context
+
+v1 has a linear `file_changes` log per entry, replayed in full by
+`calc_current`. Three properties it lacks are load-bearing:
+
+- **Nothing is ever squashed.** ADR-001's point is that every keystroke is
+  durable; ADR-005 makes keyframes a skip-replay hint, explicitly not a deletion
+  mechanism.
+- **Deletion is not erasure.** ADR-004 is a bug report against `destroy!`, which
+  cascades the log. It resolved the model as one row per `srcpath`, tombstoned.
+- **`revision` from `count` is racy** (ADR-003): concurrent appends collide, and
+  the count resets if rows are removed.
+
+## Decision
+
+**The per-file log is an append-only DAG. History is never squashed. A delete is
+a tombstone. Identity is the node id, and a path is an attribute of it.**
+
+- **Revisions form a DAG** with `parent_id` (first parent) and `second_parent_id`
+  (non-nil iff a merge commit). Current content is derived by replay along the
+  first parent; the full DAG is used for merge verdicts (ADR-036).
+- **Never auto-squash.** Keyframes are full-content snapshots that let replay
+  *start later*; they never replace or delete what came before. A side-log /
+  WAL compaction is deferred until it is actually needed, not built now.
+- **`revision` is a per-entry atomic sequence**, not `count`, with a unique
+  `(directory_entry_id, revision)` index. This is the fix ADR-003 already named.
+- **Delete tombstones.** `delete` sets `deleted_at` on the node and its subtree;
+  revisions, branches and keyframes are untouched. `read(path, revision_id:)`
+  still reconstructs any pre-delete state. `restore` clears the tombstone.
+- **Recreate resurrects, never forks.** Creating a path whose node is tombstoned
+  reuses the same row — same id, same DAG — so a delete/recreate cycle does not
+  fork history. The unique `[project_id, path]` index becomes **partial**
+  (`WHERE deleted_at IS NULL`) so a live node and a tombstoned history can share a
+  path; `find_any` prefers the live row.
+- **Every create writes a genesis revision**, including empty files and 0-byte
+  binaries. Without it the branch head is nil and the next write is a blind
+  append with no base — exactly the case (two clients on a new file) where
+  transform matters most.
+- **Identity is the node.** Addressing is by id; the path can move under a rename
+  without disconnecting a client or forking history.
+
+```d2
+# A delete hides a node; it does not erase the DAG. Recreate rejoins it.
+direction: right
+
+live: "live node\nrevs 0..5"
+gone: "external rm\n→ tombstone\n(deleted_at set)"
+hidden: "find/list/tree\nhide it"
+hist: "read(rev 3)\nstill reconstructs"
+back: "create at same path\n→ SAME row, SAME DAG"
+future: "next revision\ncontinues the lineage"
+
+live -> gone
+gone -> hidden
+gone -> hist {style.stroke-dash: 3}
+gone -> back
+back -> future
+live -> future {style.stroke-dash: 3}
+```
+
+## Consequences
+
+**Positive**
+
+- History survives `git pull`, atomic saves, renames and external deletes —
+  the cases that silently destroyed it.
+- A delete/recreate cycle reads as "one document, interrupted," not two
+  unrelated files.
+- The read model has an honest acceleration story (keyframes) that does not
+  trade away history.
+
+**Negative / to resolve**
+
+- The explorer must learn about tombstones (hidden by default) and resurrection.
+- Tombstones accumulate; a retention/GC policy is an **open question** and would
+  be the only place history is ever discarded, so it must be explicit and opt-in.
+- `deleted_at` + a partial unique index is a schema change against a live
+  `[project_id, srcpath]` unique index.
+
+## Alternatives considered
+
+- **Hard delete, as today.** Rejected: it loses history by design (ADR-004).
+- **Multiple `DirectoryEntry` rows per `srcpath`.** Rejected in ADR-004: it buys
+  nothing the lifecycle events in the log do not already answer, and doubles the
+  bookkeeping.
+- **Squash old revisions into a keyframe.** Rejected: that is history loss, and
+  history is the reason the store exists.

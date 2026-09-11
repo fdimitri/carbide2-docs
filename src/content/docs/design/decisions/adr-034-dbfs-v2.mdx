@@ -1,0 +1,170 @@
+---
+title: "ADR-034: DBFS v2 — a per-file revision DAG"
+description: "Why the database-backed filesystem is being reimplemented as a per-file revision DAG, and why this is the design v1 stood in for rather than a rewrite."
+sidebar:
+  order: 34
+  badge:
+    text: Exploratory
+    variant: note
+status: Exploratory
+implementation_exists: false
+date: "2026-09-11"
+extends:
+  label: ADR-001 (Database-backed Filesystem)
+  href: /design/decisions/adr-001-db-vfs/
+related:
+  - label: ADR-003 (External VFS Write Semantics)
+    href: /design/decisions/adr-003-external-write-semantics/
+  - label: ADR-004 (Filesystem Deletion & Identity)
+    href: /design/decisions/adr-004-fs-deletion-identity/
+---
+
+import AdrHeader from '../../../../components/AdrHeader.astro';
+
+<AdrHeader {...frontmatter} />
+
+## Context
+
+CARB/IDE has had a database-backed filesystem since the original CARBIDE, roughly
+twelve years ago, written in a day or two so the hobby project could have
+multi-user editing and a revision history *in the happy case*. DBFS v1 in
+CARB/IDE2 is that same idea re-cut quickly: it stood in for a job and made the
+product run. It was **not** meant to be robust, and not meant to be good. It was
+a stand-in, and it is still standing in.
+
+It is now the load-bearing filesystem, and the things the product wants next are
+beyond its reach:
+
+- **Branching and merge.** v1's history is a single linear chain per file
+  (`FileChange` ordered by `revision`). A branch is not representable, and a merge
+  has nothing to merge against — ADR-004's own open question has no substrate.
+- **Concurrent editing without a global order.** `fs/write` appends the client's
+  deltas as given, with no base revision and no transform. Convergence today is
+  whatever order the server happened to apply them in.
+- **History that survives an ordinary event.** A delete is `destroy!`, which
+  cascades the whole log (ADR-004). A `git pull` or an atomic save destroys a
+  file's history as a matter of routine.
+- **Structure that survives contact with a shell.** Symlinks are skipped or
+  silently followed depending on which component walked the tree (ADR-026).
+- **Binaries off the PVC.** v1 keeps binary bytes on a `local-path` volume and
+  only metadata in Postgres. That was free on one node; on more than one it is a
+  data-loss-shaped cost.
+
+None of this is a defect discovered late. It is the known cost of a stand-in that
+outlived its intent.
+
+## Decision
+
+**Build DBFS v2: a per-file revision DAG with branches, OT and three-way merge,
+content-addressed blobs, and tombstones — as a standalone package, spliced into
+CARB/IDE2 as the model layer.**
+
+This is not a rewrite for its own sake. It is the implementation that was
+intended to replace the hobby-level one, finally specified.
+
+Two layers, named explicitly so neither is mistaken for the whole:
+
+1. **Per-file substrate** — a revision DAG, branches, merge, OT, blobs,
+   tombstones. Specified by children ADR-035 through ADR-041.
+2. **Project / repo-directory DAG** — the glue that makes "this repository at
+   revision R" a single addressable thing. Still undesigned; ADR-042
+   (Exploratory).
+
+**v2 is not complete when the per-file DAG works.** Per-file history answers "what
+is this file at revision R"; it cannot answer "what is this *project* at revision
+R", which is what snapshots, undo, and the git-shaped mental model actually ask
+for. The two layers are the point of the exercise.
+
+### Where v2 lives
+
+The prototype is a standalone ActiveRecord application. To splice it in it must
+become a **library both processes load** against the shared Postgres schema
+(worker and Rails already share it; ADR-001, and expand/contract migrations,
+crabide2#17). The per-file call-site inventory — what maps to what — is recorded
+in the prototype's `docs/integration-notes.md`.
+
+### Relationship to v1's ADRs
+
+These children **supersede by intent** ADR-001 (linear log), ADR-003
+(external-write semantics), ADR-004 (deletion & identity), ADR-005 (keyframe
+read model as a proposal), and ADR-026 (symlinks). They are not flipped to
+`Superseded` yet: per ADR-000, supersession flips when the replacement lands, and
+v2 has not shipped into CARB/IDE2. Until then the old ADRs remain the description
+of the running system, and this one describes where it is going.
+
+```d2
+# The shape change: v1 is one line per file; v2 is a graph with named branches.
+direction: right
+
+v1: "v1 — linear log" {
+  direction: right
+  a: "rev 0 setContents"
+  b: "rev 1 insert"
+  c: "rev 2 insert"
+  a -> b -> c
+  note: "no branch, no merge,\nno base revision"
+  c -> note {style.stroke-dash: 3}
+}
+
+v2: "v2 — revision DAG" {
+  direction: right
+  g: genesis
+  e1: edit
+  e2: edit
+  head_main: "main head"
+  head_feat: "feature head"
+  m: "merge\n(2 parents)"
+  g -> e1 -> e2 -> head_main
+  e1 -> head_feat
+  head_main -> m
+  head_feat -> m
+}
+```
+
+## Consequences
+
+**Positive**
+
+- Every product goal that v1 cannot reach — branch, merge, durable history,
+  symlinks, offline editing, binaries off the PVC — has a substrate.
+- The per-file log becomes a DAG without losing the append-only promise: nothing
+  is ever squashed or deleted (ADR-035).
+- v2 already exists as a tested prototype; this is integration, not invention.
+
+**Negative / to resolve**
+
+- Two models coexist during the transition. Running both is debt, not a path;
+  `DirectoryEntry` is repointed at `DbfsV2::Store` and retired.
+- The editor wire changes: `fs/write` gains a base revision, and `revision`
+  becomes an opaque id rather than `file_changes.count`.
+- The client needs a JavaScript port of the transform for offline editing —
+  bit-compatible with the Ruby, because the diff tie-break and fold order are
+  semantic, not incidental.
+- The project DAG (ADR-042) does not exist, and offline/divergent editing cannot
+  be finished without it.
+
+## Alternatives considered
+
+- **Keep v1 and add branching on top.** Rejected: v1's log is linear by
+  construction. Branching needs a second parent, which is not a column you bolt
+  onto `file_changes` without becoming v2.
+- **Adopt git (or a CRDT store) wholesale.** Rejected for now: git is the wrong
+  granularity for per-keystroke collaborative editing, and a CRDT store swaps one
+  large dependency surface for another while losing the per-keystroke audit log
+  that is the whole point. ADR-001 already parked CRDT as a possible overlay.
+- **Patch v1 in place until it hurts more.** Rejected: the prototype shows the
+  target is small and bounded; the cost of carrying v1 grows with every feature
+  that assumes a DAG it does not have.
+
+## Children
+
+| ADR | Scope |
+|---|---|
+| ADR-035 | Revision graph, history, and identity |
+| ADR-036 | Branches, ancestry, and merge |
+| ADR-037 | OT transform and the write path |
+| ADR-038 | Blobs and binary content |
+| ADR-039 | Working-area sync (watcher and flusher) |
+| ADR-040 | Configuration, errors, and API surface |
+| ADR-041 | Correctness model and testing strategy |
+| ADR-042 | Project / repo-directory DAG (Exploratory) |

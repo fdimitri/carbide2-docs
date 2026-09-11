@@ -1,0 +1,102 @@
+---
+title: "ADR-040: Configuration, errors, and API surface"
+description: "Settings are a value object passed on instantiation with no environment reads and no defaults, failures are typed, and file ownership becomes a user id."
+sidebar:
+  order: 40
+  badge:
+    text: Exploratory
+    variant: note
+status: Exploratory
+implementation_exists: false
+date: "2026-09-11"
+extends:
+  label: ADR-034 (DBFS v2)
+  href: /design/decisions/adr-034-dbfs-v2/
+---
+
+import AdrHeader from '../../../../components/AdrHeader.astro';
+
+<AdrHeader {...frontmatter} />
+
+## Context
+
+v1's flusher reads `ProjectSetting` from the database *and* falls back to
+environment variables (`CARBIDE_FLUSH_INTERVAL`, `CARBIDE_FLUSH_BYTES`), so
+effective configuration is spread across a row, the process environment, and code
+constants. Errors are mostly untyped: a stale base is handled by the agent tools
+as a string result, an off-first-parent base raises a bare `RuntimeError`, and an
+over-limit payload has no typed failure at all.
+
+## Decision
+
+**Configuration is a value object passed on instantiation; `dbfs_v2` reads no
+environment variables and no database. Failures are typed. Ownership is a user
+id.**
+
+- **`Settings` is passed in, with no defaults.** A field is nil unless set, and
+  nil means unset: `max_blob_bytes: nil` is no limit; nil keyframe thresholds
+  mean no automatic keyframes. The caller reads wherever it likes (the project's
+  row, in the application's own database) and hands a `Settings` in. This
+  replaces the ENV constants, which are removed.
+- **Typed errors**: `ConflictError` (a stale or off-parent base, an overlapping
+  write, a target/source that advanced under a merge), `TooLargeError` (a size
+  overrun — not a conflict), `RecordNotFound` for a foreign revision id.
+- **A base reachable only off the first-parent line is a `ConflictError`, not a
+  `RuntimeError`**, with a distinct message for "reachable only via a merge" vs
+  "not a revision of this file", so callers can re-sync instead of treating it as
+  a bug.
+- **Refuse vs rebase is a policy**, not a hard-coded choice: an off-parent base
+  either refuses (`ConflictError`) or rebases via the same diff mechanism the
+  live path uses for a concurrent change. Overlapping writes still raise.
+- **Regexp timeout** is applied as Ruby's process-global `Regexp.timeout` — which
+  is what Ruby exposes, with the caveat that it is global and per *match*, not
+  per operation.
+- **Ownership is a string user id.** The forward intent is the CARB/IDE user's
+  UUID, not a username and not `ENV['USER']`; passing it in is a caller-side
+  change, and the `ENV['USER']` default is dropped.
+
+```d2
+# One seam for configuration; typed failures on the way out.
+direction: right
+
+app: "application DB\n(project row)"
+caller: "caller"
+st: "DbfsV2::Settings\n(passed in, no ENV, no defaults)"
+store: "DbfsV2::Store"
+
+ok: "result"
+ce: "ConflictError\n(stale / off-parent / overlap)"
+tl: "TooLargeError\n(size overrun)"
+
+app -> caller: "read" {style.stroke-dash: 3}
+caller -> st
+st -> store
+store -> ok
+store -> ce
+store -> tl
+```
+
+## Consequences
+
+**Positive**
+
+- Effective configuration is one object, not a row + env + constants.
+- Callers can branch on failure kind instead of parsing strings.
+- The library is testable and embeddable without an environment.
+
+**Negative / to resolve**
+
+- `Regexp.timeout` is process-global: two Stores with different settings,
+  last init wins.
+- Dropping the ENV fallbacks is a behaviour change for anyone relying on them;
+  the settings row becomes the only source.
+- File ownership as a UUID is a forward note, not yet wired.
+
+## Alternatives considered
+
+- **Keep ENV fallbacks.** Rejected: three spellings of one knob, and the library
+  should not read process state.
+- **Defaults in the library.** Rejected: an unset field silently acquiring a
+  value hides a caller mistake; nil is an honest "unset."
+- **A single `DbfsError` with a message.** Rejected: callers need to distinguish
+  "re-sync" from "too large" without matching prose.

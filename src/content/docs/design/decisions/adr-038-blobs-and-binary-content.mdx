@@ -1,0 +1,113 @@
+---
+title: "ADR-038: Blobs and binary content"
+description: "Binary bytes move off the PVC into a content-addressed byte store behind a BlobStore seam, addressed by version with no server-side file descriptor."
+sidebar:
+  order: 38
+  badge:
+    text: Exploratory
+    variant: note
+status: Exploratory
+implementation_exists: false
+date: "2026-09-11"
+extends:
+  label: ADR-034 (DBFS v2)
+  href: /design/decisions/adr-034-dbfs-v2/
+related:
+  - label: ADR-039 (Working-area sync)
+    href: /design/decisions/adr-039-working-area-sync/
+---
+
+import AdrHeader from '../../../../components/AdrHeader.astro';
+
+<AdrHeader {...frontmatter} />
+
+## Context
+
+v1 keeps binary bytes on the workspace PVC and tracks only stat/mtime in
+Postgres. That was deliberate and free on one node; the moment there was
+somewhere else to schedule it stopped being free — a pod that reschedules leaves
+its binary files behind, while text returns because text really is in the
+database.
+
+Two further v1 properties are worth separating: binary content has **no
+`FileChange`**, and binary "merging" is last-write-wins, not OT.
+
+## Decision
+
+**Binary bytes live in a content-addressed byte store behind a `BlobStore` seam,
+addressed statelessly by version. The PVC remains the live working area; the byte
+store is the archive.**
+
+- **`BlobStore` is an interface, not a choice.** `put(bytes) → sha256`,
+  `get(digest)`, `exist?` / `size` / `delete`, optional native `read_range`. A
+  `DbBlobStore` (Postgres `bytea`) is the default; object storage (MinIO/S3) or a
+  distributed FS (Ceph) satisfies the same interface. **Content addressing is
+  what makes a swap safe**: a digest names exact bytes, so any backend returning
+  those bytes for that key is correct, and a digest-keyed cache can never be
+  stale.
+- **Blob IO is stateless and version-addressed.** Every op is a pure function of
+  `(path, revision, offset)`. The server holds **no file descriptor**; an fd is a
+  mutable cursor that hides the version, is not durable server state, and would be
+  a second coordinate system alongside text's revision bases. POSIX ergonomics
+  come from a client-side cursor pinned to a revision.
+- **Binary is last-write-wins, not OT.** Two concurrent `write_blob`s do not
+  merge; they are a conflict the caller resolves. A binary file still flows
+  through the same per-file DAG (branches, revisions, reconstruction).
+- **One ingest function, two triggers.** `Ingest` is the only path that commits
+  binary content: a DBFS binary write stages a temp file, renames it into place,
+  then calls ingest inline; an external write arrives through the watcher and
+  calls the *same* function. Ingest is idempotent by digest against the branch
+  head.
+- **A size cap is enforced at every byte entry point**, before storing, aborting
+  the streaming copy the moment the limit is crossed. A size overrun is a typed
+  `TooLargeError`, not a conflict.
+- **Ordering: PUT the object, then commit the revision.** Orphans are harmless; a
+  revision pointing at missing bytes is not.
+
+```d2
+# The live copy is written in place; the archive is content-addressed by digest.
+direction: right
+
+write: "DBFS binary write\nor external write"
+stage: "stage to cache (hash as we go)"
+guard: "clean-read?\n(no event mid-read)"
+digest: "digest == head?"
+bs: "BlobStore\nput(bytes) → sha256" {shape: cylinder}
+rev: "commit writeBinary revision\n{p sha256, size }"
+noop: "no-op by digest"
+
+write -> stage
+stage -> guard
+guard -> digest: "clean"
+guard -> stage: "discard, rerun" {style.stroke-dash: 3}
+digest -> noop: "equal"
+digest -> bs: "new"
+bs -> rev
+```
+
+## Consequences
+
+**Positive**
+
+- Binary bytes survive pod rescheduling — the multi-node gap closes.
+- Identical bytes across revisions, branches and projects share one row.
+- The byte store can be swapped for object storage without touching callers.
+
+**Negative / to resolve**
+
+- A Postgres `bytea` default holds the whole payload in one INSERT and carries it
+  in base backups; the `BlobStore` seam exists precisely so this can move.
+- Mutations (`append`/`insert`/`overwrite`/`truncate`) are read-modify-write and
+  O(size); efficient append at scale wants content-defined chunking, deferred.
+- `fs/blob` / `download` currently `send_file` from disk and must read the byte
+  store instead.
+
+## Alternatives considered
+
+- **Keep bytes on the PVC (v1).** Rejected: it is a data-loss-shaped cost the day
+  there is a second node.
+- **Server-side file descriptors for seek.** Rejected: not durable, not
+  versionable, and a second coordinate system that must be reconciled with
+  concurrent edits.
+- **Inline everything in `bytea` with no seam.** Rejected: the seam costs one
+  interface and buys the ability to move without a migration of callers.

@@ -1,0 +1,127 @@
+---
+title: "ADR-037: OT transform and the write path"
+description: "One coordinate space, a right-to-left prim fold, a semantic diff tie-break, and a write path that validates against an anchored base under the branch lock."
+sidebar:
+  order: 37
+  badge:
+    text: Exploratory
+    variant: note
+status: Exploratory
+implementation_exists: false
+date: "2026-09-11"
+extends:
+  label: ADR-034 (DBFS v2)
+  href: /design/decisions/adr-034-dbfs-v2/
+related:
+  - label: ADR-036 (Branches, ancestry, and merge)
+    href: /design/decisions/adr-036-branches-ancestry-and-merge/
+---
+
+import AdrHeader from '../../../../components/AdrHeader.astro';
+
+<AdrHeader {...frontmatter} />
+
+## Context
+
+v1's `fs/write` appends whatever the client sends. There is no base revision, so
+there is nothing to transform against and no notion of a conflict — the "OT" is
+an append order enforced by the server. v2 must accept a **stale base** and do
+something correct with it.
+
+Several details of the transform are **semantic, not incidental**, and have to be
+pinned:
+
+- **One coordinate space.** Every delta normalizes to primitive splices
+  `(start, end, text, priority)`. Mixing chained and same-space coordinates
+  compounded shifts wrongly; everything is same-space now.
+- **Fold order.** A single revision can emit several prims (a multi-hunk
+  `setContents` diff, a multi-match regex replace). `transform_list` folds the
+  others **right-to-left** (descending start), because a prim to the right never
+  shifts one to its left. List order compounded shifts in the gaps between prims
+  and silently deleted the wrong text.
+- **The diff tie-break.** With repeated tokens the placement of an added token is
+  ambiguous (all minimal). Myers appends at the **end**; which is chosen decides
+  where a concurrent edit near the repeats lands. The tie-break is a pinned
+  semantic, not an optimisation — a diff swap that changes it must fail loudly.
+- **Insert-inside-replace is opaque**, and that is why it cannot be split: both
+  halves would need the replacement text, and an insert cannot be ordered
+  unambiguously within one prim. It is routed to the conflict path, not guessed.
+
+## Decision
+
+**A write carries its base. The server validates against that base, transforms
+the op past the intervening revisions under the branch lock, and either appends
+or raises a typed `ConflictError`.**
+
+- **Position semantics are positional OT.** A concurrent insert shifts a stale
+  cursor by its length; a keystroke based at "end of world" lands after an
+  inserted header, not re-anchored to the head.
+- **`setContents` is diffable, not an opaque clobber.** `to_prims` diffs the new
+  content against the parent, so a `setContents` means "these are my changes" and
+  merges with concurrent edits. A genuine full rewrite degenerates to a replace
+  over the whole range, which overlaps everything — a conflict.
+- **One entry point.** `transform()` is a thin wrapper over the same prim fold
+  the live path uses. The old opaque `transform_opaque` (a snapshot the
+  production path never took) is gone; a pairwise call and the Store agree, and an
+  ambiguous overlap raises in both.
+- **Write anchors its base under the lock.** `write` captures the revision it
+  validated against (caller base, or the head for a blind append) and uses that
+  as the effective base, so a foreign write landing between validation and lock is
+  transformed against rather than mis-applied. Validation runs against
+  `Content.at(node, base)`, not a fresh head read.
+- **Serialization is the branch row lock** (`SELECT … FOR UPDATE`). Every write
+  and merge takes it, so there is one total order and each stale op is transformed
+  along exactly one path — the Jupiter / Google-Docs model, where TP1
+  (two-operation convergence) is sufficient.
+- **The diff is Myers O(ND)** with common prefix/suffix trimmed and a bounded
+  edit distance; past the cap a genuine rewrite falls back to one coarse hunk.
+
+```d2
+# The live write path: base in, lock, transform, append or refuse.
+direction: right
+
+c: "client\nfs/write(path, changes, base)"
+v: "validate vs\nContent.at(base)"
+lk: "branch row lock\n(FOR UPDATE)"
+x: "transform past\nintervening revisions"
+g: "ambiguous?"
+ap: "append revision\n(broadcast)"
+cf: "ConflictError\ncommitted nothing"
+
+c -> v
+v -> lk
+lk -> x
+x -> g
+g -> ap: "disjoint"
+g -> cf: "overlap"
+```
+
+## Consequences
+
+**Positive**
+
+- A stale edit is transformed and survives, instead of clobbering or being
+  clobbered by whatever landed first.
+- The pairwise API and production share one fold, so a property test exercises
+  the code that runs.
+- Conflicts are typed and fail closed — nothing is committed on refusal.
+
+**Negative / to resolve**
+
+- **TP2 is not tested, deliberately.** With a single serializing lock, each op is
+  transformed along one path, so TP2 is not required; the transform does violate
+  it (verified), and a TP2 test would send someone chasing a property this
+  architecture does not need.
+- The lock is a no-op on SQLite (the Arel visitor drops the clause), so the
+  serialization guarantee is only real on Postgres and must be tested there.
+- The client needs a bit-compatible JS port of this transform (fold order, Myers
+  tie-break, conflict gate) for offline editing.
+
+## Alternatives considered
+
+- **Append order with no transform (v1).** Rejected: it cannot express a stale
+  base, so it cannot distinguish "a concurrent edit" from "a clobber."
+- **CRDT merge semantics.** Parked (ADR-001): a much larger dependency surface,
+  and it does not give the per-keystroke audit log for free.
+- **Opaque `setContents` on any overlap.** Rejected: it silently relocates a
+  stale edit and discards the other writer's intent.
