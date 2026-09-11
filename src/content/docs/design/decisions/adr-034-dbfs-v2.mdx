@@ -182,7 +182,9 @@ dbfs.kf -> stores.pg: "3 append + advance head"
 dbfs.kf -> stores.s3: "4 binary bytes → BlobStore"
 dbfs.kf -> worker.doc: "5 advance cache"
 worker.fs -> worker.bc: "6 fan out"
-worker.bc -> client.apply: "7 fs/change"
+# drawn client->worker so the client stays the top layer; the arrowhead points
+# back at the client, i.e. the worker fans the change out to it (step 7).
+client.apply -> worker.bc: "7 fs/change" {source-arrowhead.shape: arrow}
 worker.fl -> dbfs.store: "read current"
 worker.fl -> stores.pvc: "write TEXT only"
 stores.pvc -> worker.wt: "inotify"
