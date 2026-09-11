@@ -84,31 +84,21 @@
 }
 
 /* ── Layout tweaks ────────────────────────────────────────────────────────── */
-/* Starlight sizes the main pane from --sl-content-width (45rem default) and
-   reserves a proportional slice of the leftover for the ToC rail. That is far
-   too narrow here — ADR tables, code blocks and d2 diagrams all want room — so
-   at desktop sizes we stop deriving the pane width from that variable and
-   instead let the pane take the remaining width with the ToC rail pinned.
-   Below 72rem Starlight is single-column already and none of this applies. */
+/* Keep Starlight's own centred layout. It sizes the main pane and the ToC rail
+   from --sl-content-width so the prose column sits centred between the left
+   sidebar and the ToC; overriding the pane widths breaks that (the column gets
+   pushed right and the ToC drifts to the edge). The only knob we touch is the
+   width itself, raised in steps so Starlight's leftover space — shared between
+   the two columns — never goes negative as the viewport grows.
+   Starlight's default is 45rem. */
 @media (min-width: 72rem) {
-  [data-has-sidebar][data-has-toc] .main-pane {
-    width: auto !important;
-    flex: 1 1 auto;
-  }
-
-  /* Pin the ToC rail; it no longer grows with the content width. */
-  .right-sidebar-container {
-    flex: 0 0 16rem;
-    width: 16rem !important;
-    max-width: 16rem !important;
-  }
-
-  /* Cap the prose column so ultrawide displays don't stretch lines to
-     unreadable lengths, while still filling the pane on normal screens.
-     Applies to every sidebar page, with or without a ToC. */
-  [data-has-sidebar] .main-pane .sl-container {
-    max-width: min(100%, 96rem);
-  }
+  :root { --sl-content-width: 52rem; }
+}
+@media (min-width: 90rem) {
+  :root { --sl-content-width: 62rem; }
+}
+@media (min-width: 110rem) {
+  :root { --sl-content-width: 72rem; }
 }
 
 @media print {
