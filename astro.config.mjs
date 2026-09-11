@@ -12,10 +12,6 @@ export default defineConfig({
     // WebAssembly build (`experimental.useD2js`), so no `d2` binary is
     // required in CI. Fenced ```d2 blocks are compiled to SVG under
     // public/d2/ and referenced by <img>.
-    d2({
-      layout: 'elk',
-      experimental: { useD2js: true },
-    }),
     mermaid({
       theme: 'dark',
       autoTheme: true,
@@ -46,40 +42,21 @@ export default defineConfig({
         baseUrl: 'https://github.com/fdimitri/carbide2-docs/edit/main/',
       },
       sidebar: [
-        {
-          label: 'Get Started',
-          autogenerate: { directory: 'get-started' },
-        },
-        {
-          label: 'Architecture',
-          autogenerate: { directory: 'architecture' },
-        },
-        {
-          label: 'API Reference',
-          autogenerate: { directory: 'api-reference' },
-        },
-        {
-          label: 'Operations',
-          autogenerate: { directory: 'operations' },
-        },
-        {
-          label: 'Development',
-          autogenerate: { directory: 'development' },
-        },
-        {
-          label: 'Standards',
-          autogenerate: { directory: 'standards' },
-        },
-        {
-          label: 'Design',
-          autogenerate: { directory: 'design' },
-        },
-        {
-          label: 'Release Notes',
-          autogenerate: { directory: 'release-notes' },
-        },
+        { label: 'Get Started', items: [{ autogenerate: { "directory": "get-started" }}]},
+        { label: 'Architecture', items: [{ autogenerate: { "directory": "architecture" }}]},
+        { label: 'API Reference', items: [{ autogenerate: { "directory": "api-reference" }}]},
+        { label: 'Operations', items: [{ autogenerate: { "directory": "operations" }}]},
+        { label: 'Development', items: [{ autogenerate: { "directory": "development" }}]},
+        { label: 'Standards', items: [{ autogenerate: { "directory": "standards" }}]},
+        { label: 'Design', items: [{ autogenerate: { "directory": "design" }}]},
+        { label: 'Release Notes', items: [{ autogenerate: { "directory": "release-notes" }}]},
       ],
       customCss: ['./src/styles/custom.css'],
+    }),
+    d2({
+      layout: 'elk',
+      experimental: { useD2js: true },
+      inline: true,
     }),
   ],
   vite: {
