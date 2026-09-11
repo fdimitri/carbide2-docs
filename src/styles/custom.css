@@ -84,12 +84,30 @@
 }
 
 /* ── Layout tweaks ────────────────────────────────────────────────────────── */
-/* The default right ToC rail feels too wide for this docs site. */
+/* Starlight sizes the main pane from --sl-content-width (45rem default) and
+   reserves a proportional slice of the leftover for the ToC rail. That is far
+   too narrow here — ADR tables, code blocks and d2 diagrams all want room — so
+   at desktop sizes we stop deriving the pane width from that variable and
+   instead let the pane take the remaining width with the ToC rail pinned.
+   Below 72rem Starlight is single-column already and none of this applies. */
 @media (min-width: 72rem) {
-  .right-sidebar-container,
-  .right-sidebar {
-    width: 14rem !important;
-    max-width: 14rem !important;
+  [data-has-sidebar][data-has-toc] .main-pane {
+    width: auto !important;
+    flex: 1 1 auto;
+  }
+
+  /* Pin the ToC rail; it no longer grows with the content width. */
+  .right-sidebar-container {
+    flex: 0 0 16rem;
+    width: 16rem !important;
+    max-width: 16rem !important;
+  }
+
+  /* Cap the prose column so ultrawide displays don't stretch lines to
+     unreadable lengths, while still filling the pane on normal screens.
+     Applies to every sidebar page, with or without a ToC. */
+  [data-has-sidebar] .main-pane .sl-container {
+    max-width: min(100%, 96rem);
   }
 }
 
